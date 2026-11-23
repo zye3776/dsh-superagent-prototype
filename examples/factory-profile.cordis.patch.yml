@@ -1,0 +1,21 @@
+# Example profile that runs only the factory's /assess route ($DSH_HOME/profiles/factory/cordis.patch.yml).
+# The owner's software factory posts a permission request to http://127.0.0.1:3083/assess and gets a decision back.
+# Replace the <placeholder> before first start.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    # 3083 keeps this profile clear of a `web` profile on DSH's default port, 3080.
+    port: 3083
+# The prototype's own plugins stay off in this profile: no GitHub or Feishu polling, no management panel.
+- id: dsh-superagent
+  disabled: true
+- id: dsh-superagent-github
+  disabled: true
+- id: dsh-superagent-feishu
+  disabled: true
+- id: dsh-superagent-factory
+  disabled: false
+  config:
+    # Projects the route may write a decision into. Each must already have its .factory folder, which the factory creates.
+    projects:
+      - <absolute path of a project, for example /home/me/projects/factory-testbed>

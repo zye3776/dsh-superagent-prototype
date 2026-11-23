@@ -28,8 +28,10 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
 
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
-  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
-    'dsh-superagent-router-preset'])
+  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-factory',
+    'dsh-superagent-worker-preset', 'dsh-superagent-router-preset'])
+  // The factory route is off unless a profile turns it on, so the prototype's own profiles do not change.
+  expect(rows.find(row => row.id === 'dsh-superagent-factory')).toEqual({ id: 'dsh-superagent-factory', name: 'dsh-superagent/factory', disabled: true })
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)

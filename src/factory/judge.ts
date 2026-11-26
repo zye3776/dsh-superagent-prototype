@@ -32,6 +32,8 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+/** DSH's `subagents.waitForTreeWork`: waits for the work of an agent's subagent tree and says whether there was any. */
+export type TreeWork = (root: Agent) => Promise<boolean>
 /** One tool call as the guard sees it: the tool's name and its arguments. */
 export interface JudgeToolCall { name: string; arguments: unknown }
 /** Checks one tool call of a judge: a text refuses the call and says why, `undefined` lets it run. `cwd` is the project's folder. */
@@ -163,6 +165,8 @@ export class ReadLedger {
 export class JudgeSession {
   /** At most this many helpers per question. */
   static readonly MAX_HELPERS = 3
+  /** How long after a question was sent the judge's answer may wait for its helpers to finish, in milliseconds: inside the hook's 30-second wait. */
+  static readonly SETTLE_END_MS = 25_000
   /** A helper may only be started this long after the question was sent, in milliseconds. */
   static readonly HELPER_START_MS = 10_000
   /** Every `wait_agent` must end by this long after the question was sent, so the answer is in within the factory hook's 30-second wait. */
@@ -187,7 +191,8 @@ export class JudgeSession {
    * @param sessionId - the factory's `session_id` of the worker session this judge belongs to.
    * @param agent - the Session's live agent; `JudgeSessions.open` replaces it when DSH resumed the Session with a new one.
    */
-  constructor(readonly id: string, readonly project: string, readonly sessionId: string, public agent: Agent, private readonly now: () => number = Date.now) {}
+  constructor(readonly id: string, readonly project: string, readonly sessionId: string, public agent: Agent, private readonly now: () => number = Date.now,
+    private readonly treeWork?: TreeWork) {}
 
   /** The text to put before a question. The first call tells the judge to start from the request; each later call lists the files read with the `read` tool that have changed since, or says none has. */
   brief(): string {
@@ -323,6 +328,30 @@ export class JudgeSession {
     return answer
   }
 
+  /**
+   * Waits, after the judge's turn, until its helpers have finished and any turn their results woke has ended, the way DSH's own headless runner does
+   * (whenIdle, then `subagents.waitForTreeWork`, until neither finds work). It gives up at `SETTLE_END_MS` after the question was sent, so it cannot hang: a
+   * helper still running then is refused every further call. Without DSH's subagent service it does nothing.
+   */
+  private async settleHelpers(agent: Agent, question: Question, aborted: Promise<never>): Promise<void> {
+    const treeWork = this.treeWork
+    if (treeWork === undefined) return
+    while (true) {
+      const left = question.started + JudgeSession.SETTLE_END_MS - this.now()
+      if (left <= 0) return
+      const seq = (agent.session as { seq?: unknown }).seq
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const out = new Promise<'out'>(resolve => { timer = setTimeout(() => { resolve('out') }, left) })
+      try {
+        const worked = await Promise.race([treeWork(agent), out, aborted])
+        if (worked === 'out') return
+        const idle = await Promise.race([agent.whenIdle().then(() => 'idle' as const), out, aborted])
+        if (idle === 'out') return
+        if (!worked && (agent.session as { seq?: unknown }).seq === seq) return
+      } catch { return } finally { clearTimeout(timer) }
+    }
+  }
+
   private async exchange(message: string | (() => string), signal: AbortSignal): Promise<JudgeReply> {
     signal.throwIfAborted()
     const text = typeof message === 'string' ? message : message()
@@ -340,7 +369,11 @@ export class JudgeSession {
     const aborted = Promise.withResolvers<never>()
     const abort = () => { aborted.reject(signal.reason) }
     signal.addEventListener('abort', abort, { once: true })
-    try { await Promise.race([agent.whenIdle(), aborted.promise]) } finally {
+    try {
+      await Promise.race([agent.whenIdle(), aborted.promise])
+      // DSH's whenIdle does not wait for helpers: one still running would finish later and wake the judge for a turn outside any question.
+      if (question.helpers > 0) await this.settleHelpers(agent, question, aborted.promise)
+    } finally {
       signal.removeEventListener('abort', abort)
       // From here on the question counts as answered: its helpers run nothing more.
       question.open = false
@@ -385,9 +418,10 @@ export class JudgeSessions implements JudgeOpener {
   /**
    * @param options.now - the clock of the helper budget; tests set it.
    * @param options.fetcher - the `fetch` of documentation lookups; tests hand in one that records each request.
+   * @param options.treeWork - DSH's `subagents.waitForTreeWork`: waits for the judge's helpers and says whether there was any work to wait for.
    */
   constructor(private readonly ctx: Pick<Context, 'sessionController' | 'workspaceRegistry' | 'permissionPresets'>, private readonly guards: GuardSource,
-    private readonly options: { now?: () => number; fetcher?: Fetcher } = {}) {}
+    private readonly options: { now?: () => number; fetcher?: Fetcher; treeWork?: TreeWork } = {}) {}
 
   /** The DSH Session id of one pair: the same on every run, and it says nothing of the project's path. */
   static idOf(project: string, sessionId: string): string {
@@ -429,7 +463,7 @@ export class JudgeSessions implements JudgeOpener {
       }
       if ('error' in result) throw result.error
       const agent = result.agent
-      const judge = known?.id === id && !createdNow ? known : new JudgeSession(id, project, sessionId, agent, this.options.now)
+      const judge = known?.id === id && !createdNow ? known : new JudgeSession(id, project, sessionId, agent, this.options.now, this.options.treeWork)
       judge.agent = agent
       ctx.permissionPresets.set(agent.session, JudgeSessions.PERMISSIONS)
       if (!this.guarded.has(agent)) {

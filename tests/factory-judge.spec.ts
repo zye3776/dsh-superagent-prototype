@@ -461,6 +461,46 @@ describe('helpers and documentation lookups (story 2.22)', () => {
     expect(judge.subagentRefusal()).toMatch(/no question is being answered/)
   })
 
+  it('waits after the judge\'s turn until its helpers are done, and gives up at 25 seconds so it cannot hang', async () => {
+    let clock = 1_000
+    const dsh = fakeDsh((_text, run) => { run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } }); return 'ok' })
+    const helperDone = Promise.withResolvers<boolean>()
+    let openDuringWait: boolean | undefined
+    const treeWork = vi.fn(async () => {
+      if (treeWork.mock.calls.length === 1) {
+        openDuringWait = judge.waitRefusal(10_000) === undefined
+        return helperDone.promise
+      }
+      return false
+    })
+    const judges = new JudgeSessions(dsh.ctx, withJudgeTools().source, { now: () => clock, treeWork })
+    const judge = await judges.open(project, 's1')
+    let answered = false
+    const asked = judge.ask('one', new AbortController().signal).then(text => { answered = true; return text })
+    await vi.waitFor(() => { expect(treeWork).toHaveBeenCalledTimes(1) })
+    expect(answered).toBe(false)
+    // The question stays open while its helpers run.
+    expect(openDuringWait).toBe(true)
+    helperDone.resolve(true)
+    expect(await asked).toBe('ok')
+    expect(treeWork).toHaveBeenCalledTimes(2)
+    expect(judge.subagentRefusal()).toMatch(/no question is being answered/)
+
+    // A helper that never finishes: the wait ends at 25 s after the question was sent.
+    const stuck = vi.fn(() => new Promise<boolean>(() => {}))
+    const late = new JudgeSessions(fakeDsh((_text, run) => { run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } }); clock += 24_990; return 'late' }).ctx,
+      withJudgeTools().source, { now: () => clock, treeWork: stuck })
+    const lateJudge = await late.open(project, 's2')
+    expect(await lateJudge.ask('two', new AbortController().signal)).toBe('late')
+    expect(stuck).toHaveBeenCalledTimes(1)
+
+    // No helper started: nothing is waited for.
+    const none = vi.fn(async () => false)
+    const quiet = await new JudgeSessions(fakeDsh().ctx, withJudgeTools().source, { now: () => clock, treeWork: none }).open(project, 's3')
+    await quiet.ask('three', new AbortController().signal)
+    expect(none).not.toHaveBeenCalled()
+  })
+
   it('holds every helper to the strict guard with the project as folder, records its reads, and refuses it once the question is answered', async () => {
     const strict = fakeGuard(['.env'])
     const during: (string | undefined)[] = []

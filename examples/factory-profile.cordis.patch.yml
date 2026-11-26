@@ -1,6 +1,6 @@
 # Example profile that runs only the factory's /assess route ($DSH_HOME/profiles/factory/cordis.patch.yml).
 # The owner's software factory posts a permission request to http://127.0.0.1:3083/assess and gets a decision back.
-# Replace the <placeholder> before first start.
+# Replace both <placeholders> before first start.
 - id: webserver
   config:
     host: 127.0.0.1
@@ -20,5 +20,10 @@
     # tokenFile is left out on purpose: it defaults to ~/.config/zees-factory/superagent-token, the file the factory's setup
     # writes (mode 0600). The factory sends that token with each request; the route answers nobody without it.
     # Until that setup (the factory's story 7) writes it, make one by hand: mkdir -p -m 700 ~/.config/zees-factory && (umask 077; openssl rand -hex 32 > ~/.config/zees-factory/superagent-token)
+    # The factory's built mask file. Every decision is masked with it before it is written, so no secret and nothing that says
+    # who the owner is reaches decisions.jsonl. There is no default: without it the route answers 503 and writes nothing.
+    # The file is loaded once: after the factory rebuilds it, restart DSH so the new one is used.
+    # The factory's setup (its story 7) will write this line; until then, set it by hand.
+    maskModule: <absolute path of lib/dist/decisionMask.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/decisionMask.js>
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { AssessRoute, DecisionsFile, StubJudge } from '../src/factory/assess.ts'
+import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import * as plugin from '../src/factory/index.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 
@@ -28,20 +29,26 @@ function writeToken(content: string = TOKEN, mode = 0o600): void {
   // Set after writing: the mode given to writeFileSync is cut down by the umask.
   chmodSync(tokenPath(), mode)
 }
+/** A stand-in for the factory's built mask file, with the same export. It marks `reason`, so a test can tell that the line went through it. */
+const maskPath = () => join(root, 'fake-mask.mjs')
+const MASKED = ' [masked]'
+const FAKE_MASK = `export const DecisionMask = { forProject: () => ({ mask: line => ({ ...line, reason: line.reason + ${JSON.stringify(MASKED)} }) }) }\n`
+/** The route's writer, loading the mask module at `path`. */
+const writer = (path: string | undefined = maskPath()) => new DecisionWriter(new FactoryMaskModule(path))
 const file = () => join(project, DecisionsFile.FOLDER, DecisionsFile.FILE)
 const lines = () => readFileSync(file(), 'utf8').split('\n').filter(line => line !== '')
 /** A masked request as the factory posts it; `project` is the raw path. */
 const sample = (fields: Record<string, unknown> = {}) => ({ request_id: 'req-1', request_key: 'k1', session_id: 's1', tool_name: 'Bash',
   tool_input: { command: 'ls' }, reason: 'List files', project, ...fields })
 
-/** Serves the route of a fake DSH web server over real HTTP, reading the token file of the test, and returns the route as it was registered. */
-async function serve(projects: string[] = [project]): Promise<Route> {
+/** Serves the route of a fake DSH web server over real HTTP, reading the token file and the fake mask of the test, and returns the route as it was registered. */
+async function serve(projects: string[] = [project], mask: DecisionWriter = writer()): Promise<Route> {
   let route: Route | undefined
   server = createServer((req, res) => { void route!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { route = registered; return () => {} } } }
-  new AssessRoute(projects, new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW)).register(ctx as never)
+  new AssessRoute(projects, new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW), mask).register(ctx as never)
   return route!
 }
 /** Sends one request with the valid token, unless `headers` gives another one or `undefined` for none. */
@@ -70,6 +77,7 @@ beforeEach(() => {
   project = join(root, 'project')
   mkdirSync(join(project, DecisionsFile.FOLDER), { recursive: true })
   writeToken()
+  writeFileSync(maskPath(), FAKE_MASK)
 })
 afterEach(async () => {
   await new Promise<void>(resolve => { server ? server.close(() => { resolve() }) : resolve() })
@@ -85,13 +93,16 @@ it('registers one exact, anonymous route and refuses a web server that is not on
   expect(() => new AssessRoute(['relative/project'])).toThrow('absolute')
 })
 
-it('answers a valid request with the stub decision and appends the same line last', async () => {
+it('answers a valid request with the stub decision, masked, and appends the same line last', async () => {
   await serve()
   writeFileSync(file(), '{"earlier":true}\n')
   const answer = await call('POST', sample())
   expect(answer.status).toBe(200)
   expect(answer.body).toEqual({ decision_id: expect.stringMatching(/^[0-9a-f-]{36}$/), request_id: 'req-1', kind: 'permission', decision: 'ask_owner',
-    choice: null, risk: 'high', reason: StubJudge.REASON, alternative: '', cites: '', reads: [], tokens: 0, seconds: expect.any(Number), ts: NOW, project })
+    choice: null, risk: 'high', reason: `${StubJudge.REASON}${MASKED}`, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0, seconds: expect.any(Number),
+    ts: NOW, project })
+  // The factory's decision shape refuses an empty `cites`.
+  expect(StubJudge.CITES).not.toBe('')
   expect(answer.body.seconds).toBeGreaterThanOrEqual(0)
   expect(lines()).toEqual(['{"earlier":true}', answer.text])
   // The reply carries the token in its header, and the token is in neither the reply's body nor the file.
@@ -102,6 +113,23 @@ it('answers a valid request with the stub decision and appends the same line las
   expect(second.body.request_id).toBe('req-2')
   expect(second.body.decision_id).not.toBe(answer.body.decision_id)
   expect(lines()).toEqual(['{"earlier":true}', answer.text, second.text])
+})
+
+it('answers 503 and writes nothing when no mask module is configured, when it does not load, and when its masker throws', async () => {
+  const broken = join(root, 'broken-mask.mjs')
+  writeFileSync(broken, 'export const DecisionMask = { forProject: () => ({ mask: () => { throw new Error("planted-detail") } }) }\n')
+  for (const mask of [writer(''), new DecisionWriter(), writer(join(root, 'missing-mask.mjs')), writer(broken)]) {
+    await serve([project], mask)
+    const answer = await call('POST', sample())
+    expect(answer.status).toBe(503)
+    expect(Object.keys(answer.body)).toEqual(['error'])
+    // The refusal does not repeat the mask's own error, which could quote the line.
+    expect(answer.text).not.toContain('planted-detail')
+    expect(answer.headers[SharedTokenFile.HEADER]).toBeUndefined()
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+    server = undefined
+  }
+  expect(existsSync(file())).toBe(false)
 })
 
 it('refuses a project that is not listed or has no .factory folder, and writes nothing', async () => {
@@ -163,6 +191,8 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
 it('is a plugin that needs only the web server and mounts the route for the configured projects', () => {
   expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer']])
   expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath() })
+  expect(plugin.Config({ maskModule: maskPath() })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, maskModule: maskPath() })
+  expect(() => plugin.Config({ maskModule: 'relative/decisionMask.js' })).toThrow()
   expect(plugin.Config({})).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH })
   expect(SharedTokenFile.DEFAULT_PATH).toBe(join(homedir(), '.config', 'zees-factory', 'superagent-token'))
   expect(() => plugin.Config({ projects: ['relative'] })).toThrow()
@@ -175,7 +205,7 @@ it('is a plugin that needs only the web server and mounts the route for the conf
   expect(registered.map(route => route.path)).toEqual(['/assess'])
 })
 
-it('is a plugin that reads the shared token from the configured token file', async () => {
+it('is a plugin that reads the shared token from the configured token file and masks with the configured mask module', async () => {
   // Not the file the other tests use, so only `tokenFile` can have led the route to it.
   const configured = join(root, 'configured-token')
   writeFileSync(configured, `${OTHER_TOKEN}\n`)
@@ -183,10 +213,11 @@ it('is a plugin that reads the shared token from the configured token file', asy
   const registered: Route[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
     effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
-  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured }))
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath() }))
   const accepted = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
   await registered[0]!.handler(accepted.req, accepted.res)
   expect([accepted.answer.status, accepted.answer.headers[SharedTokenFile.HEADER]]).toEqual([200, OTHER_TOKEN])
+  expect((JSON.parse(accepted.answer.text) as { reason: string }).reason).toBe(`${StubJudge.REASON}${MASKED}`)
   // The token of the default test file is not the configured one.
   const refused = direct('127.0.0.1')
   await registered[0]!.handler(refused.req, refused.res)
@@ -275,7 +306,7 @@ function direct(remoteAddress: string | undefined, headers: Record<string, strin
 }
 
 it('refuses a caller whose address is not loopback, whatever its Host header and token say', async () => {
-  const route = new AssessRoute([project], new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW))
+  const route = new AssessRoute([project], new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW), writer())
   for (const address of ['192.168.1.9', '10.0.0.1', '::ffff:192.168.1.9', 'fe80::1', '127.0.0.2', '', undefined]) {
     const { req, res, answer, resume } = direct(address)
     await route.handle(req, res, 3083)

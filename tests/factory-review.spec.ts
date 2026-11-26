@@ -699,7 +699,7 @@ function pluginContext(registered: Route[], connection: DshConnection | undefine
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
     effect: (effect: () => () => void) => effect(), logger, on: () => () => {},
     inject: (names: string[], callback: (child: unknown) => void) => {
-      expect(names).toEqual(['connection'])
+      expect(names).toEqual(['connection', 'connection.authentication'])
       if (connection !== undefined) callback({ connection, effect: (effect: () => () => unknown) => { left.push(effect()) } })
       return () => {}
     } }

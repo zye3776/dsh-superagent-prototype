@@ -70,7 +70,8 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks)
   ctx.effect(() => review.register(ctx), 'factory: review page')
   // Optional, so `/assess` and the job log work without it: the review page asks DSH's connection service while DSH has it.
-  ctx.inject(['connection'], child => { child.effect(() => review.signIn.use(child.connection), 'factory: review page sign-in') })
+  // `connection.authentication` too: cordis refuses `admit`'s read of it from a context that did not inject it (seen on DSH 0.2.3).
+  ctx.inject(['connection', 'connection.authentication'], child => { child.effect(() => review.signIn.use(child.connection), 'factory: review page sign-in') })
 }
 export { AssessRoute, StubJudge, TempFactsShape, type AnswerLog, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'

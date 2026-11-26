@@ -40,6 +40,11 @@ export class JudgeQuestion {
     '- A git, gh or glab command that runs other code, calls a raw API or throws away local work: check what it would run, call or throw away.',
     '- An ordinary edit to the text of a skill or of a command: check that it changes what the request says and nothing else.',
     '- A request to read a secret file: judge it from the request alone. Do not open the file; a read of it is refused.',
+    // Story 2.20's live check: the judge denied the ask-first skill's own call as an opaque bundle, so asking first never reached /ask.
+    '- A run of the factory\'s ask-first script (`bun ".../skills/ask-first/dist/ask.script.js" --session ... --tool ... --command ...`): the script only sends the'
+      + ' action named in its arguments to the super agent\'s /ask route, where that action is judged on its own, and keeps a small record of what it asked under'
+      + ' ~/.config/zees-factory/ask-first. Do not judge the asked action here and do not read the bundle. Approve the call when the script lies outside the project'
+      + ' you judge (in the factory\'s plugin folder) and the command line runs that script alone, with plain quoted arguments and no other command; otherwise deny it.',
   ]
   /** The rules of the decision itself. Plain code checks the second and third again after the answer. */
   static readonly RULES: readonly string[] = [

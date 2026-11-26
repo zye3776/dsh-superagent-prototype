@@ -36,7 +36,7 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   ctx.effect(() => route.register(ctx), 'factory: assess route')
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
 }
-export { AssessRoute, StubJudge, type AssessRequest, type Judge, type TokenSource, type Verdict } from './assess.ts'
+export { AssessRoute, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export { SharedTokenFile } from './token.ts'

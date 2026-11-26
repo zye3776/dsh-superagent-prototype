@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { AssessRoute, DecisionsFile, StubJudge, type Judge } from '../src/factory/assess.ts'
+import { AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts } from '../src/factory/assess.ts'
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
@@ -123,6 +123,50 @@ it('answers a valid request with the stub decision, masked, and appends the same
   expect(second.body.request_id).toBe('req-2')
   expect(second.body.decision_id).not.toBe(answer.body.decision_id)
   expect(lines()).toEqual(['{"earlier":true}', answer.text, second.text])
+})
+
+/** Temp-folder facts as the factory's hook sends them: one path in `/tmp`, outside the session's own temp folder. */
+const tempFacts = (): TempFacts => ({ session_dir: '/private/tmp/claude-502/-project/session/scratchpad',
+  paths: [{ path: '/private/tmp/x', in_session_dir: false, created_by_session: false, in_exception: false }], variable_delete: false })
+
+it('hands a well-formed temp to the judge unchanged, and a request without one as it is', async () => {
+  const asked: AssessRequest[] = []
+  const stub = new StubJudge()
+  await serve([project], writer(), { decide: (request) => { asked.push(request); return stub.decide(request) } })
+  const facts = tempFacts()
+  const none: TempFacts = { session_dir: null, paths: [], variable_delete: true }
+  for (const temp of [facts, none, null]) expect((await call('POST', sample({ temp }))).status).toBe(200)
+  expect((await call('POST', sample())).status).toBe(200)
+
+  expect(asked.map(request => request.temp)).toEqual([facts, none, null, undefined])
+  expect('temp' in asked[3]!).toBe(false)
+  // The rest of the request reaches the judge with it, and each request left its decision.
+  expect(asked[0]).toEqual(sample({ temp: facts }))
+  expect(lines()).toHaveLength(4)
+  expect(plugin.TempFactsShape).toBe(TempFactsShape)
+})
+
+it('refuses a temp that is not null or the agreed facts with 400, and writes nothing', async () => {
+  const asked: AssessRequest[] = []
+  const stub = new StubJudge()
+  await serve([project], writer(), { decide: (request) => { asked.push(request); return stub.decide(request) } })
+  const facts = tempFacts()
+  const fact = facts.paths[0]!
+  const malformed: unknown[] = [
+    { paths: 'x' }, 'facts', 7, true, [], [facts], {},
+    { ...facts, session_dir: 7 }, { ...facts, session_dir: undefined }, { ...facts, paths: undefined }, { ...facts, paths: {} },
+    { ...facts, variable_delete: 'false' }, { ...facts, variable_delete: undefined }, { ...facts, extra: true },
+    { ...facts, paths: [null] }, { ...facts, paths: ['/tmp/x'] }, { ...facts, paths: [[]] },
+    { ...facts, paths: [{ ...fact, path: 7 }] }, { ...facts, paths: [{ ...fact, in_session_dir: 'false' }] },
+    { ...facts, paths: [{ ...fact, created_by_session: 0 }] }, { ...facts, paths: [{ ...fact, in_exception: null }] },
+    { ...facts, paths: [{ ...fact, in_exception: undefined }] }, { ...facts, paths: [{ ...fact, extra: 1 }] }, { ...facts, paths: [fact, { path: '/tmp/y' }] },
+  ]
+  for (const temp of malformed) {
+    const answer = await call('POST', sample({ temp }))
+    expect([answer.status, answer.body], JSON.stringify(temp)).toEqual([400, { error: 'The request has a malformed temp' }])
+  }
+  expect(asked).toEqual([])
+  expect(existsSync(file())).toBe(false)
 })
 
 it('answers 503 and writes nothing when no mask module is configured, when it does not load, and when its masker throws', async () => {

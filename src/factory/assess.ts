@@ -18,11 +18,50 @@ import { SharedTokenFile } from './token.ts'
 
 export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
 
+/** One path of a shared temp folder (such as `/tmp`) that a request names, with what the factory's hook found out about it. */
+export interface TempPathFact {
+  /** The path as a full path, as far as it is known. */
+  path: string
+  /** True when the path is the worker session's own temp folder or lies inside it. */
+  in_session_dir: boolean
+  /** True when the worker session's record shows that this session made the file or folder. */
+  created_by_session: boolean
+  /** True when the path lies in the one shared temp folder the factory allows by name. */
+  in_exception: boolean
+}
 /**
- * What the factory posts: its masked request record. Only these three fields are read here; `project` is the raw absolute path, and `session_id` names the
- * worker session that asks, which gets a judge Session of its own.
+ * The temp-folder facts of one request, worked out by the factory's hook (`lib/tempFacts` there) and sent as the request's `temp`.
+ * `session_dir` is the worker session's own temp folder, `null` when it has none; `variable_delete` says that the request deletes through a variable.
  */
-export interface AssessRequest { request_id: string; project: string; session_id: string; [field: string]: unknown }
+export interface TempFacts { session_dir: string | null; paths: TempPathFact[]; variable_delete: boolean }
+
+/** Checks that a request's `temp` has the agreed shape, so the judge is never handed facts of another shape. */
+export class TempFactsShape {
+  private static readonly FIELDS: readonly string[] = ['session_dir', 'paths', 'variable_delete']
+  private static readonly PATH_FIELDS: readonly string[] = ['path', 'in_session_dir', 'created_by_session', 'in_exception']
+  /** Whether `value` is `null` (the hook could not work the facts out) or the facts with exactly their fields: text where text belongs, true or false where a flag belongs. */
+  static holds(value: unknown): value is TempFacts | null {
+    if (value === null) return true
+    if (!TempFactsShape.hasExactly(value, TempFactsShape.FIELDS)) return false
+    if (value.session_dir !== null && typeof value.session_dir !== 'string') return false
+    if (typeof value.variable_delete !== 'boolean' || !Array.isArray(value.paths)) return false
+    return value.paths.every((fact: unknown) => TempFactsShape.hasExactly(fact, TempFactsShape.PATH_FIELDS) && typeof fact.path === 'string'
+      && typeof fact.in_session_dir === 'boolean' && typeof fact.created_by_session === 'boolean' && typeof fact.in_exception === 'boolean')
+  }
+  /** Whether `value` is a plain object with these fields and no other. */
+  private static hasExactly(value: unknown, fields: readonly string[]): value is Record<string, unknown> {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+    const present = Object.keys(value)
+    return present.length === fields.length && fields.every(field => present.includes(field))
+  }
+}
+
+/**
+ * What the factory posts: its masked request record. Only these fields are read here; `project` is the raw absolute path, and `session_id` names the
+ * worker session that asks, which gets a judge Session of its own. `temp` holds the request's temp-folder facts for the judge: left out by a caller
+ * that sends none, `null` when the hook could not work them out.
+ */
+export interface AssessRequest { request_id: string; project: string; session_id: string; temp?: TempFacts | null; [field: string]: unknown }
 
 /** A decision without `seconds`, which the route measures. */
 export type Verdict = Omit<Decision, 'seconds'>
@@ -58,7 +97,8 @@ export interface TokenSource { read(): string | undefined }
 /**
  * Serves `POST /assess` on DSH's web server, for the factory on this machine only.
  * It refuses a web server that is not bound to 127.0.0.1, a Host header that is not loopback, a request with an Origin header (a browser), a caller whose address is
- * not loopback, any method but POST, a caller that does not send the shared token, a body over 128 KiB or not JSON, and a project that its configuration does not list.
+ * not loopback, any method but POST, a caller that does not send the shared token, a body over 128 KiB or not JSON, a `temp` that is not in the agreed shape,
+ * and a project that its configuration does not list.
  * A decision that cannot be masked (no mask module, or one that fails) is refused with 503 and not written, and so is a request its judge refuses
  * (no judge Session, no usable answer, or no answer in time).
  * Everything up to and including the token is checked before the body is read. The token is written to no file, log line or error message: only the 200 reply
@@ -135,12 +175,17 @@ export class AssessRoute {
     return this.writer.write({ ...verdict, seconds, ts: this.now().toISOString(), project: request.project })
   }
 
-  private static requestOf(body: unknown): AssessRequest {
+  /**
+   * Checks a parsed body and returns it as the request, unchanged. Refuses with 400 a body that is not an object, one without `request_id`, `project` or
+   * `session_id`, and one whose `temp` is present but neither `null` nor the agreed facts. Public, so the factory's contract check can run the same check.
+   */
+  static requestOf(body: unknown): AssessRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
     const { request_id: id, project, session_id: session } = body as Record<string, unknown>
     if (typeof id !== 'string' || id === '') throw new AssessRefusal(400, 'The request has no request_id')
     if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
     if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
+    if ('temp' in body && !TempFactsShape.holds((body as Record<string, unknown>).temp)) throw new AssessRefusal(400, 'The request has a malformed temp')
     return body as AssessRequest
   }
 

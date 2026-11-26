@@ -1,0 +1,6 @@
+# dsh-superagent-review-link bundle layer: inserts its one plugin, which only adds the "Review" link at the foot of DSH's sidebar.
+# The link opens /review, the review page of dsh-superagent's factory plugin, so a profile that lists this bundle also turns on
+# the `dsh-superagent-factory` row (see ../../examples/factory-profile.cordis.patch.yml).
+- insert:
+    - id: dsh-superagent-review-link
+      name: dsh-superagent-review-link

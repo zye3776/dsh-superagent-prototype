@@ -11,4 +11,9 @@ export default defineConfig([
   { entry: { client: 'src/client/index.tsx' }, outDir: 'lib', format: 'cjs', platform: 'browser', dts: false, clean: false, plugins: [raw],
     deps: { neverBundle: ['react', 'react/jsx-runtime', 'react-dom'] },
     outputOptions: { entryFileNames: 'client.js', banner: 'window.__ModuleLoader__.load({ id: "dsh-superagent", factory: (require) => {', footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' } },
+  // The "Review" link package (packages/review-link): its empty node half, and its browser half, loaded under its own package name.
+  { entry: { index: 'packages/review-link/src/index.ts' }, outDir: 'packages/review-link/lib', format: 'esm', fixedExtension: false, platform: 'node', target: 'es2024', dts: false, clean: true },
+  { entry: { client: 'packages/review-link/src/client.tsx' }, outDir: 'packages/review-link/lib', format: 'cjs', platform: 'browser', dts: false, clean: false,
+    deps: { neverBundle: ['react', 'react/jsx-runtime', 'react-dom'] },
+    outputOptions: { entryFileNames: 'client.js', banner: 'window.__ModuleLoader__.load({ id: "dsh-superagent-review-link", factory: (require) => {', footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' } },
 ])

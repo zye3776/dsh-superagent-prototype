@@ -98,8 +98,6 @@ const TEXT = {
   executorWaitingSetup: ['执行器等待部署检查', 'Executor waiting for the deployment check'],
   // Header, search, and tabs
   panel: ['Superagent', 'Superagent'],
-  // The factory's review page, linked from the foot of DSH's sidebar; the page itself is in English, so the link's word is too.
-  reviewLink: ['Review', 'Review'],
   openMaster: ['打开主 Session', 'Open main Session'],
   pagesLabel: ['dsh-superagent 页面', 'dsh-superagent pages'],
   searchPlaceholder: ['搜索工单、线程、触发或链接', 'Search Tickets, Threads, Triggers or links'],

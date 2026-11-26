@@ -16,6 +16,11 @@
 # The agent preset the route's judge Sessions are created with. A judge reads a project and changes nothing.
 - id: dsh-superagent-judge-preset
   disabled: false
+# The "Review" link at the foot of DSH's sidebar, to the review page below. It is the package packages/review-link, linked into
+# the profile next to dsh-superagent (dsh plugin --profile <name> add "link:<fork>/packages/review-link"), since DSH shows a
+# plugin's browser part only for an enabled row named by its package, and this profile turns dsh-superagent's own row off.
+- id: dsh-superagent-review-link
+  disabled: false
 - id: dsh-superagent-factory
   disabled: false
   config:

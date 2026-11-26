@@ -389,7 +389,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
-| `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel, the page in DeepSeek Harness's Plugin Manager, and the "Review" link at the foot of the sidebar, beside Settings (slot `sidebar.footer.action`), a plain link to the factory's review page `/review` in the same tab: the word when the sidebar is wide, an icon named by it on the rail |
+| `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
@@ -411,8 +411,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/marks.ts` | The marks of the states the views classify: a Ticket's or a Thread's stage, a Source's state and a Decision's outcome, each as a dot, an icon, a tone and a label |
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
+| `packages/review-link/src/index.ts` | The node half of the `dsh-superagent-review-link` package: an empty plugin, so the package has a row of its own in DSH's plugin list |
+| `packages/review-link/src/client.tsx` | Its browser half: the "Review" link at the foot of DSH's sidebar, beside Settings (slot `sidebar.footer.action`), a plain link to the factory's review page `/review` in the same tab: the word when the sidebar is wide, an icon named by it on the rail |
 
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. `src/factory/index.ts` is the entry of the factory plugin, exported as `./factory`. The bundle's `cordis.patch.yml` inserts the four plugins, with Feishu and the factory disabled, and the factory's judge preset (`dsh-superagent-judge-preset`), disabled too; `examples/factory-profile.cordis.patch.yml` is a profile that runs the factory plugin alone, with the judge preset turned on.
+
+The "Review" link is a package of its own, `dsh-superagent-review-link` in `packages/review-link`, because DSH serves a plugin's browser part only for an enabled plugin row named by its bare package name (`@deepseek-ai/dsh-client-modules`, the same rule in 0.2.1 and 0.2.3): a row named by a subpath such as `dsh-superagent/factory` gets none, and the factory's profile turns the `dsh-superagent` row off. The package follows DSH's one-package-one-plugin pattern: an empty node half, a `./client` export declared by `dsh.client` (platform `web`), and a bundle layer (`packages/review-link/cordis.patch.yml`) that inserts its one row, `dsh-superagent-review-link`. The fork has no pnpm workspace: the package has no dependencies of its own, `tsdown.config.ts` and `tsconfig.json` at the root build and check it with the root's, its `lib/` is built by the root's `pnpm build`, and a profile links it with `dsh plugin --profile <name> add "link:<fork>/packages/review-link"`; the factory's example profile turns its row on.
 
 ## Tests
 
@@ -466,7 +470,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
-| `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, the "Review" link to `/review` wide and on the rail, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
+| `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
+| `tests/review-link.spec.tsx` | The link package: its one registration, the "Review" link to `/review` wide and on the rail, and the manifest and bundle row DSH needs to serve it |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |

@@ -49,30 +49,14 @@ const serve = () => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
 }))
 afterEach(() => { vi.unstubAllGlobals() })
 
-it('registers a localized main panel, sidebar entry, review link and Plugin Manager row page, and no settings section', () => {
+it('registers a localized main panel, sidebar entry and Plugin Manager row page, and no review link or settings section', () => {
   const { entries, dictionaries, main, nav } = fixture([])
-  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'sidebar.footer.action', 'plugins.row.config'])
-  expect(entries[3]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
+  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'plugins.row.config'])
+  expect(entries[2]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
   expect(nav.options).toMatchObject({ id: 'dsh-superagent', order: 10, locale: 'dshSuperagent' })
   expect(nav.options.label?.()).toBe('Superagent')
-})
-
-it('puts a "Review" link to /review at the foot of DSH\'s sidebar, the word when wide and an icon named by it on the rail, opening in the same tab', async () => {
-  const { entries } = fixture([])
-  const link = entries.find(entry => entry.options.name === 'sidebar.footer.action')!
-  expect(link.options).toMatchObject({ id: 'dsh-superagent-review', locale: 'dshSuperagent' })
-  expect(link.options.label?.()).toBe('Review')
-  const wide = await render(link, { wide: true, t })
-  const anchor = wide.container.querySelector('a')!
-  expect([anchor.getAttribute('href'), anchor.getAttribute('target'), anchor.textContent, anchor.getAttribute('aria-label')]).toEqual(['/review', null, 'Review', null])
-  wide.dispose()
-  const rail = await render(link, { wide: false, t })
-  const icon = rail.container.querySelector('a')!
-  expect([icon.getAttribute('href'), icon.getAttribute('target'), icon.textContent, icon.getAttribute('aria-label'), icon.querySelector('svg') !== null])
-    .toEqual(['/review', null, '', 'Review', true])
-  rail.dispose()
 })
 
 it('opens a listed Session through the workspace from the main panel', async () => {

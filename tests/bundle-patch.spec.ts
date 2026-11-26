@@ -102,6 +102,8 @@ it('turns the judge preset and the factory route on in the factory\'s example pr
   const example = readFileSync(join(import.meta.dirname, '..', 'examples', 'factory-profile.cordis.patch.yml'), 'utf8')
   expect(example).toMatch(/^- id: dsh-superagent-judge-preset\n  disabled: false$/m)
   expect(example).toMatch(/^- id: dsh-superagent-factory\n  disabled: false$/m)
+  // The review page's link is its own package's row, on, since the main plugin's row (which would carry it) is off here.
+  expect(example).toMatch(/^- id: dsh-superagent-review-link\n  disabled: false$/m)
   // The prototype's own runtimes, the GitHub-bound one among them, stay off in the factory's profile.
   for (const id of ['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu']) expect(example).toMatch(new RegExp(`^- id: ${id}\\n  disabled: true$`, 'm'))
   expect(example).toMatch(/^    guardModule: <absolute path of lib\/dist\/judgeGuard\.js /m)

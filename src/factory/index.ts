@@ -67,7 +67,7 @@ export {
   type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
-export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
+export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
 export { SharedTokenFile } from './token.ts'
 export { TokenTally, type TalliedEvent } from './usage.ts'
 export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

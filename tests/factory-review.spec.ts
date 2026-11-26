@@ -1,5 +1,5 @@
 /** The factory's review page, served by a real HTTP server on loopback, reading and writing a temporary project through a stand-in records module. */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -712,8 +712,10 @@ it('makes every timeline row a link to its step, and marks the picked row', () =
   expect([...page.querySelectorAll('ol li')].map(row => [row.className, row.querySelector('a')!.getAttribute('aria-current')])).toEqual([['', null], ['on', 'true'], ['', null]])
   expect(page.querySelector('aside.detail h2')!.textContent).toMatch(/^Step detail · \d\d:\d\d · Permission answered$/)
   expect(ReviewPage.stepIdOf(job.steps[1]!)).toBe(answer.step_id)
-  // The whole-job comment field stays in the middle panel.
-  expect([page.querySelectorAll('textarea').length, page.querySelector('main textarea')!.id]).toEqual([1, 'comment'])
+  // One comment field, at the bottom of the detail panel, for the picked step.
+  const field = page.querySelector('aside.detail textarea')!
+  expect([page.querySelectorAll('textarea').length, field.id, field.getAttribute('data-step'), page.querySelector('aside.detail label')!.textContent])
+    .toEqual([1, 'comment', 'step-2', ReviewPage.STEP_COMMENT])
 })
 
 it('shows all five parts of a permission answer in full, in the panel\'s order, as text and never as markup', () => {
@@ -802,6 +804,143 @@ it('answers 503 for a picked step when the records module has no step reader, an
   expect((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).status).toBe(200)
   const picked = await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-1'), { cookie })
   expect([picked.status, dom(picked.text).querySelector('p')!.textContent]).toEqual([503, 'The configured recordsModule does not export StepDetailReader, so no record is read'])
+})
+
+describe('comments on a job and on any step', () => {
+  /** One job: its start, a permission answer, a message and its stop. */
+  const steps = () => [
+    action(),
+    action({ step_id: 'step-2', ts: '2026-11-26T08:10:00.000Z', kind: 'permission_answer', summary: 'Approved: run the tests.' }),
+    action({ step_id: 'step-3', ts: '2026-11-26T08:20:00.000Z', kind: 'message_in', summary: 'Start the ready stories.', from: 'owner', to: 'super agent' }),
+    action({ step_id: 'step-4', ts: '2026-11-26T08:30:00.000Z', kind: 'job_stop', summary: 'Stopped.' }),
+  ]
+  /** The "Comments" block as [heading, comment] pairs, and the echoes under the timeline's rows as [row id, comment]. */
+  const listed = (page: Document) => [...page.querySelectorAll('ul.comments li')].map(entry => [entry.querySelector('strong')!.textContent, entry.querySelector('.mine')!.textContent])
+  const echoes = (page: Document) => [...page.querySelectorAll('ol li')].flatMap(row => {
+    const echo = row.querySelector('.mine')
+    return echo === null ? [] : [[new URL(row.querySelector('a')!.href, 'http://x').searchParams.get('step'), echo.textContent]]
+  })
+  const fieldOf = (page: Document) => {
+    const field = page.querySelector<HTMLTextAreaElement>('aside.detail textarea')
+    return field === null ? null : [page.querySelector('aside.detail label')!.textContent, field.getAttribute('data-step'), field.value]
+  }
+
+  it('saves a comment on one step masked, with its step_id, and shows it under the step, in the job\'s comments and in that step\'s field', async () => {
+    await serve()
+    put('actions.jsonl', steps())
+    const cookie = await signIn()
+    const answer = await comment(cookie, { project, job_id: 'job-1', step_id: 'step-2', comment: `Too wide; never print ${PLANTED}.` })
+    expect([answer.status, JSON.parse(answer.text)]).toEqual([200, { saved: true }])
+    const written = lines('reviews.jsonl')
+    expect(written).toHaveLength(1)
+    expect(JSON.parse(written[0]!)).toEqual({ ts: NOW, project, job_id: 'job-1', step_id: 'step-2', comment: `Too wide; never print ${REDACTED}.` })
+    expect(Object.keys(JSON.parse(written[0]!) as object)).toEqual(['ts', 'project', 'job_id', 'step_id', 'comment'])
+    expect(readFileSync(file('reviews.jsonl'), 'utf8')).not.toContain(PLANTED)
+    const job = await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })
+    expect(job.text).not.toContain(PLANTED)
+    const page = dom(job.text)
+    expect(listed(page)).toEqual([['Permission answered', `You: Too wide; never print ${REDACTED}.`]])
+    expect(echoes(page)).toEqual([['step-2', `You: Too wide; never print ${REDACTED}.`]])
+    // With no step picked the field is the whole job's, which has no comment yet.
+    expect(fieldOf(page)).toEqual([ReviewPage.JOB_COMMENT, null, ''])
+    expect(fieldOf(dom((await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-2'), { cookie })).text)))
+      .toEqual([ReviewPage.STEP_COMMENT, 'step-2', `Too wide; never print ${REDACTED}.`])
+  })
+
+  it('writes a changed comment as a new line and shows only the newest text of each, once', async () => {
+    await serve()
+    put('actions.jsonl', steps())
+    const cookie = await signIn()
+    for (const body of [{ comment: 'Good pace.' }, { step_id: 'step-2', comment: 'Too wide.' }, { step_id: 'step-3', comment: 'Fine.' }, { step_id: 'step-2', comment: 'Ask me next time.' }]) {
+      expect((await comment(cookie, { project, job_id: 'job-1', ...body })).status).toBe(200)
+    }
+    expect(lines('reviews.jsonl')).toHaveLength(4)
+    const html = (await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).text
+    const page = dom(html)
+    expect(listed(page)).toEqual([[ReviewPage.WHOLE_JOB, 'You: Good pace.'], ['Permission answered', 'You: Ask me next time.'], ['Message received', 'You: Fine.']])
+    // The whole job's comment shows under the row that stops the job.
+    expect(echoes(page)).toEqual([['step-2', 'You: Ask me next time.'], ['step-3', 'You: Fine.'], ['step-4', 'You: Good pace.']])
+    expect(html).not.toContain('Too wide.')
+    expect(page.querySelector('nav a.job')!.textContent).toContain('3 comments')
+    // The job's start and stop rows hold the whole job's comment.
+    for (const id of ['step-1', 'step-4']) {
+      expect(fieldOf(dom((await call('GET', ReviewRoute.address(project, 'job-1', false, id), { cookie })).text))).toEqual([ReviewPage.JOB_COMMENT, null, 'Good pace.'])
+    }
+    // The changed step's own field holds its newest text.
+    expect(fieldOf(dom((await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-2'), { cookie })).text))).toEqual([ReviewPage.STEP_COMMENT, 'step-2', 'Ask me next time.'])
+  })
+
+  it('refuses a step comment it cannot keep, and writes nothing', async () => {
+    const answer = automatic({ ts: '2026-11-26T08:05:00.000Z' })
+    // The stand-in reader reads no automatic answer, so this records module adds one to the job.
+    class WithAutomatic extends FactoryRecordsModule {
+      override async jobsReader() {
+        const reader = await super.jobsReader()
+        return { read: (projects: readonly string[]) => reader.read(projects).map(entry => ({ ...entry, jobs: entry.jobs.map(job => ({
+          ...job, steps: [...job.steps, { automatic: true as const, ts: answer.ts, answer }].sort((x, y) => x.ts.localeCompare(y.ts)) })) })) }
+      }
+    }
+    await serve([project], new WithAutomatic(recordsModule(root)))
+    put('actions.jsonl', steps())
+    const cookie = await signIn()
+    const refused = async (step_id: unknown) => {
+      const sent = await comment(cookie, { project, job_id: 'job-1', step_id, comment: 'Hm.' })
+      return [sent.status, (JSON.parse(sent.text) as { error: string }).error]
+    }
+    expect(await refused('step-9')).toEqual([404, 'That step is not in this job'])
+    expect(await refused(answer.request_id)).toEqual([400, 'An automatic answer takes no comment'])
+    expect(await refused('step-1')).toEqual([400, 'Comment on the whole job without a step'])
+    expect(await refused('step-4')).toEqual([400, 'Comment on the whole job without a step'])
+    expect(await refused('')).toEqual([400, 'step_id must be non-empty text'])
+    expect(await refused(7)).toEqual([400, 'step_id must be non-empty text'])
+    expect(existsSync(file('reviews.jsonl'))).toBe(false)
+    // The automatic answer's detail has no comment field.
+    expect(fieldOf(dom((await call('GET', ReviewRoute.address(project, 'job-1', false, answer.request_id), { cookie })).text))).toBeNull()
+  })
+
+  it('lists the whole job\'s comment only among the job\'s comments when the job has no stop row', () => {
+    const { job, entry } = threeSteps()
+    job.reviews.push(review({ comment: 'Good pace.' }), review({ step_id: 'step-3', comment: 'Fine.' }))
+    const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false }))
+    expect(listed(page)).toEqual([[ReviewPage.WHOLE_JOB, 'You: Good pace.'], ['Message received', 'You: Fine.']])
+    expect(echoes(page)).toEqual([['step-3', 'You: Fine.']])
+    expect([...page.querySelectorAll('ul.comments a')].map(link => link.getAttribute('href'))).toEqual([ReviewRoute.address(project, 'job-1'), ReviewRoute.address(project, 'job-1', false, 'step-3')])
+  })
+
+  it('sends the picked step\'s id with its comment, and none with the whole job\'s', async () => {
+    const { job, entry } = threeSteps()
+    const sent: unknown[] = []
+    for (const step of [job.steps[1], undefined]) {
+      const html = new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step, detail: step === undefined ? undefined : NONE })
+      const window = new JSDOM(html, { runScripts: 'dangerously', url: 'http://127.0.0.1:3083/review', beforeParse: view => {
+        (view as unknown as { fetch: unknown }).fetch = (_url: string, init: { body: string }) => { sent.push(JSON.parse(init.body)); return Promise.resolve({ ok: true }) }
+      } }).window
+      const field = window.document.querySelector('textarea')!
+      field.value = 'Ask me next time.'
+      field.dispatchEvent(new window.Event('blur'))
+      await settle()
+    }
+    expect(sent).toEqual([
+      { project, job_id: 'job-1', step_id: 'step-2', comment: 'Ask me next time.' },
+      { project, job_id: 'job-1', comment: 'Ask me next time.' },
+    ])
+  })
+
+  it('writes nothing but comment lines: reading, signing in and refused writes leave the records as they were, and the page offers no mark or setting', async () => {
+    await serve()
+    put('actions.jsonl', steps())
+    const before = readFileSync(file('actions.jsonl'), 'utf8')
+    const cookie = await signIn()
+    const html = (await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-2'), { cookie })).text
+    expect((await call('POST', ReviewRoute.address(project, 'job-1'), { cookie, origin: origin() }, '{}')).status).toBe(405)
+    expect((await comment(cookie, { project, job_id: 'job-1', step_id: 'step-2', comment: 'Ask me next time.' })).status).toBe(200)
+    expect([readFileSync(file('actions.jsonl'), 'utf8'), lines('reviews.jsonl').length]).toEqual([before, 1])
+    expect(readdirSync(join(project, FactoryRecordFile.FOLDER)).sort()).toEqual(['actions.jsonl', 'reviews.jsonl'])
+    // The only control is the comment field: no form, button, select, radio or checkbox, and no word of a mark, grade or setting.
+    const page = dom(html)
+    expect([...page.querySelectorAll('form, button, select, input')].length).toBe(0)
+    expect(page.body.textContent).not.toMatch(/\b(mark|grade|score|rating|never[- ]decide|setting)s?\b/i)
+  })
 })
 
 /** The factory's folder, when the environment says where it is: its built job log file and its review sample are read from it. */
@@ -906,5 +1045,24 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
       ['Why', 'automatic yes · answered by the fixed checks · not reviewed'],
     ])
     expect(typeof (await new FactoryRecordsModule(built).stepReader()).read).toBe('function')
+  })
+
+  it('keeps a comment on a job, comments on two steps and a change to one as four masked lines, and shows the changed text once', async () => {
+    const { a, cookie } = await serveSample()
+    rmSync(file('reviews.jsonl', a))
+    const secret = 'sk-made-up-0000000000000000'
+    for (const body of [{ comment: 'Good pace.' }, { step_id: 'a2-2', comment: 'Too wide.' }, { step_id: 'a2-3', comment: `Never print ${secret}.` },
+      { step_id: 'a2-2', comment: 'Ask me next time.' }]) {
+      expect((await comment(cookie, { project: a, job_id: 'job-a2', ...body })).status).toBe(200)
+    }
+    const written = lines('reviews.jsonl', a).map(line => JSON.parse(line) as ReviewLine)
+    expect(written.map(line => [line.job_id, line.step_id ?? null])).toEqual([['job-a2', null], ['job-a2', 'a2-2'], ['job-a2', 'a2-3'], ['job-a2', 'a2-2']])
+    // The real mask cleaned the planted secret before the line was written.
+    expect(readFileSync(file('reviews.jsonl', a), 'utf8')).not.toContain(secret)
+    expect(written[2]!.comment).toMatch(/^Never print \S+\.$/)
+    const html = (await call('GET', ReviewRoute.address(a, 'job-a2'), { cookie })).text
+    expect([html.includes(secret), html.includes('Too wide.')]).toEqual([false, false])
+    const entries = [...dom(html).querySelectorAll('ul.comments li')].map(entry => [entry.querySelector('strong')!.textContent, entry.querySelector('.mine')!.textContent])
+    expect(entries).toEqual([[ReviewPage.WHOLE_JOB, 'You: Good pace.'], ['Message received', 'You: Ask me next time.'], ['Session started', `You: ${written[2]!.comment}`]])
   })
 })

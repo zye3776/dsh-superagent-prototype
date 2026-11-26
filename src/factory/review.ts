@@ -1,7 +1,8 @@
 /**
- * The owner's review page, served at `/review` on DSH's web server: it shows what the super agent did in each job and takes the owner's comment on a job.
- * Left, the listed (target) projects and the jobs of the picked one, newest first; in the middle, the picked job's timeline, which also holds the requests
- * the fixed checks answered on their own while the job ran, and the job's always-open comment field; right, the detail of the step picked in the timeline.
+ * The owner's review page, served at `/review` on DSH's web server: it shows what the super agent did in each job and takes the owner's comments on a job
+ * and on any step of it. Left, the listed (target) projects and the jobs of the picked one, newest first; in the middle, the job's comments together, then
+ * its timeline, which also holds the requests the fixed checks answered on their own while the job ran, each comment echoed under its step; right, the
+ * detail of the step picked in the timeline and, below it, the always-open comment field for that step or for the whole job.
  * The factory's `JobsReader` builds the jobs from each project's `.factory/` records and its `StepDetailReader` reads a step's detail through the step's
  * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
@@ -14,7 +15,7 @@ import { createHmac, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, isAbsolute, resolve } from 'node:path'
 import {
-  FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type StepAsked, type StepDetail,
+  FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
 import { SharedTokenFile } from './token.ts'
@@ -95,9 +96,25 @@ export class ReviewAccess {
 export interface ReviewView { projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean; step?: TimelineStep; detail?: StepDetail }
 
 /**
+ * The owner's comments on one job as the page shows them: one for the whole job and one per step, each the newest line for it in file order,
+ * since a changed comment is written as a new line and the older lines stay in the file.
+ */
+export class JobComments {
+  /** The newest comment line per step id; the whole job's is under `''`. */
+  private readonly newest = new Map<string, ReviewLine>()
+  constructor(job: RecordedJob) {
+    for (const review of job.reviews) this.newest.set(review.step_id ?? '', review)
+  }
+
+  /** The comment on the whole job, or on the step with `stepId`; `undefined` when the owner wrote none. */
+  of(stepId?: string): string | undefined { return this.newest.get(stepId ?? '')?.comment }
+}
+
+/**
  * Builds the HTML of the review page. Every piece of text from a record or a request is escaped before it goes into the page.
- * The comment is an always-open text area: there is no Save button. A small script saves it when the owner leaves the field or pauses typing, and
- * says "Saving…", then "Saved", in one line under the field; on a failure the text stays and the line says so. An emptied field is not sent.
+ * The comment is an always-open text area at the bottom of the detail panel, for the picked step or the whole job: there is no Save button. A small
+ * script saves it when the owner leaves the field or pauses typing, and says "Saving…", then "Saved", in one line under the field; on a failure the
+ * text stays and the line says so. An emptied field is not sent.
  * The style names only DSH's design tokens, so served outside DSH's own client the browser's defaults show.
  */
 export class ReviewPage {
@@ -114,6 +131,12 @@ export class ReviewPage {
   static readonly SAVED = 'Saved'
   static readonly NOT_SAVED = 'Not saved. Your text is kept here; it is tried again when you type.'
   static readonly PICK_STEP = 'Pick a step in the timeline to see its detail.'
+  static readonly STEP_COMMENT = 'Your comment on this step'
+  static readonly JOB_COMMENT = 'Your comment on this job'
+  static readonly COMMENTS = 'Comments'
+  static readonly WHOLE_JOB = 'On the whole job'
+  /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */
+  static readonly WHOLE_JOB_KINDS: ReadonlySet<JobLogLine['kind']> = new Set(['job_start', 'job_stop'])
   /** What a part of a step reads when no record holds it: the label stays, never a blank or a guess. */
   static readonly NOT_RECORDED = 'Not recorded'
   /** The step detail's five parts, in the order the panel shows them. */
@@ -144,7 +167,9 @@ export class ReviewPage {
     '.left span { display: block; }',
     '.l2, .meta, .who { font-size: 11px; color: var(--dsw-alias-label-tertiary); }',
     '.pill { font-size: 11px; padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; color: var(--dsw-alias-label-secondary); }',
-    'ol { list-style: none; padding: 0; }',
+    'ol, ul.comments { list-style: none; padding: 0; }',
+    '.mine { margin-top: 6px; padding: 4px 8px; border-left: 3px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); font-size: 12px; }',
+    '.detail .comment { margin-top: 16px; }',
     'li { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
     'li.auto { color: var(--dsw-alias-label-tertiary); }',
     'li a.step { display: block; color: inherit; text-decoration: none; }',
@@ -171,7 +196,7 @@ export class ReviewPage {
   if (!field || !status) return
   let saved = field.value, timer, sending = false, again = false
   const send = (text, keepalive) => fetch(${JSON.stringify(ReviewRoute.COMMENT_PATH)}, { method: 'POST', credentials: 'same-origin', keepalive,
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: field.dataset.project, job_id: field.dataset.job, comment: text }) })
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: field.dataset.project, job_id: field.dataset.job, step_id: field.dataset.step, comment: text }) })
   const save = async () => {
     clearTimeout(timer)
     const text = field.value
@@ -223,14 +248,15 @@ export class ReviewPage {
 
   /**
    * The page of one view: a line naming where the owner is, the left panel (projects, then the picked project's jobs and, when it has any, its answers
-   * outside a job), and the middle panel: the job's timeline and its comment field, the answers outside a job, or the text saying there is no job yet.
-   * An automatic answer has no comment field; neither has the list outside a job.
+   * outside a job), the middle panel: the job's comments and its timeline, the answers outside a job, or the text saying there is no job yet; and, for a
+   * job, the right panel with the picked step's detail and the comment field. An automatic answer has no comment field; neither has the list outside a job.
    */
   view(view: ReviewView): string {
     const { project, job } = view
     const name = ReviewPage.escape(ReviewPage.nameOf(project.project))
     let crumb = `<span title="${ReviewPage.escape(project.project)}">${name}</span>`
     let middle: string
+    let panel = ''
     if (view.outside) {
       crumb += ` › ${ReviewPage.OUTSIDE}`
       middle = `<h2>${ReviewPage.OUTSIDE} · ${ReviewPage.count(project.outside.length, 'automatic answer')}</h2>
@@ -241,31 +267,74 @@ ${project.outside.map(answer => ReviewPage.automaticRow(answer)).join('\n')}
       middle = `<p>${ReviewPage.escape(ReviewPage.NO_JOB)}</p>`
     } else {
       crumb += ` › Job ${job.number} · ${ReviewPage.escape(ReviewPage.span(job))}${job.guideline_version === undefined ? '' : ` · <span class="pill">guideline ${ReviewPage.escape(job.guideline_version)}</span>`}`
-      const comment = job.reviews.findLast(review => review.step_id === undefined)?.comment ?? ''
-      middle = `<h2>Timeline · ${ReviewPage.count(job.steps.length, 'step')}</h2>
+      const comments = new JobComments(job)
+      middle = `${ReviewPage.commentList(job, comments)}<h2>Timeline · ${ReviewPage.count(job.steps.length, 'step')}</h2>
 <ol>
-${job.steps.map(step => ReviewPage.row(step, job, view.step)).join('\n')}
-</ol>
-<label for="comment">Your comment on this job</label>
-<textarea id="comment" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.escape(comment)}</textarea>
-<p id="comment-status" role="status"></p>
-<script nonce="${this.nonce}">${ReviewPage.script()}</script>`
+${job.steps.map(step => ReviewPage.row(step, job, view.step, comments)).join('\n')}
+</ol>`
+      panel = `<aside class="detail" aria-label="Step detail">
+${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
+<p>${ReviewPage.escape(ReviewPage.PICK_STEP)}</p>` : ReviewPage.detail(view.step, view.detail)}
+${this.commentField(job, view.step, comments)}
+</aside>`
     }
-    const panel = job !== undefined && !view.outside
     return this.document(`<div class="crumb">${crumb}</div>
-<div class="cols${panel ? ' with-detail' : ''}">
+<div class="cols${panel === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Projects and jobs">
 ${ReviewPage.left(view)}
 </nav>
 <main>
 ${middle}
 </main>
-${!panel ? '' : `<aside class="detail" aria-label="Step detail">
-${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
-<p>${ReviewPage.escape(ReviewPage.PICK_STEP)}</p>` : ReviewPage.detail(view.step, view.detail)}
-</aside>`}
+${panel}
 </div>`)
   }
+
+  /**
+   * The always-open comment field at the bottom of the detail panel: the picked step's comment, or the whole job's when no step, the job's start or its
+   * stop is picked. An answer of the fixed checks takes no comment, so it has no field.
+   */
+  private commentField(job: RecordedJob, picked: TimelineStep | undefined, comments: JobComments): string {
+    if (picked?.automatic === true) return ''
+    const stepId = picked === undefined || ReviewPage.WHOLE_JOB_KINDS.has(picked.line.kind) ? undefined : picked.line.step_id
+    return `<div class="comment">
+<label for="comment">${stepId === undefined ? ReviewPage.JOB_COMMENT : ReviewPage.STEP_COMMENT}</label>
+<textarea id="comment" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}"${
+  stepId === undefined ? '' : ` data-step="${ReviewPage.escape(stepId)}"`}>${ReviewPage.escape(comments.of(stepId) ?? '')}</textarea>
+<p id="comment-status" role="status"></p>
+</div>
+<script nonce="${this.nonce}">${ReviewPage.script()}</script>`
+  }
+
+  /**
+   * The job's comments together, above its timeline: the whole job's first, then each step's in timeline order, each once with its newest text and a link
+   * that picks its step. Nothing when the owner has not commented on the job yet.
+   */
+  private static commentList(job: RecordedJob, comments: JobComments): string {
+    const entries: string[] = []
+    const whole = comments.of()
+    if (whole !== undefined) entries.push(ReviewPage.commentEntry(ReviewRoute.address(job.project, job.job_id), `<strong>${ReviewPage.WHOLE_JOB}</strong>`, whole))
+    for (const step of job.steps) {
+      if (step.automatic) continue
+      const text = comments.of(step.line.step_id)
+      if (text === undefined) continue
+      entries.push(ReviewPage.commentEntry(ReviewRoute.address(job.project, job.job_id, false, step.line.step_id),
+        `${ReviewPage.time(step.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[step.line.kind] ?? step.line.kind)}</strong>`, text))
+    }
+    if (entries.length === 0) return ''
+    return `<h2>${ReviewPage.COMMENTS} · ${entries.length}</h2>
+<ul class="comments">
+${entries.join('\n')}
+</ul>
+`
+  }
+
+  private static commentEntry(href: string, heading: string, text: string): string {
+    return `<li><a class="step" href="${ReviewPage.escape(href)}">${heading}${ReviewPage.echo(text)}</a></li>`
+  }
+
+  /** The owner's comment as a read-only line under what it is about. */
+  private static echo(text: string): string { return `<div class="mine">You: ${ReviewPage.escape(text)}</div>` }
 
   /** The left panel: every listed project, then the picked project's jobs, newest first, then its answers outside a job when there are any. */
   private static left(view: ReviewView): string {
@@ -297,7 +366,7 @@ ${jobs.join('\n')}`
   static stepIdOf(step: TimelineStep): string { return step.automatic ? step.answer.request_id : step.line.step_id }
 
   /** One row of a job's timeline: a link that picks the step, marked when it is the picked one. */
-  private static row(step: TimelineStep, job: RecordedJob, picked: TimelineStep | undefined): string {
+  private static row(step: TimelineStep, job: RecordedJob, picked: TimelineStep | undefined, comments: JobComments): string {
     const id = ReviewPage.stepIdOf(step)
     const on = picked !== undefined && ReviewPage.stepIdOf(picked) === id
     const link = { href: ReviewRoute.address(job.project, job.job_id, false, id), on }
@@ -306,8 +375,10 @@ ${jobs.join('\n')}`
     const who = line.from === undefined || line.to === undefined ? '' : ` <span class="who">· ${ReviewPage.escape(line.from)} ──▶ ${ReviewPage.escape(line.to)}</span>`
     const pill = line.guideline_version === undefined ? '' : ` <span class="pill">guideline ${ReviewPage.escape(line.guideline_version)}</span>`
     const cost = [line.tokens === undefined ? '' : `${line.tokens.toLocaleString('en-US')} tokens`, line.ms === undefined ? '' : `${(line.ms / 1000).toFixed(1)} s`].filter(part => part !== '')
+    // The step's own comment shows under it; the whole job's under the row that stops the job.
+    const comment = line.kind === 'job_stop' ? comments.of() : comments.of(line.step_id)
     return ReviewPage.item([], '', link, `${ReviewPage.time(line.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>${who}${pill}<div>${
-      ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}`)
+      ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}${comment === undefined ? '' : ReviewPage.echo(comment)}`)
   }
 
   /** A timeline row: its content inside a link that picks the step when `link` is given, else as it is; the picked row is marked `on`. */
@@ -426,8 +497,10 @@ type ReviewTarget = 'page' | 'login' | 'comment'
  * for in every project), `&step=<id>` one step of that job, whose detail fills the right panel, and `&outside=1` its answers outside a job. A project,
  * job or step that is not there is 404. Without the cookie it answers 401 with the sign-in form and no record content.
  * `POST /review/login` takes the token from the form, and answers 303 to `/review` with the cookie set, 401 for a wrong or empty token, 503 with no token file.
- * `POST /review/comment` takes `{ job_id, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`; it answers 400 for an
- * empty comment or a body that is not that object, 404 for a job no listed project holds, 413 for a body over 64 KiB, and 401 without the cookie.
+ * `POST /review/comment` takes `{ project, job_id, step_id?, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`, on one
+ * step when `step_id` is given, else on the whole job; a changed comment is one more line. It answers 400 for an empty comment, a body that is not that
+ * object, an automatic answer's step or the job's start or stop row as `step_id`, 404 for a job no listed project holds or a step not in that job, 413 for a
+ * body over 64 KiB, and 401 without the cookie. It is the page's only address that writes, and it writes nothing but a comment line.
  * `ReviewAccess.admit` runs first on every request (403), then the method is checked (405), then the cookie; a body is read only after all three.
  * It refuses a web server that is not bound to 127.0.0.1. The token is never logged and never put in a page.
  */
@@ -536,15 +609,22 @@ export class ReviewRoute {
       throw new ReviewRefusal(400, 'The request body is not JSON')
     }
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new ReviewRefusal(400, 'The request body must be an object')
-    const { project, job_id, comment } = body as { project?: unknown; job_id?: unknown; comment?: unknown }
+    const { project, job_id, step_id, comment } = body as { project?: unknown; job_id?: unknown; step_id?: unknown; comment?: unknown }
     if (project !== undefined && (typeof project !== 'string' || project === '')) throw new ReviewRefusal(400, 'project must be non-empty text')
     if (typeof job_id !== 'string' || job_id === '') throw new ReviewRefusal(400, 'job_id must be non-empty text')
+    if (step_id !== undefined && (typeof step_id !== 'string' || step_id === '')) throw new ReviewRefusal(400, 'step_id must be non-empty text')
     if (typeof comment !== 'string' || comment.trim() === '') throw new ReviewRefusal(400, 'comment must be non-empty text')
     // Two projects may hold the same `job_id` (each is its own job), so the page names the project it shows and the job is looked for there only.
     const projects = (await this.read()).filter(each => project === undefined || each.project === project)
     const job = projects.flatMap(each => each.jobs).find(known => known.job_id === job_id)
     if (job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
-    await this.writer.write({ ts: this.now().toISOString(), project: job.project, job_id, comment })
+    if (step_id !== undefined) {
+      const step = job.steps.find(each => ReviewPage.stepIdOf(each) === step_id)
+      if (step === undefined) throw new ReviewRefusal(404, 'That step is not in this job')
+      if (step.automatic) throw new ReviewRefusal(400, 'An automatic answer takes no comment')
+      if (ReviewPage.WHOLE_JOB_KINDS.has(step.line.kind)) throw new ReviewRefusal(400, 'Comment on the whole job without a step')
+    }
+    await this.writer.write({ ts: this.now().toISOString(), project: job.project, job_id, ...(step_id === undefined ? {} : { step_id }), comment })
     ReviewRoute.sendJson(res, 200, { saved: true })
   }
 

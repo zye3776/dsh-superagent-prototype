@@ -80,10 +80,10 @@ export class FactoryGuardModule implements GuardSource {
  * `changed()` lists the files that differ now or are gone, so the judge re-reads only those. It asks for a file's facts and never opens a file.
  */
 export class ReadLedger {
-  /** Each file's full path and its stamp; the stamp of a file that is not there is `undefined`. */
+  /** Each file's full path and its stamp; the stamp of a file that is not there, or of a folder, is `undefined`. */
   private readonly stamps = new Map<string, string | undefined>()
   private static stampOf(path: string): string | undefined {
-    try { const facts = statSync(path); return `${facts.mtimeMs}:${facts.ctimeMs}:${facts.ino}:${facts.size}` } catch { return undefined }
+    try { const facts = statSync(path); return facts.isFile() ? `${facts.mtimeMs}:${facts.ctimeMs}:${facts.ino}:${facts.size}` : undefined } catch { return undefined }
   }
   /** How many files are remembered. */
   get size(): number { return this.stamps.size }

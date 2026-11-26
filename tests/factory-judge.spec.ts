@@ -206,6 +206,13 @@ describe('ReadLedger and the brief', () => {
   /** Moves the file's modification time on, as an edit that keeps its size does. */
   const touch = (path: string): void => { const later = new Date(Date.now() + 5000); utimesSync(path, later, later) }
 
+  it('does not count a folder as a file that was read', () => {
+    const ledger = new ReadLedger(), folder = join(project, 'src')
+    expect(ledger.recordExisting(folder)).toBe(false)
+    expect(ledger.has(folder)).toBe(false)
+    expect(ledger.recordExisting(join(folder, 'a.ts'))).toBe(true)
+  })
+
   it('sees a rewrite that keeps the size and the modification time', () => {
     const ledger = new ReadLedger(), a = join(project, 'src', 'a.ts')
     const before = statSync(a)

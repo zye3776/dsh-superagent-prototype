@@ -429,6 +429,13 @@ it('shows the last comment line of a job, whatever the times say', async () => {
   expect(dom((await call('GET', '/review', { cookie: await signIn() })).text).querySelector('textarea')!.value).toBe('Written last.')
 })
 
+it('shows the comment on the whole job, not a later comment on one of its steps', async () => {
+  await serve()
+  put('actions.jsonl', [action()])
+  put('reviews.jsonl', [review({ comment: 'On the whole job.' }), review({ ts: '2026-11-26T10:00:00.000Z', step_id: 'step-1', comment: 'On one step.' })])
+  expect(dom((await call('GET', '/review', { cookie: await signIn() })).text).querySelector('textarea')!.value).toBe('On the whole job.')
+})
+
 it('answers 500 with one fixed text when something else fails, and repeats nothing of the error', async () => {
   await serve([project], new FactoryRecordsModule(recordsModule(root, `export const JobLogMask = { forProject: () => ({ maskAction: line => line, maskReview: line => line }) }
 export class JobLogReader { read() { throw new Error(${JSON.stringify(PLANTED)}) } }\n`)))

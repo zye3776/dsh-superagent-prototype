@@ -55,7 +55,7 @@ export function apply(ctx: Context, config: FactoryConfig): void {
 export { AssessRoute, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
-export { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogLine, type ReadJobLog, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine } from './records.ts'
+export { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogKind, type JobLogLine, type JobStep, type ReadJobLog, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine } from './records.ts'
 export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewedJob, type ReviewTokenSource } from './review.ts'
 export { SharedTokenFile } from './token.ts'
 export { TokenTally, type TalliedEvent } from './usage.ts'

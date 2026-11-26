@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogLine, type ReviewLine } from '../src/factory/records.ts'
+import { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogLine, type JobStep, type ReviewLine } from '../src/factory/records.ts'
 import * as plugin from '../src/factory/index.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -56,6 +56,36 @@ it('masks a comment line and appends it to reviews.jsonl, a changed comment as a
   expect(lines('reviews.jsonl')).toEqual([first, second])
   expect(Object.keys(JSON.parse(first) as object)).toEqual(['ts', 'project', 'job_id', 'comment'])
   expect(existsSync(file('actions.jsonl'))).toBe(false)
+})
+
+it('builds the line of every kind from what its caller knows, stamped with the time and a new step_id', async () => {
+  const steps: JobStep[] = [
+    { kind: 'job_start', project, jobId: 'job-1', summary: 'Started.', dshSessionId: 'dsh-1', guidelineVersion: 'v1', tokens: 0, ms: 5 },
+    { kind: 'job_stop', project, jobId: 'job-1', summary: 'Stopped.' },
+    { kind: 'permission_answer', project, jobId: 'job-1', summary: 'Allowed bun test.', ref: 'decision-1', tokens: 1200, ms: 3400 },
+    { kind: 'fork_answer', project, jobId: 'job-1', summary: 'Chose the smaller fix.', ref: 'decision-2' },
+    { kind: 'message_in', project, jobId: 'job-1', summary: `Can I push ${PLANTED}?`, from: 'worker', to: 'super agent' },
+    { kind: 'message_out', project, jobId: 'job-1', summary: 'Not yet.', from: 'super agent', to: 'worker' },
+    { kind: 'session_start', project, jobId: 'job-1', summary: 'Started a worker.', ref: 'orca-7' },
+    { kind: 'session_steer', project, jobId: 'job-1', summary: 'Told the worker to rerun the tests.' },
+  ]
+  const rec = recorder()
+  const written = []
+  for (const step of steps) written.push(JSON.parse(await rec.record(step)) as JobLogLine)
+  expect(written.map(line => line.kind)).toEqual(steps.map(step => step.kind))
+  expect(written.map(line => line.step_id)).toEqual(steps.map((_, i) => `id-${i + 1}`))
+  expect(written[0]).toEqual({ ts: NOW, project, job_id: 'job-1', step_id: 'id-1', kind: 'job_start', summary: 'Started.', tokens: 0, ms: 5, dsh_session_id: 'dsh-1', guideline_version: 'v1' })
+  expect(written[2]).toMatchObject({ ref: 'decision-1', tokens: 1200, ms: 3400 })
+  expect(written[4]).toEqual({ ts: NOW, project, job_id: 'job-1', step_id: 'id-5', kind: 'message_in', summary: `Can I push ${REDACTED}?`, from: 'worker', to: 'super agent' })
+  // What the caller does not know is left out, not written empty.
+  expect(Object.keys(written[1] as object)).toEqual(['ts', 'project', 'job_id', 'step_id', 'kind', 'summary'])
+  expect(lines('actions.jsonl')).toHaveLength(steps.length)
+})
+
+it('writes a comment on one step with its step_id before the comment', async () => {
+  const text = await new ReviewWriter(records()).write(review({ step_id: 'step-3' }))
+  expect(Object.keys(JSON.parse(text) as object)).toEqual(['ts', 'project', 'job_id', 'step_id', 'comment'])
+  expect(JSON.parse(text)).toEqual(review({ step_id: 'step-3', comment: `Never print ${REDACTED}.` }))
 })
 
 it('begins a job when the plugin starts in a listed project that has its .factory folder', async () => {

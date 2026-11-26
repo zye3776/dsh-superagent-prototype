@@ -100,7 +100,10 @@ export class ReviewPage {
   static readonly SAVED = 'Saved'
   static readonly NOT_SAVED = 'Not saved. Your text is kept here; it is tried again when you type.'
   /** What each kind of job log line is called on the page. */
-  private static readonly HEADINGS: Record<JobLogLine['kind'], string> = { job_start: 'Job started' }
+  private static readonly HEADINGS: Record<JobLogLine['kind'], string> = {
+    job_start: 'Job started', job_stop: 'Job stopped', permission_answer: 'Permission answered', fork_answer: 'Fork answered',
+    message_in: 'Message received', message_out: 'Message sent', session_start: 'Session started', session_steer: 'Session steered',
+  }
   private static readonly STYLE = [
     'body { margin: 16px; font-size: 13px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1); }',
     'h1 { font-size: 13px; }',
@@ -341,7 +344,8 @@ export class ReviewRoute {
         // The sort keeps file order for lines of the same time. ISO-8601 times in UTC sort as text.
         lines.sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)
         // The last line in the file is the one that counts, whatever its time says: a clock that was set back must not bring an older comment back.
-        const newest = read.reviews.findLast(review => review.job_id === job_id)
+        // A comment on one step (it has a `step_id`) is not the comment on the whole job.
+        const newest = read.reviews.findLast(review => review.job_id === job_id && review.step_id === undefined)
         jobs.push({ job_id, project, started: lines[0]!.ts, lines, comment: newest?.comment ?? '' })
       }
     }

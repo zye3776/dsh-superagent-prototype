@@ -1,6 +1,6 @@
 /**
  * A stand-in for the factory's built job log file (`lib/dist/jobLog.js`), with the same exports, for the tests of the job log and of the review page.
- * Its mask replaces one planted value and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
+ * Its mask refuses an unknown kind or field, replaces one planted value in every text field and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
  */
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -13,12 +13,22 @@ export const REDACTED = '[redacted-secret]'
 export const FAKE_RECORDS = `import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 const clean = text => text.replaceAll(${JSON.stringify(PLANTED)}, ${JSON.stringify(REDACTED)})
+const KINDS = ['job_start', 'job_stop', 'permission_answer', 'fork_answer', 'message_in', 'message_out', 'session_start', 'session_steer']
+const ACTION_FIELDS = ['ts', 'project', 'job_id', 'step_id', 'kind', 'summary', 'ref', 'tokens', 'ms', 'from', 'to', 'dsh_session_id', 'guideline_version']
+const REVIEW_FIELDS = ['ts', 'project', 'job_id', 'step_id', 'comment']
+const ordered = (line, fields) => {
+  const unknown = Object.keys(line).find(name => !fields.includes(name))
+  if (unknown !== undefined) throw new Error(unknown + ': is not a field')
+  const out = {}
+  for (const name of fields) if (line[name] !== undefined) out[name] = typeof line[name] === 'string' && !['ts', 'project', 'kind'].includes(name) ? clean(line[name]) : line[name]
+  return out
+}
 export const JobLogMask = { forProject: project => ({
-  maskAction: ({ ts, project, job_id, step_id, kind, summary }) => {
-    if (kind !== 'job_start') throw new Error('kind: is not one of job_start')
-    return { ts, project, job_id, step_id, kind, summary: clean(summary) }
+  maskAction: line => {
+    if (!KINDS.includes(line.kind)) throw new Error('kind: is not one of ' + KINDS.join(', '))
+    return ordered(line, ACTION_FIELDS)
   },
-  maskReview: ({ ts, project, job_id, comment }) => ({ ts, project, job_id, comment: clean(comment) }),
+  maskReview: line => ordered(line, REVIEW_FIELDS),
 }) }
 export class JobLogReader {
   read(project) {

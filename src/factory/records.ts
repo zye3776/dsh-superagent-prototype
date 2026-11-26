@@ -1,7 +1,8 @@
 /**
  * The job log and the owner's comments: how a line reaches `<project>/.factory/actions.jsonl` or `<project>/.factory/reviews.jsonl`, and how both are read back.
- * A job is one stretch of the super agent's work. `JobRecorder` writes its lines, for now only the `job_start` line of the job that begins when the plugin
- * starts; `ReviewWriter` writes the owner's comment on a whole job, for the review page (`review.ts`).
+ * A job is one stretch of the super agent's work. `JobRecorder` builds and writes its lines, one for every kind the factory lists; so far the plugin itself
+ * writes only the `job_start` line of the job that begins when it starts. `ReviewWriter` writes the owner's comment on a whole job or on one step, for the
+ * review page (`review.ts`).
  * The shapes, the mask and the reader are the factory's own: this package does not copy them. It loads the factory's built file `lib/dist/jobLog.js` from the
  * absolute path in the plugin's `recordsModule` setting, passes every line through its mask before the line is appended, and reads the files with its reader.
  * Without a working module nothing is written and nothing is read.
@@ -12,10 +13,26 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, realpathSync, wri
 import { isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-/** One line of `actions.jsonl`, the job log, in the shape the factory's `lib/jobLog` checks. `kind` has one value so far. */
-export interface JobLogLine { ts: string; project: string; job_id: string; step_id: string; kind: 'job_start'; summary: string }
-/** One line of `reviews.jsonl`: the owner's comment on a whole job. */
-export interface ReviewLine { ts: string; project: string; job_id: string; comment: string }
+/** What a job log line can say happened. The factory's `lib/jobLog` holds the list (`JobLogSchema.KINDS`); this type follows it. */
+export type JobLogKind = 'job_start' | 'job_stop' | 'permission_answer' | 'fork_answer' | 'message_in' | 'message_out' | 'session_start' | 'session_steer'
+/**
+ * One line of `actions.jsonl`, the job log, in the shape the factory's `lib/jobLog` checks. Which optional fields a line may or must have depends on its kind:
+ * `ref` on the two answer kinds and `session_start`, `from` and `to` on the two message kinds, `dsh_session_id` and `guideline_version` on `job_start`.
+ */
+export interface JobLogLine {
+  ts: string; project: string; job_id: string; step_id: string; kind: JobLogKind; summary: string
+  ref?: string; tokens?: number; ms?: number; from?: string; to?: string; dsh_session_id?: string; guideline_version?: string
+}
+/** One line of `reviews.jsonl`: the owner's comment on a whole job, or on one step of it when `step_id` is there. */
+export interface ReviewLine { ts: string; project: string; job_id: string; step_id?: string; comment: string }
+/**
+ * What the code at the place an action happens knows about it, for `JobRecorder.record`: the recorder adds the time and a new `step_id`.
+ * Leave out what is not known: a cost that was not measured, or a session id the plugin has not learnt yet.
+ */
+export interface JobStep {
+  kind: JobLogKind; project: string; jobId: string; summary: string
+  ref?: string; tokens?: number; ms?: number; from?: string; to?: string; dshSessionId?: string; guidelineVersion?: string
+}
 /** What the factory's reader gives for one project: its job log lines and its comment lines, each list in file order. */
 export interface ReadJobLog { actions: JobLogLine[]; reviews: ReviewLine[] }
 
@@ -124,7 +141,8 @@ export class FactoryRecordsModule implements RecordsSource {
 }
 
 /**
- * Writes the job log: masks a line, then appends the masked line to its project's `actions.jsonl`.
+ * Writes the job log: builds a line from what the caller knows (`record`), masks it, then appends the masked line to its project's `actions.jsonl`.
+ * `lineOf` is the one place in this package that names the fields of a job log line; the factory's contract test runs it for every kind.
  * `start` is what the plugin calls once when it starts: it begins a new job in the folder DSH was started in, when that folder is a listed project
  * that already has its `.factory/` folder. In every other case it writes nothing, says why in one warning and lets DSH start.
  */
@@ -136,6 +154,19 @@ export class JobRecorder {
     private readonly newId: () => string = randomUUID) {
     // Normalised, as the `/assess` route does, so an entry written with a trailing slash still names the same folder.
     this.projects = projects.filter(project => isAbsolute(project)).map(project => resolve(project))
+  }
+  /** The job log line for `step`, stamped with the time now and a new `step_id`. A field the step does not have is left out, never written empty. */
+  lineOf(step: JobStep): JobLogLine {
+    const line: JobLogLine = { ts: this.now().toISOString(), project: step.project, job_id: step.jobId, step_id: this.newId(), kind: step.kind, summary: step.summary }
+    const known: Omit<JobLogLine, 'ts' | 'project' | 'job_id' | 'step_id' | 'kind' | 'summary'> = {
+      ref: step.ref, tokens: step.tokens, ms: step.ms, from: step.from, to: step.to, dsh_session_id: step.dshSessionId, guideline_version: step.guidelineVersion,
+    }
+    for (const [name, value] of Object.entries(known)) if (value !== undefined) Object.assign(line, { [name]: value })
+    return line
+  }
+  /** Builds the line for `step`, masks it and appends it. Returns the exact text written, without its line break. Rejects with `RecordsRefusal`, and then nothing is written. */
+  async record(step: JobStep): Promise<string> {
+    return this.write(this.lineOf(step))
   }
   /** Masks one line and appends it. Returns the exact text written, without its line break. Rejects with `RecordsRefusal`, and then nothing is written. */
   async write(line: JobLogLine): Promise<string> {
@@ -157,7 +188,7 @@ export class JobRecorder {
       if (project === undefined) reason = `the folder DSH was started in (${folder}) is not a listed project`
       else if (!FactoryRecordFile.hasFolder(project)) reason = `${project} has no ${FactoryRecordFile.FOLDER} folder yet`
       else {
-        const line: JobLogLine = { ts: this.now().toISOString(), project, job_id: this.newId(), step_id: this.newId(), kind: 'job_start', summary: JobRecorder.START_SUMMARY }
+        const line = this.lineOf({ kind: 'job_start', project, jobId: this.newId(), summary: JobRecorder.START_SUMMARY })
         await this.write(line)
         return line
       }
@@ -178,7 +209,7 @@ export class JobRecorder {
 }
 
 /**
- * Writes the owner's comment on a whole job: masks the line, then appends the masked line to its project's `reviews.jsonl`.
+ * Writes the owner's comment on a whole job, or on one step when the line has a `step_id`: masks the line, then appends the masked line to its project's `reviews.jsonl`.
  * A changed comment is a new line; the newest line of a job is the one that counts. A line that cannot be masked is not written.
  */
 export class ReviewWriter {

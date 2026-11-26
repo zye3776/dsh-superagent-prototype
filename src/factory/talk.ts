@@ -150,7 +150,10 @@ export class TalkTexts {
 }
 
 /**
- * The talk's opening message, the `q` of its link: the title line, what the talk is for, the lookup rule, the comments, the job and the guideline.
+ * The talk's opening message, the `q` of its link: the title line, the folder check, what the talk is for, the lookup rule, the comments, the job
+ * and the guideline. The folder check comes first because Claude Desktop can start the session somewhere other than the talk folder (it was seen
+ * starting from the project selected in its Code tab, in a worktree of that repository): there the deny rules and the propose server do not apply,
+ * so Claude stops at once with a plain message instead of talking the job through.
  * Claude Desktop cuts a longer `q` at about 14,000 characters, so a message that would pass `MAX_CHARS` keeps the title line, what the talk is for, the
  * lookup rule and the comments, and names the files that hold the rest; comments longer than that are cut and point to their file too.
  * Its parts are the masked texts of the files, and the whole message goes through the mask once more when it is done (`ReviewTalks.start`).
@@ -161,10 +164,20 @@ export class TalkOpening {
     + 'never job text, comments, project code or a file path.'
   static readonly CUT = '… (the rest is in comments.md)'
 
-  /** The message for a job whose files hold `texts`, each already masked. */
-  static build(job: RecordedJob, texts: { title: string; job: string; comments: string; guideline: string }, read: GuidelineRead): string {
+  /** The folder check for the talk folder named `folder`: Claude reads its working folder from its own environment, so the check needs no tool. */
+  static folderCheck(folder: string): string {
+    return `Before anything else, check your working folder, as your environment states it. It must be the talk folder ${folder}, under `
+      + `~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "${TalkOpening.WRONG_FOLDER}", then add your working folder's path, `
+      + 'and do nothing else: read no file, call no tool and do not discuss the job.'
+  }
+
+  static readonly WRONG_FOLDER = 'This review talk opened in the wrong folder, so it is stopping here. Close this session, and in Claude Desktop\'s Code tab '
+    + 'choose no project and switch Worktree off, then start the talk again from the review page.'
+
+  /** The message for a job whose files hold `texts`, each already masked, written to the talk folder named `folder`. */
+  static build(job: RecordedJob, folder: string, texts: { title: string; job: string; comments: string; guideline: string }, read: GuidelineRead): string {
     const version = read.current === null ? 'there is none yet, so a proposal would be version 1' : `version ${read.current.version}`
-    const head = [texts.title, '',
+    const head = [texts.title, '', TalkOpening.folderCheck(folder), '',
       `This review talk is about job ${job.number} of ${TalkTexts.nameOf(job.project)} (job id ${job.job_id}), which the super agent led. The owner has commented on it. `
       + `Talk the comments through with the owner. When you both agree on a change to the super agent's decision guideline (${version}), call the tool `
       + `propose_guideline_change with job_id "${job.job_id}" and the whole new guideline text. The owner then sees it on the review page beside the current `
@@ -376,7 +389,7 @@ export class ReviewTalks {
     const state: TalkState = { project: job.project, job_id: job.job_id, number: job.number, title, started: this.now().toISOString() }
     const mcp = TalkFolder.mcpOf({ node: this.node, server: this.serverFile, url: address, tokenFile: this.tokenFile }, this.home)
     folder.write({ mcp, job: texts.job, comments: texts.comments, guideline: texts.guideline, state }, mask)
-    return { opened: true, link: TalkLink.of(folder.path, mask(TalkOpening.build(job, texts, read))), state: folder.state() ?? { ...state, title } }
+    return { opened: true, link: TalkLink.of(folder.path, mask(TalkOpening.build(job, basename(folder.path), texts, read))), state: folder.state() ?? { ...state, title } }
   }
 
   /** The project's mask over one plain text, from the factory's records module. Any failure is a 503 that repeats nothing of the text. */

@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { FactoryRecordsModule, type GuidelineRead, type JobLogLine, type RecordedJob, type RecordsMasker, type RecordsSource, type ReviewLine, type StepDetail, type TimelineStep } from '../src/factory/records.ts'
 import { ReviewPage } from '../src/factory/review.ts'
@@ -117,22 +117,28 @@ describe('TalkFolder', () => {
 describe('TalkOpening', () => {
   const texts = (comments: string, jobText = 'The job.') => ({ title: 'Review talk · shop job 3', job: jobText, comments, guideline: 'Keep it small.\n' })
   it('starts with the title line and holds what the talk is for, the lookup rule, the comments, the job and the guideline', () => {
-    const message = TalkOpening.build(job(), texts('Good pace.'), guideline('Keep it small.\n'))
+    const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('Good pace.'), guideline('Keep it small.\n'))
     expect(message.split('\n')[0]).toBe('Review talk · shop job 3')
     for (const part of [TalkOpening.LOOKUP_RULE, 'propose_guideline_change with job_id "job-1"', 'Good pace.', 'The job.', 'Keep it small.', 'version 2']) expect(message).toContain(part)
+    // The folder check comes right after the title line, before anything about the job, and names this talk's own folder.
+    expect(message.split('\n').slice(0, 3)).toEqual(['Review talk · shop job 3', '', 'Before anything else, check your working folder, as your environment states it. '
+      + 'It must be the talk folder shop-job-3-0123abcd, under ~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "This review talk '
+      + 'opened in the wrong folder, so it is stopping here. Close this session, and in Claude Desktop\'s Code tab choose no project and switch Worktree off, '
+      + 'then start the talk again from the review page.", then add your working folder\'s path, and do nothing else: read no file, call no tool and do not '
+      + 'discuss the job.'])
   })
 
   it('past 14,000 characters keeps the title line, the comments and the lookup rule, and names the files that hold the rest', () => {
-    const message = TalkOpening.build(job(), texts('Good pace.', 'x'.repeat(20_000)), guideline('Keep it small.\n'))
+    const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('Good pace.', 'x'.repeat(20_000)), guideline('Keep it small.\n'))
     expect(message.length).toBeLessThanOrEqual(TalkOpening.MAX_CHARS)
-    for (const part of ['Review talk · shop job 3', TalkOpening.LOOKUP_RULE, 'Good pace.', 'job.md', 'guideline.md']) expect(message).toContain(part)
+    for (const part of ['Review talk · shop job 3', TalkOpening.folderCheck('shop-job-3-0123abcd'), TalkOpening.LOOKUP_RULE, 'Good pace.', 'job.md', 'guideline.md']) expect(message).toContain(part)
     expect(message).not.toContain('xxxxxxxxxx')
-    const long = TalkOpening.build(job(), texts('y'.repeat(20_000)), guideline('Keep it small.\n'))
-    expect([long.length <= TalkOpening.MAX_CHARS, long.includes(TalkOpening.CUT), long.includes(TalkOpening.LOOKUP_RULE)]).toEqual([true, true, true])
+    const long = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('y'.repeat(20_000)), guideline('Keep it small.\n'))
+    expect([long.length <= TalkOpening.MAX_CHARS, long.includes(TalkOpening.CUT), long.includes(TalkOpening.LOOKUP_RULE), long.includes(TalkOpening.folderCheck('shop-job-3-0123abcd'))]).toEqual([true, true, true, true])
   })
 
   it('says there is no guideline yet and that a proposal would be version 1', () => {
-    const message = TalkOpening.build(job(), { ...texts('Good pace.'), guideline: TalkTexts.guideline(guideline(null)) }, guideline(null))
+    const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', { ...texts('Good pace.'), guideline: TalkTexts.guideline(guideline(null)) }, guideline(null))
     expect(message).toContain('there is none yet, so a proposal would be version 1')
     expect(message).toContain('There is no guideline yet. A proposal would be version 1.')
   })
@@ -167,7 +173,7 @@ describe('ReviewTalks', () => {
     expect(readFileSync(join(folder, 'guideline.md'), 'utf8')).toBe('# Guideline\nKeep it small.\n')
     expect([folderOf(started.link), started.link.startsWith('claude://code/new?folder=')]).toEqual([folder, true])
     const message = messageOf(started.link)
-    for (const part of ['Good pace.', 'Reject this at this stage.', 'Keep it small.', TalkOpening.LOOKUP_RULE]) expect(message).toContain(part)
+    for (const part of ['Good pace.', 'Reject this at this stage.', 'Keep it small.', TalkOpening.LOOKUP_RULE, TalkOpening.folderCheck(basename(folder))]) expect(message).toContain(part)
     expect(message.split('\n')[0]).toBe('Review talk · shop job 3')
   })
 

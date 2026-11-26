@@ -6,7 +6,8 @@
  * The shapes, the mask and the reader are the factory's own: this package does not copy them. It loads the factory's built file `lib/dist/jobLog.js` from the
  * absolute path in the plugin's `recordsModule` setting, passes every line through its mask before the line is appended, and reads the files with its reader.
  * Without a working module nothing is written and nothing is read.
- * This file imports only Node's own modules, so the factory's contract test can run it with Node straight from source.
+ * This file imports only Node's own modules and uses only TypeScript that Node can strip (no constructor parameter properties), so the factory's
+ * contract test and a test's child process can run it with Node straight from source.
  */
 import { randomUUID } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync, realpathSync, writeSync } from 'node:fs'
@@ -41,7 +42,10 @@ export interface ReadJobLog { actions: JobLogLine[]; reviews: ReviewLine[] }
  * 409 is a project that cannot take the line (no `.factory/` folder, or a symlink in the way); 503 is a records module that is missing or does not work.
  * Nothing is written in either case.
  */
-export class RecordsRefusal extends Error { constructor(readonly status: 409 | 503, message: string) { super(message) } }
+export class RecordsRefusal extends Error {
+  readonly status: 409 | 503
+  constructor(status: 409 | 503, message: string) { super(message); this.status = status }
+}
 
 /**
  * Appends lines to one record file in a project's `.factory/` folder, and never rewrites or removes one.
@@ -54,7 +58,9 @@ export class FactoryRecordFile {
   static readonly FOLDER = '.factory'
   static readonly ACTIONS = 'actions.jsonl'
   static readonly REVIEWS = 'reviews.jsonl'
-  constructor(readonly project: string, readonly file: typeof FactoryRecordFile.ACTIONS | typeof FactoryRecordFile.REVIEWS) {}
+  readonly project: string
+  readonly file: typeof FactoryRecordFile.ACTIONS | typeof FactoryRecordFile.REVIEWS
+  constructor(project: string, file: typeof FactoryRecordFile.ACTIONS | typeof FactoryRecordFile.REVIEWS) { this.project = project; this.file = file }
   /** Whether the project has a real `.factory/` folder. lstat does not follow a symlink, so a link to a folder does not count as the folder. */
   static hasFolder(project: string): boolean {
     try { return lstatSync(join(project, FactoryRecordFile.FOLDER)).isDirectory() } catch { return false }
@@ -103,7 +109,8 @@ interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogRe
 export class FactoryRecordsModule implements RecordsSource {
   private readonly maskers = new Map<string, RecordsMasker>()
   private kept: RecordsReader | undefined
-  constructor(readonly path?: string) {}
+  readonly path: string | undefined
+  constructor(path?: string) { this.path = path }
   async maskerFor(project: string): Promise<RecordsMasker> {
     const known = this.maskers.get(project)
     if (known) return known
@@ -150,8 +157,13 @@ export class JobRecorder {
   /** What the `job_start` line says. */
   static readonly START_SUMMARY = 'The super agent\'s factory plugin started.'
   private readonly projects: readonly string[]
-  constructor(private readonly records: RecordsSource, projects: readonly string[], private readonly now: () => Date = () => new Date(),
-    private readonly newId: () => string = randomUUID) {
+  private readonly records: RecordsSource
+  private readonly now: () => Date
+  private readonly newId: () => string
+  constructor(records: RecordsSource, projects: readonly string[], now: () => Date = () => new Date(), newId: () => string = randomUUID) {
+    this.records = records
+    this.now = now
+    this.newId = newId
     // Normalised, as the `/assess` route does, so an entry written with a trailing slash still names the same folder.
     this.projects = projects.filter(project => isAbsolute(project)).map(project => resolve(project))
   }
@@ -178,17 +190,18 @@ export class JobRecorder {
     return new FactoryRecordFile(line.project, FactoryRecordFile.ACTIONS).append(masked)
   }
   /**
-   * Begins a new job in `folder`, the folder DSH was started in: one `job_start` line with a new `job_id` and `step_id`.
+   * Begins a job in `folder`, the folder DSH was started in: one `job_start` line with a new `step_id`. The line takes `job.jobId` when given, else a
+   * new `job_id`, and `job.dshSessionId` when given.
    * Returns the line as it was handed to the mask, or `undefined` when none was written; `warn` is then called once with the reason. It never throws.
    */
-  async start(folder: string, warn: (message: string) => void): Promise<JobLogLine | undefined> {
+  async start(folder: string, warn: (message: string) => void, job: { jobId?: string; dshSessionId?: string } = {}): Promise<JobLogLine | undefined> {
     let reason: string
     try {
       const project = this.listed(folder)
       if (project === undefined) reason = `the folder DSH was started in (${folder}) is not a listed project`
       else if (!FactoryRecordFile.hasFolder(project)) reason = `${project} has no ${FactoryRecordFile.FOLDER} folder yet`
       else {
-        const line = this.lineOf({ kind: 'job_start', project, jobId: this.newId(), summary: JobRecorder.START_SUMMARY })
+        const line = this.lineOf({ kind: 'job_start', project, jobId: job.jobId ?? this.newId(), summary: JobRecorder.START_SUMMARY, dshSessionId: job.dshSessionId })
         await this.write(line)
         return line
       }
@@ -213,7 +226,8 @@ export class JobRecorder {
  * A changed comment is a new line; the newest line of a job is the one that counts. A line that cannot be masked is not written.
  */
 export class ReviewWriter {
-  constructor(private readonly records: RecordsSource) {}
+  private readonly records: RecordsSource
+  constructor(records: RecordsSource) { this.records = records }
   /** Returns the exact text written, without its line break. Rejects with `RecordsRefusal`, and then nothing is written. */
   async write(line: ReviewLine): Promise<string> {
     const masker = await this.records.maskerFor(line.project)

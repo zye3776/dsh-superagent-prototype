@@ -220,35 +220,48 @@ it('gives the reader of the records module, built once, and refuses with 503 wit
   expect(await refusal(() => records('export class JobLogReader {}\n').reader())).toEqual([503, 'The configured recordsModule gave no reader, so no record is read'])
 })
 
-it('is wired into the plugin: its start writes the job_start line of the folder DSH was started in, or warns once', async () => {
+it('is wired into the plugin: a run writes job_start and job_stop to the folder DSH was started in, or warns once', async () => {
   expect(plugin.Config({ recordsModule: '/factory/lib/dist/jobLog.js' })).toMatchObject({ recordsModule: '/factory/lib/dist/jobLog.js' })
   expect(() => plugin.Config({ recordsModule: 'relative/jobLog.js' })).toThrow()
   expect([plugin.JobRecorder, plugin.ReviewWriter, plugin.FactoryRecordsModule]).toEqual([JobRecorder, ReviewWriter, FactoryRecordsModule])
   const warn = vi.fn()
-  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: () => () => {} }, effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn } }
+  const on = vi.fn()
+  // The cleanups the plugin leaves, run as DSH runs them when it stops the plugin.
+  const cleanups: (() => unknown)[] = []
+  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: () => () => {} }, effect: (effect: () => () => unknown) => { cleanups.push(effect()) },
+    logger: { info: vi.fn(), warn }, on }
+  const stop = async () => { for (const cleanup of cleanups.splice(0)) await cleanup() }
   const cwd = vi.spyOn(process, 'cwd')
   try {
     cwd.mockReturnValue(project)
     plugin.apply(ctx as never, plugin.Config({ projects: [project], recordsModule: recordsModule(root) }))
-    await vi.waitFor(() => { expect(lines('actions.jsonl')).toHaveLength(1) })
-    expect(JSON.parse(lines('actions.jsonl')[0]!)).toMatchObject({ project, kind: 'job_start', job_id: expect.stringMatching(/^[0-9a-f-]{36}$/) as string })
+    expect(on).toHaveBeenCalledWith('session/event', expect.any(Function))
+    // Nothing is written until something happens or the plugin stops.
+    expect(existsSync(file('actions.jsonl'))).toBe(false)
+    await stop()
+    const [start, end] = lines('actions.jsonl').map(line => JSON.parse(line) as JobLogLine)
+    expect(start).toMatchObject({ project, kind: 'job_start', job_id: expect.stringMatching(/^[0-9a-f-]{36}$/) as string })
+    expect(end).toMatchObject({ project, kind: 'job_stop', job_id: start!.job_id })
     expect(warn).not.toHaveBeenCalled()
-    // Started in a folder that is not listed: no line, one warning, and the plugin still starts.
+    // Started in a folder that is not listed: no line, one warning, and the plugin still starts and stops.
     cwd.mockReturnValue(root)
     plugin.apply(ctx as never, plugin.Config({ projects: [project], recordsModule: recordsModule(root) }))
-    await vi.waitFor(() => { expect(warn).toHaveBeenCalledTimes(1) })
+    await stop()
+    expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls[0]).toEqual(['dsh-superagent-factory: %s', expect.stringContaining('is not a listed project')])
     // No records module: the same.
     cwd.mockReturnValue(project)
     plugin.apply(ctx as never, plugin.Config({ projects: [project] }))
-    await vi.waitFor(() => { expect(warn).toHaveBeenCalledTimes(2) })
+    await stop()
+    expect(warn).toHaveBeenCalledTimes(2)
     expect(warn.mock.calls[1]![1]).toContain('No recordsModule is configured')
-    expect(lines('actions.jsonl')).toHaveLength(1)
-    // The start folder was deleted, so asking for it throws: one warning, and the plugin still starts.
+    expect(lines('actions.jsonl')).toHaveLength(2)
+    // The start folder was deleted, so asking for it throws: one warning, and the plugin still starts and stops.
     cwd.mockImplementation(() => { throw new Error('ENOENT: no such file or directory, uv_cwd') })
     expect(() => { plugin.apply(ctx as never, plugin.Config({ projects: [project], recordsModule: recordsModule(root) })) }).not.toThrow()
+    await stop()
     expect(warn).toHaveBeenCalledTimes(3)
     expect(warn.mock.calls[2]).toEqual(['dsh-superagent-factory: %s', 'No job_start line was written: the folder DSH was started in is gone'])
-    expect(lines('actions.jsonl')).toHaveLength(1)
+    expect(lines('actions.jsonl')).toHaveLength(2)
   } finally { cwd.mockRestore() }
 })

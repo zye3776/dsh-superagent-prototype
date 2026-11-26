@@ -594,7 +594,7 @@ it('is wired into the plugin: the page reads the configured token file and the c
   const registered: Route[] = []
   const info = vi.fn(), warn = vi.fn()
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info, warn } }
+    effect: (effect: () => () => void) => effect(), logger: { info, warn }, on: () => () => {} }
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: recordsModule(root) }))
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
   const signing = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
@@ -607,7 +607,7 @@ it('is wired into the plugin: the page reads the configured token file and the c
   await handler('/review')(unsigned.req, unsigned.res)
   expect(unsigned.answer.status).toBe(401)
   // The token reaches no log line.
-  await vi.waitFor(() => { expect(warn).toHaveBeenCalled() })
+  expect(info).toHaveBeenCalled()
   expect(JSON.stringify([info.mock.calls, warn.mock.calls])).not.toContain(TOKEN)
   expect([plugin.ReviewRoute, plugin.ReviewPage, plugin.ReviewAccess]).toEqual([ReviewRoute, ReviewPage, ReviewAccess])
 })

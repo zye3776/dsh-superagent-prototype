@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
 import { AssessRefusal, DecisionWriter, type Decision } from './decisions.ts'
+import type { JobAnswer } from './job.ts'
 import { SharedTokenFile } from './token.ts'
 
 export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
@@ -93,6 +94,8 @@ interface AnonymousRoute {
 
 /** Where the route gets the shared token from, on every request. `undefined` means there is no usable token. */
 export interface TokenSource { read(): string | undefined }
+/** Where the route tells each decision it wrote, for the job log: the plugin's `FactoryJob`. It never rejects. */
+export interface AnswerLog { answered(answer: JobAnswer): Promise<void> }
 
 /**
  * Serves `POST /assess` on DSH's web server, for the factory on this machine only.
@@ -111,7 +114,7 @@ export class AssessRoute {
   static readonly LOOPBACK_ADDRESSES: ReadonlySet<string> = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
   private readonly projects: ReadonlySet<string>
   constructor(projects: readonly string[], private readonly tokens: TokenSource = new SharedTokenFile(), private readonly judge: Judge = new StubJudge(),
-    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter()) {
+    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter(), private readonly log?: AnswerLog) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     // Normalised, so an entry written with a trailing slash or `..` still matches the absolute path a caller sends.
@@ -166,13 +169,17 @@ export class AssessRoute {
    * Decides one request, and has the decision masked and appended to its project's file. Returns the line as written, which is the masked one.
    * `seconds` is the whole time the judge took: opening its Session, waiting behind earlier questions of the same worker session, the question and, when there
    * was one, the repair question. The caller is not watched: a decision that comes after the caller gave up is still written.
+   * Once the decision is written, the job log gets a `permission_answer` line that points at it; a line that cannot be written changes nothing here.
    */
   async assess(request: AssessRequest): Promise<string> {
     if (!this.projects.has(request.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
     const started = performance.now()
     const verdict = await this.judge.decide(request)
     const seconds = Math.round(performance.now() - started) / 1000
-    return this.writer.write({ ...verdict, seconds, ts: this.now().toISOString(), project: request.project })
+    const written = await this.writer.write({ ...verdict, seconds, ts: this.now().toISOString(), project: request.project })
+    await this.log?.answered({ project: request.project, requestId: request.request_id, decisionId: verdict.decision_id, decision: verdict.decision,
+      tokens: verdict.tokens, seconds })
+    return written
   }
 
   /**

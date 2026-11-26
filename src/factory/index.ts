@@ -1,6 +1,7 @@
 /**
  * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
- * It also begins a job in the job log when it starts, and mounts the owner's review page at `/review`.
+ * Each run of the plugin is one job in the job log: its start, each permission answer, each message into or out of the main session, and its stop
+ * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`.
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -12,7 +13,9 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import s from '@deepseek-ai/schemastery'
 import { AssessRoute } from './assess.ts'
 import { DecisionWriter, FactoryMaskModule } from './decisions.ts'
+import { FactoryJob } from './job.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
+import { MainSessionWatch } from './mainsession.ts'
 import { FactoryRecordsModule, JobRecorder } from './records.ts'
 import { ReviewRoute } from './review.ts'
 import { SharedTokenFile } from './token.ts'
@@ -35,25 +38,29 @@ export const Config = s.object({
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
-  const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
-  const tokens = new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH)
-  const route = new AssessRoute(config.projects ?? [], tokens, new ModelJudge(judges), undefined,
-    new DecisionWriter(new FactoryMaskModule(config.maskModule)))
-  ctx.effect(() => route.register(ctx), 'factory: assess route')
-  ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
-  const records = new FactoryRecordsModule(config.recordsModule)
-  const review = new ReviewRoute(config.projects ?? [], tokens, records)
-  ctx.effect(() => review.register(ctx), 'factory: review page')
-  // The start of this plugin is the start of a job. The line is written in the background: `start` never rejects, and DSH starts with or without it.
+  // This run of the plugin is one job. Its lines are written as things happen; `FactoryJob` never rejects, so DSH works with or without them.
   const warn = (message: string) => { ctx.logger.warn('dsh-superagent-factory: %s', message) }
   let folder: string | undefined
   // Asking for the start folder throws when that folder was deleted since.
   try { folder = process.cwd() } catch { /* told below */ }
   if (folder === undefined) warn('No job_start line was written: the folder DSH was started in is gone')
-  else void new JobRecorder(records, config.projects ?? []).start(folder, warn)
+  const records = new FactoryRecordsModule(config.recordsModule)
+  const job = new FactoryJob(new JobRecorder(records, config.projects ?? []), folder, warn)
+  new MainSessionWatch(job).install(ctx)
+  ctx.effect(() => () => job.stop(), 'factory: job stop')
+  const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
+  const tokens = new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH)
+  const route = new AssessRoute(config.projects ?? [], tokens, new ModelJudge(judges), undefined,
+    new DecisionWriter(new FactoryMaskModule(config.maskModule)), job)
+  ctx.effect(() => route.register(ctx), 'factory: assess route')
+  ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
+  const review = new ReviewRoute(config.projects ?? [], tokens, records)
+  ctx.effect(() => review.register(ctx), 'factory: review page')
 }
-export { AssessRoute, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
+export { AssessRoute, StubJudge, TempFactsShape, type AnswerLog, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
+export { FactoryJob, type JobAnswer } from './job.ts'
+export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogKind, type JobLogLine, type JobStep, type ReadJobLog, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine } from './records.ts'
 export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewedJob, type ReviewTokenSource } from './review.ts'

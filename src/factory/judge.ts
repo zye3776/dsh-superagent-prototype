@@ -240,9 +240,11 @@ export class JudgeSessions implements JudgeOpener {
   private readonly guarded = new WeakSet<Agent>()
   constructor(private readonly ctx: Pick<Context, 'sessionController' | 'workspaceRegistry' | 'permissionPresets'>, private readonly guards: GuardSource) {}
 
+  /** How every judge Session's id begins, so other code can tell a judge from the owner's own Sessions. */
+  static readonly PREFIX = 'factory-judge-'
   /** The DSH Session id of one pair: the same on every run, and it says nothing of the project's path. */
   static idOf(project: string, sessionId: string): string {
-    return `factory-judge-${createHash('sha256').update(`${project}\n${sessionId}`).digest('hex').slice(0, 16)}`
+    return `${JudgeSessions.PREFIX}${createHash('sha256').update(`${project}\n${sessionId}`).digest('hex').slice(0, 16)}`
   }
   /** How many judges were opened so far. */
   get count(): number { return this.judges.size }

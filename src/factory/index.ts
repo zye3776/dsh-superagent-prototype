@@ -9,6 +9,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-workspace'
 import s from '@deepseek-ai/schemastery'
+import { PendingApprovals } from './approvals.ts'
 import { AssessRoute } from './assess.ts'
 import { DecisionWriter, FactoryMaskModule } from './decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
@@ -27,16 +28,19 @@ export const Config = s.object({
     .description('The factory\'s built mask file, lib/dist/decisionMask.js in the factory\'s folder. Absolute path, no default; every decision is masked with it before it is written, and without it the route answers 503.'),
   guardModule: s.string().pattern(/^\//)
     .description('The factory\'s built judge guard file, lib/dist/judgeGuard.js in the factory\'s folder. Absolute path, no default; every tool call of a judge Session is checked with it, and without it no judge Session is opened and the route answers 503.'),
+  approvalSeconds: s.number().min(PendingApprovals.MIN_SECONDS).max(PendingApprovals.MAX_SECONDS).step(1).default(PendingApprovals.DEFAULT_SECONDS)
+    .description('How long an approval a worker asked for before acting (POST /ask) is held for the factory\'s hook to claim (POST /claim), in seconds. Held in memory only; a restart drops them.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
   const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
   const route = new AssessRoute(config.projects ?? [], new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH), new ModelJudge(judges), undefined,
-    new DecisionWriter(new FactoryMaskModule(config.maskModule)))
-  ctx.effect(() => route.register(ctx), 'factory: assess route')
-  ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
+    new DecisionWriter(new FactoryMaskModule(config.maskModule)), new PendingApprovals(config.approvalSeconds ?? PendingApprovals.DEFAULT_SECONDS))
+  ctx.effect(() => route.register(ctx), 'factory: assess, ask and claim routes')
+  ctx.logger.info('dsh-superagent-factory serves POST %s, %s and %s for %d project(s)', AssessRoute.PATH, AssessRoute.ASK_PATH, AssessRoute.CLAIM_PATH, route.projectCount)
 }
-export { AssessRoute, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
+export { PendingApprovals, type ApprovalClaim, type HeldApproval } from './approvals.ts'
+export { AssessRoute, StubJudge, TempFactsShape, type AskRequest, type AssessRequest, type ClaimRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export { SharedTokenFile } from './token.ts'

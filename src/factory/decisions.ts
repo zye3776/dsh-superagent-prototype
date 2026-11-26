@@ -3,6 +3,8 @@
  * The mask is the factory's own: this package does not copy it. It loads the factory's built file `lib/dist/decisionMask.js` from the absolute
  * path in the plugin's `maskModule` setting, and passes every decision line through it before the line is appended, so no secret and nothing that
  * says who the owner is reaches the file. Without a working mask nothing is written: the request is refused with 503.
+ * The same built file also masks a request a worker asks about before it acts (`/ask`) and gives the factory's key of that request, so this package
+ * copies neither.
  * This file imports only Node's own modules, so the factory's contract test can run it with Node straight from source.
  */
 import { closeSync, constants, lstatSync, openSync, writeSync } from 'node:fs'
@@ -66,11 +68,27 @@ export class DecisionsFile {
 }
 
 /** Cleans one decision line: the result holds no secret and nothing that says who the owner is. It throws when the line is not a decision. */
-export interface DecisionMasker { mask(line: DecisionLine): DecisionLine }
-/** Gives the masker of one project. It rejects with `AssessRefusal(503)` when there is none. */
-export interface MaskSource { maskerFor(project: string): Promise<DecisionMasker> }
-/** What the factory's built mask file exports: `DecisionMask.forProject(project)` gives the masker of that project. */
-interface MaskModuleExports { DecisionMask?: { forProject?: unknown } }
+export interface DecisionMasker {
+  mask(line: DecisionLine): DecisionLine
+  /**
+   * Cleans the fields of a request a worker sent (`/ask`), the way the factory's hook masks a request before it is written. A masker of a factory
+   * from before "ask first" has none; then nothing can be asked.
+   */
+  maskRequest?(fields: Record<string, unknown>): Record<string, unknown>
+}
+/**
+ * Gives the masker of one project. It rejects with `AssessRefusal(503)` when there is none.
+ * `requestKey` gives the factory's key of one request (session id, tool, input, all raw); a source without it cannot serve `/ask`.
+ */
+export interface MaskSource {
+  maskerFor(project: string): Promise<DecisionMasker>
+  requestKey?(sessionId: string, toolName: string, toolInput: unknown): Promise<string>
+}
+/**
+ * What the factory's built mask file exports: `DecisionMask.forProject(project)` gives the masker of that project, and
+ * `DecisionMask.requestKey(session, tool, input)` the key the factory's hook writes as `request_key`.
+ */
+interface MaskModuleExports { DecisionMask?: { forProject?: unknown; requestKey?: unknown } }
 
 /**
  * The factory's mask, loaded from its built file `lib/dist/decisionMask.js`.
@@ -89,9 +107,7 @@ export class FactoryMaskModule implements MaskSource {
     if (known) return known
     if (this.path === undefined || this.path === '') throw new AssessRefusal(503, 'No maskModule is configured, so no decision can be masked and none is written')
     if (!isAbsolute(this.path)) throw new AssessRefusal(503, 'The configured maskModule is not an absolute path, so no decision is written')
-    let loaded: MaskModuleExports
-    try { loaded = await import(pathToFileURL(this.path).href) as MaskModuleExports }
-    catch { throw new AssessRefusal(503, 'The configured maskModule could not be loaded, so no decision is written') }
+    const loaded = await this.load('no decision is written')
     const forProject = loaded.DecisionMask?.forProject
     if (typeof forProject !== 'function') throw new AssessRefusal(503, 'The configured maskModule does not export DecisionMask.forProject, so no decision is written')
     let masker: unknown
@@ -102,6 +118,30 @@ export class FactoryMaskModule implements MaskSource {
     }
     this.maskers.set(project, masker as DecisionMasker)
     return masker as DecisionMasker
+  }
+
+  /**
+   * The factory's own key of one request, computed by its `RequestKey` inside the built file, so this package holds no second implementation of it.
+   * Pass the raw values, before masking. Refuses with 503 when the module is missing or is from a factory without `DecisionMask.requestKey`, and
+   * with 400 when the values cannot be turned into a key.
+   */
+  async requestKey(sessionId: string, toolName: string, toolInput: unknown): Promise<string> {
+    if (this.path === undefined || this.path === '') throw new AssessRefusal(503, 'No maskModule is configured, so no request can be keyed and none is judged')
+    if (!isAbsolute(this.path)) throw new AssessRefusal(503, 'The configured maskModule is not an absolute path, so no request is judged')
+    const loaded = await this.load('no request is judged')
+    const requestKey = loaded.DecisionMask?.requestKey
+    if (typeof requestKey !== 'function') throw new AssessRefusal(503, 'The configured maskModule does not export DecisionMask.requestKey, so no request is judged')
+    let key: unknown
+    try { key = requestKey.call(loaded.DecisionMask, sessionId, toolName, toolInput) }
+    catch { throw new AssessRefusal(400, 'The request cannot be given a key') }
+    if (typeof key !== 'string' || key === '') throw new AssessRefusal(503, 'The configured maskModule gave no key for the request, so it is not judged')
+    return key
+  }
+
+  /** Imports the module; `what` says, in the refusal, what does not happen without it. */
+  private async load(what: string): Promise<MaskModuleExports> {
+    try { return await import(pathToFileURL(this.path as string).href) as MaskModuleExports }
+    catch { throw new AssessRefusal(503, `The configured maskModule could not be loaded, so ${what}`) }
   }
 }
 
@@ -119,5 +159,25 @@ export class DecisionWriter {
     catch { throw new AssessRefusal(503, 'The decision could not be masked, so it is not written') }
     if (masked === null || typeof masked !== 'object' || Array.isArray(masked)) throw new AssessRefusal(503, 'The decision could not be masked, so it is not written')
     return new DecisionsFile(line.project).append(masked)
+  }
+
+  /**
+   * Masks the fields of a request a worker sent, with the same factory mask, before the judge sees them. Returns the masked copy.
+   * Refuses with 503 when there is no mask, when it cannot mask a request (a factory from before "ask first"), or when masking fails.
+   */
+  async maskRequest(project: string, fields: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const masker = await this.masks.maskerFor(project)
+    if (typeof masker.maskRequest !== 'function') throw new AssessRefusal(503, 'The configured maskModule cannot mask a request, so it is not judged')
+    let masked: unknown
+    try { masked = masker.maskRequest(fields) }
+    catch { throw new AssessRefusal(503, 'The request could not be masked, so it is not judged') }
+    if (masked === null || typeof masked !== 'object' || Array.isArray(masked)) throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
+    return masked as Record<string, unknown>
+  }
+
+  /** The factory's key of one request, from the same mask source. Refuses with 503 when the source cannot give one. */
+  async requestKey(sessionId: string, toolName: string, toolInput: unknown): Promise<string> {
+    if (typeof this.masks.requestKey !== 'function') throw new AssessRefusal(503, 'The mask source cannot key a request, so it is not judged')
+    return this.masks.requestKey(sessionId, toolName, toolInput)
   }
 }

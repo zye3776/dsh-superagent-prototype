@@ -122,11 +122,12 @@ export class JudgeAnswer {
     readonly temp: readonly TempListed[]) {}
 
   /**
-   * Reads the answer from the judge's text: the first JSON object in it that has a `decision`, so a code fence or words around the object do no harm.
-   * @throws UnusableAnswer when there is no such object, when `decision`, `risk` or `undo` is not one of its values, or when `reason` is empty.
+   * Reads the answer from the judge's text: the one JSON object in it that has a `decision`, so a code fence or words around the object do no harm.
+   * @throws UnusableAnswer when there is no such object or more than one, when the object names a field twice, when `decision`, `risk` or `undo` is not one
+   * of its values, or when `reason` is empty.
    */
   static parse(text: string): JudgeAnswer {
-    const fields = JudgeAnswer.firstObject(text)
+    const fields = JudgeAnswer.onlyObject(text)
     const decision = JudgeAnswer.oneOf(fields, 'decision', JudgeAnswer.DECISIONS)
     const risk = JudgeAnswer.oneOf(fields, 'risk', JudgeAnswer.RISKS)
     const undo = JudgeAnswer.oneOf(fields, 'undo', JudgeAnswer.UNDOS)
@@ -183,21 +184,50 @@ export class JudgeAnswer {
   }
 
   /**
-   * The first JSON object in `text` that has a `decision` text. Every opening brace is tried in turn, so the answer is found after a brace in a sentence,
+   * The one JSON object in `text` that has a `decision` text. Every opening brace is tried in turn, so the answer is found after a brace in a sentence,
    * after another object the judge quoted (such as the request), and inside braces that are not JSON themselves.
+   * A second object with a `decision` makes the answer unusable: a worker can put such an object in its request, the judge may quote it, and no rule
+   * could then tell which of the two is the judge's own. So does a field named twice, of which `JSON.parse` would silently keep the last.
    */
-  private static firstObject(text: string): Record<string, unknown> {
+  private static onlyObject(text: string): Record<string, unknown> {
+    let found: Record<string, unknown> | undefined
     for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
       const end = JudgeAnswer.closingOf(text, start)
       if (end === -1) continue
-      try {
-        const value: unknown = JSON.parse(text.slice(start, end + 1))
-        if (value !== null && typeof value === 'object' && !Array.isArray(value) && typeof (value as Record<string, unknown>).decision === 'string') {
-          return value as Record<string, unknown>
-        }
-      } catch { /* braces that are not JSON: the next opening brace is tried */ }
+      const written = text.slice(start, end + 1)
+      let value: unknown
+      try { value = JSON.parse(written) } catch { continue /* braces that are not JSON: the next opening brace is tried */ }
+      if (value === null || typeof value !== 'object' || Array.isArray(value) || typeof (value as Record<string, unknown>).decision !== 'string') continue
+      if (found !== undefined) throw new UnusableAnswer('it holds more than one JSON object with a `decision`; answer with one object and quote no other')
+      if (JudgeAnswer.namesFieldTwice(written)) throw new UnusableAnswer('its JSON object names a field more than once')
+      found = value as Record<string, unknown>
+      start = end // what is inside the answer is part of it, not a second answer
     }
-    throw new UnusableAnswer('it holds no JSON object with a `decision`')
+    if (found === undefined) throw new UnusableAnswer('it holds no JSON object with a `decision`')
+    return found
+  }
+
+  /** Whether `written`, the text of a valid JSON object, names one of its own fields more than once. Fields of the objects inside it are not looked at. */
+  private static namesFieldTwice(written: string): boolean {
+    const names = new Set<string>()
+    let depth = 0, name = true
+    for (let at = 0; at < written.length; at++) {
+      const char = written[at]
+      if (char === '"') {
+        let close = at + 1
+        while (written[close] !== '"') close += written[close] === '\\' ? 2 : 1
+        if (depth === 1 && name) {
+          const field = JSON.parse(written.slice(at, close + 1)) as string
+          if (names.has(field)) return true
+          names.add(field)
+          name = false
+        }
+        at = close
+      } else if (char === '{' || char === '[') depth++
+      else if (char === '}' || char === ']') depth--
+      else if (char === ',' && depth === 1) name = true
+    }
+    return false
   }
 
   /** Where the brace opened at `start` closes, or -1. Braces inside a JSON text do not count. */
@@ -240,7 +270,7 @@ export class JudgeAnswer {
       if (typeof entry === 'string') return entry === '' ? [] : [{ path: entry, used: true }]
       if (entry === null || typeof entry !== 'object') return []
       const { path, used } = entry as { path?: unknown; used?: unknown }
-      return typeof path === 'string' && path !== '' ? [{ path, used: used !== false }] : []
+      return typeof path === 'string' && path !== '' ? [{ path, used: used === true || used === undefined }] : []
     })
   }
 }

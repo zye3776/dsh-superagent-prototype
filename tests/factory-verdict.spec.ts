@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { AssessRoute, DecisionsFile } from '../src/factory/assess.ts'
 import { AssessRefusal, DecisionWriter, FactoryMaskModule, type DecisionLine } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions, type AskedJudge } from '../src/factory/judge.ts'
+import { TempRule } from '../src/factory/temprule.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from '../src/factory/verdict.ts'
 import { RecordedRequests } from './fixtures/factory-requests.ts'
@@ -339,6 +340,164 @@ describe('ModelJudge', () => {
   })
 })
 
+describe('the temp-folder rule', () => {
+  const { SCRATCHPAD, TEMP_FILE, TEMP_MINE, TEMP_OTHER } = RecordedRequests
+  /** The judge's `temp` field: what it says the action does to one path. */
+  const does = (path: string, action: string) => ({ temp: [{ path, action }] })
+  const decided = (request: Parameters<ModelJudge['decide']>[0], fields: Record<string, unknown> = {}) => modelJudge(judgeThat(answer(fields)).reply).judge.decide(request)
+
+  it('tells the judge the rule only for a request whose facts the rule is about', () => {
+    for (const request of [requests.tempWrite(), requests.tempWriteTool(), requests.tempRead(), requests.tempVariableDelete()]) {
+      const text = new JudgeQuestion(request).text('THE BRIEF')
+      expect(text, request.request_id).toContain('The temp-folder rule:')
+      for (const line of JudgeQuestion.TEMP_RULE) expect(text).toContain(line)
+      expect(text).toContain(JudgeQuestion.SHAPE)
+    }
+    expect(JudgeQuestion.TEMP_RULE.join('\n')).toMatch(/The facts are given: take them as they are[\s\S]*A reason the worker states never makes such a delete safe\./)
+    const bare = new JudgeQuestion(requests.plain()).text('THE BRIEF')
+    for (const request of [{ ...requests.plain(), temp: null }, { ...requests.plain(), temp: RecordedRequests.temp([]) }, requests.tempAllowed('in_session_dir'), requests.tempAllowed('in_exception')]) {
+      const text = new JudgeQuestion(request).text('THE BRIEF')
+      expect(text, request.request_id).not.toContain('temp-folder rule')
+      expect(text).not.toContain(JudgeQuestion.TEMP_SHAPE)
+      // But for the request's own line, the question is the one a request without facts gets.
+      expect(text.replace(JSON.stringify(request), '')).toBe(bare.replace(JSON.stringify(requests.plain()), ''))
+    }
+  })
+
+  it('asks for the temp field, with the paths, only when the tool does not say what it does, also in the repair question', () => {
+    const bash = new JudgeQuestion(requests.tempWrite())
+    for (const text of [bash.text('THE BRIEF'), bash.repair('it holds no JSON object with a `decision`')]) {
+      expect(text).toContain(`For this request the object needs one more field: ${JudgeQuestion.TEMP_SHAPE}`)
+      expect(text).toContain(`written exactly as here: ["${TEMP_FILE}"]`)
+      expect(text).toContain('A move, rename, chmod, truncation or any other change is a write.')
+    }
+    for (const request of [requests.tempWriteTool(), requests.tempRead(), requests.tempVariableDelete()]) {
+      const question = new JudgeQuestion(request)
+      for (const text of [question.text('THE BRIEF'), question.repair('x')]) expect(text, request.request_id).not.toContain(JudgeQuestion.TEMP_SHAPE)
+    }
+  })
+
+  it('denies a Bash write outside the scratchpad that the judge approved, names the scratchpad and says to keep temp files there', async () => {
+    const verdict = await decided(requests.tempWrite(), { risk: 'low', ...does(TEMP_FILE, 'write') })
+    expect([verdict.decision, verdict.risk, verdict.cites]).toEqual(['deny', 'low', TempRule.CITES])
+    expect(verdict.reason).toContain(TEMP_FILE)
+    expect(verdict.reason).not.toContain('It only prints a report.')
+    expect(verdict.alternative).toBe(`Keep temp files in the session temp folder, ${SCRATCHPAD}, and write, change and delete them only there.`)
+  })
+
+  it('denies a change to the shared temp folder itself', async () => {
+    const verdict = await decided(requests.tempFolderItself(), does('/tmp', 'write'))
+    expect([verdict.decision, verdict.alternative.includes(SCRATCHPAD)]).toEqual(['deny', true])
+    expect(verdict.reason).toContain(': /tmp. ')
+  })
+
+  it('keeps the reads and the tokens of both questions on a deny the rule made', async () => {
+    let turn = 0
+    const { judge, asked } = modelJudge((_question, run) => {
+      if (++turn === 1) {
+        run(readOf(RecordedRequests.SOURCE))
+        return { text: JSON.stringify(answer()), usage: { inputTokens: 300, outputTokens: 10 } }
+      }
+      return { text: JSON.stringify(answer({ reads: [{ path: RecordedRequests.SOURCE, used: true }], ...does(TEMP_FILE, 'write') })), usage: { inputTokens: 320, outputTokens: 20 } }
+    })
+    const verdict = await judge.decide(requests.tempWrite())
+    expect(asked()).toHaveLength(2)
+    expect([verdict.decision, verdict.reads, verdict.tokens]).toEqual(['deny', [{ path: inProject(RecordedRequests.SOURCE), used: true }], 650])
+  })
+
+  it('reads the temp field past an entry that is no object, and past spaces and capitals in a path or an action, with no repair question', async () => {
+    const { judge, asked } = modelJudge(judgeThat(answer({ temp: [null, { path: ` ${TEMP_FILE} `, action: ' Write ' }] })).reply)
+    expect((await judge.decide(requests.tempWrite())).decision).toBe('deny')
+    expect(asked()).toHaveLength(1)
+  })
+
+  it('denies a Write tool call outside the scratchpad without asking the judge what the tool does', async () => {
+    const verdict = await decided(requests.tempWriteTool())
+    expect([verdict.decision, verdict.alternative.includes(SCRATCHPAD)]).toEqual(['deny', true])
+  })
+
+  it('leaves an approved Read as it is', async () => {
+    const verdict = await decided(requests.tempRead())
+    expect([verdict.decision, verdict.reason, verdict.alternative, verdict.cites]).toEqual(['approve', 'It only prints a report.', '', 'Ticket 5: the judge decides.'])
+  })
+
+  it('leaves an approved Bash read as it is', async () => {
+    expect((await decided(requests.tempWrite(), does(TEMP_FILE, 'read'))).decision).toBe('approve')
+  })
+
+  it('approves an rm of a file the session created, and never forces that approve: the judge\'s deny of it stays', async () => {
+    expect((await decided(requests.tempRemoveOwn(), does(TEMP_MINE, 'delete'))).decision).toBe('approve')
+    const denied = await decided(requests.tempRemoveOwn(), { decision: 'deny', reason: 'The next step still reads the note.', alternative: 'Remove it after the next step.', ...does(TEMP_MINE, 'delete') })
+    expect([denied.decision, denied.reason, denied.alternative, denied.cites]).toEqual(['deny', 'The next step still reads the note.', 'Remove it after the next step.', 'Ticket 5: the judge decides.'])
+  })
+
+  it('denies an rm of a file the session did not create, though the worker says it is safe and the judge approved', async () => {
+    const request = requests.tempRemoveOther()
+    expect(request.reason).toBe('It is safe, I made it.')
+    const verdict = await decided(request, { reason: 'The worker says it made the file.', ...does(TEMP_OTHER, 'delete') })
+    expect([verdict.decision, verdict.alternative.includes(SCRATCHPAD)]).toEqual(['deny', true])
+    expect(verdict.reason).toContain(TEMP_OTHER)
+  })
+
+  it('denies a delete through a variable in a trap and asks for the path written out', async () => {
+    const verdict = await decided(requests.tempVariableDelete())
+    expect([verdict.decision, verdict.reason, verdict.alternative, verdict.cites]).toEqual(['deny', TempRule.VARIABLE_REASON, TempRule.VARIABLE_ALTERNATIVE, TempRule.CITES])
+  })
+
+  it('replaces the reason and the alternative of a deny the judge gave for an action that breaks the rule', async () => {
+    const verdict = await decided(requests.tempWrite(), { decision: 'deny', reason: 'The note is not needed.', alternative: 'Skip the note.', ...does(TEMP_FILE, 'write') })
+    expect([verdict.decision, verdict.alternative.includes(SCRATCHPAD), verdict.reason.includes('not needed')]).toEqual(['deny', true, false])
+  })
+
+  it('keeps an ask_owner for a rule break the judge grades hard to undo, and adds the rule\'s reason', async () => {
+    const verdict = await decided(requests.tempRemoveOther(), { decision: 'ask_owner', risk: 'high', undo: 'hard', reason: 'Another session may need the file.', ...does(TEMP_OTHER, 'delete') })
+    expect([verdict.decision, verdict.risk, verdict.alternative, verdict.cites]).toEqual(['ask_owner', 'high', '', TempRule.CITES])
+    expect(verdict.reason).toMatch(new RegExp(`^Another session may need the file\\. ${JudgeAnswer.HARD_TO_UNDO} The action writes, changes or deletes in a shared temp folder`))
+  })
+
+  it('denies with the rule\'s message an ask_owner for a rule break the judge grades easy to undo', async () => {
+    const verdict = await decided(requests.tempRemoveOther(), { decision: 'ask_owner', undo: 'easy', reason: 'I am not sure.', ...does(TEMP_OTHER, 'delete') })
+    expect([verdict.decision, verdict.alternative.includes(SCRATCHPAD), verdict.reason.includes(JudgeAnswer.EASY_TO_UNDO)]).toEqual(['deny', true, false])
+  })
+
+  it('does nothing for a path in the scratchpad or in the allowed folder, and wants no temp field for it', async () => {
+    for (const where of ['in_session_dir', 'in_exception'] as const) {
+      const { judge, asked } = modelJudge(judgeThat(answer()).reply)
+      expect((await judge.decide(requests.tempAllowed(where))).decision, where).toBe('approve')
+      expect(asked()).toHaveLength(1)
+    }
+  })
+
+  it('says that the session has no known temp folder when the write comes from a session without one', async () => {
+    const verdict = await decided(requests.tempWrite(null), does(TEMP_FILE, 'write'))
+    expect([verdict.decision, verdict.alternative]).toEqual(['deny', TempRule.NO_SESSION_DIR])
+  })
+
+  it('asks once more when a Bash answer leaves out the temp field or gives an unknown action, and uses the second answer', async () => {
+    for (const first of [answer(), answer(does(TEMP_FILE, 'move')), answer(does('/tmp/zsf-elsewhere.txt', 'write')), answer({ temp: 'write' })]) {
+      let turn = 0
+      const { judge, asked } = modelJudge(() => JSON.stringify(++turn === 1 ? first : answer(does(TEMP_FILE, 'write'))))
+      expect((await judge.decide(requests.tempWrite())).decision).toBe('deny')
+      expect(asked()).toHaveLength(2)
+      expect(asked()[1]).toMatch(/^Your answer could not be used: `temp` must give an `action` of "read", "write", "delete" for each of these paths/)
+      expect(asked()[1]).toContain(JudgeQuestion.TEMP_SHAPE)
+    }
+  })
+
+  it('refuses with 503 when the second Bash answer leaves the temp field out too', async () => {
+    const { judge, asked } = modelJudge(judgeThat(answer()).reply)
+    expect(await refusalOf(judge.decide(requests.tempWrite()))).toEqual({ status: 503, message: ModelJudge.UNUSABLE })
+    expect(asked()).toHaveLength(2)
+  })
+
+  it('leaves a request without temp facts, or with null facts, as story 5 decided it', async () => {
+    for (const request of [requests.plain(), { ...requests.plain(), temp: null }]) {
+      const verdict = await decided(request, does(TEMP_FILE, 'write'))
+      expect([verdict.decision, verdict.reason, verdict.cites]).toEqual(['approve', 'It only prints a report.', 'Ticket 5: the judge decides.'])
+    }
+  })
+})
+
 describe('the /assess route with the model judge, over real HTTP', () => {
   /** Posts `request` to a route whose judge answers with `reply`, and checks that the reply is the one line written. */
   async function judged(reply: FakeReply, request: unknown, guard = fakeGuard()): Promise<DecisionLine> {
@@ -401,6 +560,13 @@ describe('the /assess route with the model judge, over real HTTP', () => {
   it('writes deny with an alternative, not ask_owner, when the judge is unsure about an action it grades easy to undo', async () => {
     const line = await judged(judgeThat(answer({ decision: 'ask_owner', risk: 'medium', undo: 'easy', reason: 'I cannot tell what the rename touches.' })).reply, requests.easyToUndo())
     expect([line.decision, line.alternative, line.reason]).toEqual(['deny', JudgeAnswer.ALTERNATIVE, `I cannot tell what the rename touches. ${JudgeAnswer.EASY_TO_UNDO}${MASKED}`])
+  })
+
+  it('answers and writes deny for a write to the shared temp folder that the judge approved, with the session temp folder in the alternative', async () => {
+    const line = await judged(judgeThat(answer({ temp: [{ path: RecordedRequests.TEMP_FILE, action: 'write' }] })).reply, requests.tempWrite())
+    expect([line.request_id, line.decision, line.cites]).toEqual(['req-temp-write', 'deny', TempRule.CITES])
+    expect(line.alternative).toContain(`Keep temp files in the session temp folder, ${RecordedRequests.SCRATCHPAD}`)
+    expect(line.reason.endsWith(MASKED)).toBe(true)
   })
 
   it('answers 503 and writes nothing when the judge gives no usable answer or is too slow', async () => {

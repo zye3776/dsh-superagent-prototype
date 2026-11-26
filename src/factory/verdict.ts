@@ -3,13 +3,16 @@
  * `ModelJudge` opens the judge Session of the request's worker session, asks it one question and turns its answer into a decision. `JudgeQuestion` writes that
  * question: the judge's brief, the masked request and how to judge each kind of request. `JudgeAnswer` reads the judge's answer, one JSON object, and holds it
  * to the rules that plain code checks, so that a model that drifts cannot break them: only an action the judge grades hard to undo may go to the owner, a
- * `deny` always says what to do instead, `cites` is never empty, and `reads` lists only files the judge really read.
+ * `deny` always says what to do instead, `cites` is never empty, and `reads` lists only files the judge really read. The temp-folder rule (`temprule.ts`)
+ * is held the same way: an action that breaks it is refused even when the judge approved it; only an `ask_owner` for an action the judge grades hard to undo is kept.
+ * For Bash and for a tool the rule does not know, whether the action reads, writes or deletes a path is the judge's own word.
  * This file takes only types from `judge.ts`, so it runs on stand-ins without DSH.
  */
 import { randomUUID } from 'node:crypto'
 import type { AssessRequest, Judge, Verdict } from './assess.ts'
 import { AssessRefusal, type Decision, type DecisionRead } from './decisions.ts'
 import type { AskedJudge, JudgeOpener } from './judge.ts'
+import { TempRule, type TempListed } from './temprule.ts'
 
 /** Thrown when the judge's answer is not one usable JSON object. The message says what is wrong, in words the judge can act on. */
 export class UnusableAnswer extends Error {}
@@ -44,7 +47,20 @@ export class JudgeQuestion {
     '- A deny names a safer or cheaper alternative.',
     '- Answer ask_owner only when you are unsure and the action is hard to undo. When you are unsure and the action is easy to undo, deny it with an alternative.',
   ]
-  constructor(private readonly request: AssessRequest) {}
+  /** The temp-folder rule, told to the judge only for a request whose `temp` facts the rule is about. Plain code checks it again after the answer. */
+  static readonly TEMP_RULE: readonly string[] = [
+    '- The request\'s `temp` holds facts about the paths it names in a shared temp folder such as /tmp. The facts are given: take them as they are and do not work them out again.',
+    '- A worker may read any of these paths.',
+    '- It may write, change or delete only inside its session\'s own temp folder (`in_session_dir`) or the allowed shared folder (`in_exception`).',
+    '- Outside those two it may only delete a file or folder that this session created (`created_by_session`). A reason the worker states never makes such a delete safe.',
+    '- A delete through a variable (`variable_delete`) is always refused: the worker must write the path out.',
+    '- Plain code checks this rule after your answer and refuses an action that breaks it, also when you approved it.'
+      + ' Only an ask_owner for an action that is hard to undo is kept, so still answer ask_owner when you are unsure and the action is hard to undo.',
+  ]
+  /** The extra field of the answer for a request whose tool does not say what it does to a path, shown to the judge as it is. */
+  static readonly TEMP_SHAPE = '"temp": [{"path": "...", "action": "read" | "write" | "delete"}]'
+  private readonly rule: TempRule
+  constructor(private readonly request: AssessRequest) { this.rule = new TempRule(request) }
 
   /** The whole question: `brief` (the judge's orientation, or the files that changed), then the request and the rules. */
   text(brief: string): string {
@@ -63,17 +79,24 @@ export class JudgeQuestion {
       'Rules:',
       ...JudgeQuestion.RULES,
       '',
-      ...JudgeQuestion.format(),
+      ...(this.rule.applies ? ['The temp-folder rule:', ...JudgeQuestion.TEMP_RULE, ''] : []),
+      ...this.format(),
     ].join('\n')
   }
 
   /** Asks again after an answer that could not be used; `problem` says what was wrong with it. */
   repair(problem: string): string {
-    return [`Your answer could not be used: ${problem}.`, `Decide the same request (request_id ${JSON.stringify(this.request.request_id)}) again.`, ...JudgeQuestion.format()].join('\n')
+    return [`Your answer could not be used: ${problem}.`, `Decide the same request (request_id ${JSON.stringify(this.request.request_id)}) again.`, ...this.format()].join('\n')
   }
 
-  private static format(): string[] {
-    return ['Answer with one JSON object and nothing else, in this shape:', JudgeQuestion.SHAPE, ...JudgeQuestion.FIELDS]
+  /** How to answer. It asks for the `temp` field only when the request's tool does not say what it does to the paths the temp-folder rule is about. */
+  private format(): string[] {
+    const asked = this.rule.asked
+    return ['Answer with one JSON object and nothing else, in this shape:', JudgeQuestion.SHAPE, ...JudgeQuestion.FIELDS, ...(asked.length === 0 ? [] : [
+      `For this request the object needs one more field: ${JudgeQuestion.TEMP_SHAPE}`,
+      `- temp: what the action does to each of these paths, written exactly as here: ${JSON.stringify(asked)}. A move, rename, chmod, truncation or any other change is a write.`
+        + ' When the action does more than one of the three to a path, add one entry for each.',
+    ])]
   }
 }
 
@@ -94,7 +117,9 @@ export class JudgeAnswer {
   private constructor(readonly decision: Decision['decision'], readonly risk: Decision['risk'], readonly undo: 'easy' | 'hard', readonly reason: string,
     readonly alternative: string, readonly cites: string,
     /** The files the judge says it read, as it wrote their paths. */
-    readonly listed: readonly DecisionRead[]) {}
+    readonly listed: readonly DecisionRead[],
+    /** What the judge says the action does to paths in a shared temp folder, as it wrote them. */
+    readonly temp: readonly TempListed[]) {}
 
   /**
    * Reads the answer from the judge's text: the first JSON object in it that has a `decision`, so a code fence or words around the object do no harm.
@@ -107,7 +132,8 @@ export class JudgeAnswer {
     const undo = JudgeAnswer.oneOf(fields, 'undo', JudgeAnswer.UNDOS)
     const reason = JudgeAnswer.textOf(fields.reason)
     if (reason === '') throw new UnusableAnswer('`reason` is missing or empty')
-    return new JudgeAnswer(decision, risk, undo, reason, JudgeAnswer.textOf(fields.alternative), JudgeAnswer.textOf(fields.cites), JudgeAnswer.listedOf(fields.reads))
+    return new JudgeAnswer(decision, risk, undo, reason, JudgeAnswer.textOf(fields.alternative), JudgeAnswer.textOf(fields.cites), JudgeAnswer.listedOf(fields.reads),
+      JudgeAnswer.tempOf(fields.temp))
   }
 
   /**
@@ -115,11 +141,24 @@ export class JudgeAnswer {
    * @param judge - says which files the judge ever read.
    * @param reads - the full paths of the files the judge read with the `read` tool while it answered this request.
    * @param tokens - the tokens of every answer the judge gave for this request, added up.
+   * @throws UnusableAnswer when the temp-folder rule needs the judge's word on what the action does to a path and the answer's `temp` does not give it.
    */
   verdict(request: AssessRequest, judge: Pick<AskedJudge, 'readPath'>, reads: readonly string[], tokens = 0): Verdict {
     // Only an action that is hard to undo may go to the owner; `risk` does not count here, because a risky action can still be easy to take back.
     const refused = this.decision === 'ask_owner' && this.undo !== 'hard'
-    const decision = refused ? 'deny' : this.decision
+    const rule = new TempRule(request)
+    const problem = rule.problem(this.temp)
+    if (problem !== undefined) throw new UnusableAnswer(problem)
+    // An action that breaks the temp-folder rule is refused, also when the judge approved it. Only a kept `ask_owner` stays: the owner decides what is hard to undo.
+    const broken = rule.broken(this.temp)
+    const decision = refused || (broken !== undefined && this.decision !== 'ask_owner') ? 'deny' : this.decision
+    if (broken !== undefined) {
+      return {
+        decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk,
+        reason: decision === 'ask_owner' ? `${this.reason} ${JudgeAnswer.HARD_TO_UNDO} ${broken.reason}` : broken.reason,
+        alternative: decision === 'deny' ? broken.alternative : '', cites: broken.cites, reads: this.readsOf(judge, reads), tokens,
+      }
+    }
     return {
       decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk,
       reason: refused ? `${this.reason} ${JudgeAnswer.EASY_TO_UNDO}` : decision === 'ask_owner' ? `${this.reason} ${JudgeAnswer.HARD_TO_UNDO}` : this.reason,
@@ -183,6 +222,16 @@ export class JudgeAnswer {
   }
 
   private static textOf(value: unknown): string { return typeof value === 'string' ? value.trim() : '' }
+
+  /** The `temp` list the judge wrote, as far as it can be read: the entries with a path and an action as texts, without spaces around them and with the action in small letters. `TempRule` checks the actions. */
+  private static tempOf(value: unknown): TempListed[] {
+    if (!Array.isArray(value)) return []
+    return value.flatMap((entry: unknown): TempListed[] => {
+      if (entry === null || typeof entry !== 'object') return []
+      const { path, action } = entry as { path?: unknown; action?: unknown }
+      return typeof path === 'string' && typeof action === 'string' ? [{ path: path.trim(), action: action.trim().toLowerCase() }] : []
+    })
+  }
 
   /** The `reads` the judge wrote, as far as they can be read: an entry is a path, or `{ path, used }`, where a missing `used` counts as used. */
   private static listedOf(value: unknown): DecisionRead[] {

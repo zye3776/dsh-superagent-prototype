@@ -1,7 +1,8 @@
 /**
  * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
  * Each run of the plugin is one job in the job log: its start, each permission answer, each message into or out of the main session, and its stop
- * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`.
+ * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`, whose "Start review talk" prepares a job's review talk in Claude
+ * Desktop (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`).
  * It runs on its own, without the main plugin.
@@ -21,7 +22,8 @@ import { FactoryJob } from './job.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
 import { FactoryRecordsModule, JobRecorder } from './records.ts'
-import { ReviewRoute } from './review.ts'
+import { ReviewPage, ReviewRoute } from './review.ts'
+import { ReviewTalks } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 import { ModelJudge } from './verdict.ts'
 
@@ -38,7 +40,7 @@ export const Config = s.object({
   guardModule: s.string().pattern(/^\//)
     .description('The factory\'s built judge guard file, lib/dist/judgeGuard.js in the factory\'s folder. Absolute path, no default; every tool call of a judge Session is checked with it, and without it no judge Session is opened and the route answers 503.'),
   recordsModule: s.string().pattern(/^\//)
-    .description('The factory\'s built job log file, lib/dist/jobLog.js in the factory\'s folder. Absolute path, no default; every job log line and every comment of the review page is masked with it before it is written, and the review page reads the records and the decision guideline\'s versions with it. Without it no job log line or comment is written and the review page answers 503.'),
+    .description('The factory\'s built job log file, lib/dist/jobLog.js in the factory\'s folder. Absolute path, no default; every job log line and every comment of the review page is masked with it before it is written, and the review page reads the records and the decision guideline\'s versions with it. A review talk\'s files are masked with it too, and its tool server is lib/dist/proposeServer.js next to it. Without it no job log line or comment is written and the review page answers 503.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -61,7 +63,9 @@ export function apply(ctx: Context, config: FactoryConfig): void {
     new DecisionWriter(new FactoryMaskModule(config.maskModule)), job)
   ctx.effect(() => route.register(ctx), 'factory: assess route')
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
-  const review = new ReviewRoute(config.projects ?? [], tokens, records)
+  // A review talk's folder is outside every repository; its propose server is the factory's `lib/dist/proposeServer.js`, next to the job log file.
+  const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage })
+  const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks)
   ctx.effect(() => review.register(ctx), 'factory: review page')
 }
 export { AssessRoute, StubJudge, TempFactsShape, type AnswerLog, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
@@ -75,7 +79,12 @@ export {
   type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
+export { TextDiff, type DiffLine, type DiffMark, type DiffSides } from './diff.ts'
 export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
+export {
+  GuidelineProposals, ReviewTalks, TalkComments, TalkFolder, TalkLink, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type ReviewTalksOptions, type StepWords,
+  type TalkServer, type TalkStart, type TalkState,
+} from './talk.ts'
 export { SharedTokenFile } from './token.ts'
 export { TokenTally, type TalliedEvent } from './usage.ts'
 export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

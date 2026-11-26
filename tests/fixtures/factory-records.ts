@@ -4,7 +4,7 @@
  * Its `GuidelineReader` reads `guideline/v<N>.md` in the folder the module was written to.
  * Its `StepDetailReader` follows no pointer: it gives the detail a test wrote for the step's id in the project's `.factory/step-details.json`, and a detail
  * with every part `null` (not recorded) for any other step.
- * Its mask refuses an unknown kind or field, replaces one planted value in every text field and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
+ * Its mask refuses an unknown kind or field, replaces one planted value in every text field (and in a plain text, `maskText`) and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
  */
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -33,6 +33,7 @@ export const JobLogMask = { forProject: project => ({
     return ordered(line, ACTION_FIELDS)
   },
   maskReview: line => ordered(line, REVIEW_FIELDS),
+  maskText: text => clean(text),
 }) }
 export class JobLogReader {
   read(project) {

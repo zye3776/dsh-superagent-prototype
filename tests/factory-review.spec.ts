@@ -2,7 +2,8 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
+import { spawn } from 'node:child_process'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { JSDOM } from 'jsdom'
@@ -10,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
 import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute } from '../src/factory/review.ts'
+import { ReviewTalks, TalkFolder } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -36,15 +38,23 @@ const action = (fields: Partial<JobLogLine> = {}): JobLogLine => ({ ts: '2026-11
 const review = (fields: Partial<ReviewLine> = {}): ReviewLine => ({ ts: '2026-11-26T09:00:00.000Z', project, job_id: 'job-1', comment: 'Keep it small.', ...fields })
 const origin = () => `http://127.0.0.1:${port}`
 
+/** Where the tests' review talks go, and the stand-in for the built propose server that a talk's `.mcp.json` names. */
+const talkRoot = () => join(root, 'review-talks')
+const proposeServer = () => join(root, 'proposeServer.js')
+/** The review talks of the test's page: under the test's folder, never under the owner's home. */
+const talksFor = (records: FactoryRecordsModule, serverFile: string = proposeServer()) =>
+  new ReviewTalks({ records, tokenFile: tokenPath(), words: ReviewPage, root: talkRoot(), serverFile, now: () => new Date(NOW) })
+let reviewRoute: ReviewRoute | undefined
 /** Serves the page of a fake DSH web server over real HTTP, reading the token file and the stand-in records module of the test. */
-async function serve(projects: string[] = [project], records: FactoryRecordsModule = new FactoryRecordsModule(recordsModule(root))): Promise<Route[]> {
+async function serve(projects: string[] = [project], records: FactoryRecordsModule = new FactoryRecordsModule(recordsModule(root)), talks: ReviewTalks = talksFor(records)): Promise<Route[]> {
   routes = []
   // DSH's `exact` routes match the path alone, without the query.
   server = createServer((req, res) => { void routes.find(route => route.path === new URL(req.url ?? '/', 'http://127.0.0.1').pathname)!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { routes.push(registered); return () => {} } } }
-  new ReviewRoute(projects, new SharedTokenFile(tokenPath()), records, () => new Date(NOW)).register(ctx as never)
+  reviewRoute = new ReviewRoute(projects, new SharedTokenFile(tokenPath()), records, () => new Date(NOW), talks)
+  reviewRoute.register(ctx as never)
   return routes
 }
 /** Sends one request. A header given as `undefined` is left out. */
@@ -81,6 +91,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'factory-review-'))
   project = join(root, 'project')
   mkdirSync(join(project, FactoryRecordFile.FOLDER), { recursive: true })
+  writeFileSync(proposeServer(), '// stand-in for the built propose server\n')
   writeToken()
 })
 afterEach(async () => {
@@ -89,14 +100,14 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-it('registers three exact, anonymous routes and refuses a web server that is not on loopback', async () => {
+it('registers five exact, anonymous routes and refuses a web server that is not on loopback', async () => {
   const registered = await serve()
   expect(registered.map(route => [route.kind, route.path, route.auth])).toEqual([['exact', '/review', 'anonymous'], ['exact', '/review/login', 'anonymous'],
-    ['exact', '/review/comment', 'anonymous']])
+    ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous']])
   const disposed: string[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => () => { disposed.push(route.path) } } }
   new ReviewRoute([project]).register(ctx as never)()
-  expect(disposed).toEqual(['/review', '/review/login', '/review/comment'])
+  expect(disposed).toEqual(['/review', '/review/login', '/review/comment', '/review/talk', '/review/proposal'])
   expect(() => new ReviewRoute([project]).register({ webServer: { host: '0.0.0.0', port: 3083, register: () => () => {} } } as never)).toThrow('loopback')
   expect(() => new ReviewRoute(['relative/project'])).toThrow('absolute')
 })
@@ -275,8 +286,9 @@ it('lists the projects, then the picked project\'s jobs newest first; shows a jo
   // The comment is text in the field, never markup of the page.
   expect(page.querySelector('b')).toBeNull()
   expect(page.querySelector('#comment-status')!.textContent).toBe('')
-  // No button, no form, no dialog: the field saves by itself.
-  expect([page.querySelector('button'), page.querySelector('form'), page.querySelector('dialog'), page.querySelector('input')]).toEqual([null, null, null, null])
+  // No form, no dialog, and no button but the review talk's: the field saves by itself.
+  expect([page.querySelector('form'), page.querySelector('dialog'), page.querySelector('input')]).toEqual([null, null, null])
+  expect([...page.querySelectorAll('button')].map(button => button.textContent)).toEqual([ReviewPage.START_TALK])
   // A job without a stop says so in place of its duration.
   const older = dom((await call('GET', ReviewRoute.address(other, 'job-0'), { cookie })).text)
   expect([older.querySelector('ol li div')!.textContent, older.querySelector('textarea')!.value, older.querySelector('.crumb')!.textContent])
@@ -651,6 +663,33 @@ it('is wired into the plugin: the page reads the configured token file and the c
   expect([plugin.ReviewRoute, plugin.ReviewPage, plugin.ReviewAccess]).toEqual([ReviewRoute, ReviewPage, ReviewAccess])
 })
 
+it('is wired into the plugin for the review talk: a start writes .mcp.json with the propose server beside the configured records module and the configured token file', async () => {
+  put('actions.jsonl', [action()])
+  put('reviews.jsonl', [review()])
+  const dist = join(root, 'factory', 'lib', 'dist')
+  mkdirSync(dist, { recursive: true })
+  const records = recordsModule(dist)
+  writeFileSync(join(dist, 'proposeServer.js'), '// stand-in for the built propose server\n')
+  const registered: Route[] = []
+  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: () => () => {} }
+  // The plugin's talks go under `TalkFolder.ROOT`, read when it is applied: pointed at the test's folder here, so nothing lands in the owner's home.
+  const root0 = TalkFolder.ROOT
+  Object.assign(TalkFolder, { ROOT: talkRoot() })
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  const handler = (path: string) => registered.find(route => route.path === path)!.handler
+  const signing = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
+  await handler('/review/login')(signing.req, signing.res)
+  const cookie = signing.answer.headers['set-cookie']!.split(';')[0]!
+  const started = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie }, JSON.stringify({ project, job_id: 'job-1' }))
+  await handler('/review/talk')(started.req, started.res)
+  expect([started.answer.status, (JSON.parse(started.answer.text) as { opened: boolean }).opened]).toEqual([200, true])
+  const folder = readdirSync(talkRoot()).map(name => join(talkRoot(), name))[0]!
+  const mcp = JSON.parse(readFileSync(join(folder, '.mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args: string[] }> }
+  const { args } = mcp.mcpServers[TalkFolder.SERVER_NAME]!
+  expect([args[0], args[2], args[4]]).toEqual([join(dist, 'proposeServer.js'), 'http://127.0.0.1:3083/review/proposal', tokenPath()])
+})
+
 /** An answer of the fixed checks, as the factory's `JobsReader` gives it. */
 const automatic = (fields: Partial<AutomaticAnswer> = {}): AutomaticAnswer => ({ ts: '2026-11-26T08:05:00.000Z', request_id: 'req-1', session_id: 'worker-1', tool_name: 'Bash',
   tool_input: { command: 'git push origin story-4-2' }, reason: 'Share the branch.', answer: 'allow', ...fields })
@@ -693,7 +732,7 @@ it('lists the answers outside a job on their own, with no comment field', () => 
   const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, outside: true }))
   expect([page.querySelector('.crumb')!.textContent, page.querySelector('main h2')!.textContent]).toEqual(['project › Outside a job', 'Outside a job · 2 automatic answers'])
   expect([...page.querySelectorAll('ol li')].map(row => row.querySelector('.pill')!.textContent)).toEqual(['automatic yes', 'automatic no'])
-  expect([page.querySelector('textarea'), page.querySelector('script')]).toEqual([null, null])
+  expect([page.querySelector('textarea'), page.querySelector('#start-talk'), page.querySelector('#talk-notice')]).toEqual([null, null, null])
   expect(page.querySelector('nav a.job.on')!.getAttribute('href')).toBe(ReviewRoute.address(project, undefined, true))
 })
 
@@ -948,9 +987,10 @@ describe('comments on a job and on any step', () => {
     expect((await comment(cookie, { project, job_id: 'job-1', step_id: 'step-2', comment: 'Ask me next time.' })).status).toBe(200)
     expect([readFileSync(file('actions.jsonl'), 'utf8'), lines('reviews.jsonl').length]).toEqual([before, 1])
     expect(readdirSync(join(project, FactoryRecordFile.FOLDER)).sort()).toEqual(['actions.jsonl', 'reviews.jsonl'])
-    // The only control is the comment field: no form, button, select, radio or checkbox, and no word of a mark, grade or setting.
+    // The only controls are the comment field and the review talk's button: no form, other button, select, radio or checkbox, and no word of a mark,
+    // grade or setting.
     const page = dom(html)
-    expect([...page.querySelectorAll('form, button, select, input')].length).toBe(0)
+    expect([...page.querySelectorAll('form, button, select, input')].map(control => control.id)).toEqual(['start-talk'])
     expect(page.body.textContent).not.toMatch(/\b(mark|grade|score|rating|never[- ]decide|setting)s?\b/i)
   })
 })
@@ -1007,9 +1047,9 @@ describe('the Guideline tab', () => {
     expect([...page.querySelectorAll('main p')].map(line => line.textContent)).toEqual([ReviewPage.NO_GUIDELINE_FOLDER, 'No zees-software-factory folder entry.'])
   })
 
-  it('is reached from the Jobs tab, has no control, keeps the three routes, and needs the cookie', async () => {
+  it('is reached from the Jobs tab, has no control, keeps the five routes, and needs the cookie', async () => {
     const registered = await serve([project], new GuidelineRecords(twoVersions()))
-    expect(registered.map(route => route.path)).toEqual(['/review', '/review/login', '/review/comment'])
+    expect(registered.map(route => route.path)).toEqual(['/review', '/review/login', '/review/comment', '/review/talk', '/review/proposal'])
     expect((await call('GET', ReviewRoute.guidelineAddress())).status).toBe(401)
     const cookie = await signIn()
     const jobs = dom((await call('GET', ReviewRoute.PATH, { cookie })).text)
@@ -1017,6 +1057,319 @@ describe('the Guideline tab', () => {
       .toEqual([['Jobs', '/review', true], ['Guideline', ReviewRoute.guidelineAddress(), false]])
     const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
     expect([...page.querySelectorAll('form, button, select, input, textarea')].length).toBe(0)
+  })
+})
+
+describe('the review talk and its proposals', () => {
+  /** A job of three steps with a comment on the whole job and one on its second step, and a guideline v1 next to the stand-in records module. */
+  function sample(): void {
+    put('actions.jsonl', [action(), action({ step_id: 'step-2', ts: '2026-11-26T08:10:00.000Z', kind: 'permission_answer', summary: 'Approved: run the tests.' }),
+      action({ step_id: 'step-3', ts: '2026-11-26T08:30:00.000Z', kind: 'job_stop', summary: 'Stopped.' })])
+    put('reviews.jsonl', [review({ comment: 'Good pace.' }), review({ step_id: 'step-2', comment: 'Reject this at this stage.' })])
+    mkdirSync(join(root, 'guideline'), { recursive: true })
+    writeFileSync(join(root, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\nAsk first.\n')
+  }
+  /** Clicks "Start review talk" as the page's script does. */
+  const startTalk = (cookie: string | undefined, body: object = { project, job_id: 'job-1' }, headers: Record<string, string | undefined> = {}) =>
+    call('POST', ReviewRoute.TALK_PATH, { origin: origin(), cookie, 'content-type': 'application/json', ...headers }, JSON.stringify(body))
+  /** Posts a proposal as the talk's tool does: no Origin, no cookie, the shared token in its header. */
+  const propose = (body: unknown, headers: Record<string, string | undefined> = {}) =>
+    call('POST', ReviewRoute.PROPOSAL_PATH, { 'content-type': 'application/json', [SharedTokenFile.HEADER]: TOKEN, ...headers }, typeof body === 'string' ? body : JSON.stringify(body))
+  const talkFolder = () => readdirSync(talkRoot()).map(name => join(talkRoot(), name))[0]!
+  const filesOf = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
+    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).sort()
+
+  it('starts a talk on a signed-in click: the folder holds the pinned files and the job\'s files, and the answer carries the link and the notice', async () => {
+    await serve()
+    sample()
+    const cookie = await signIn()
+    const answer = await startTalk(cookie)
+    const body = JSON.parse(answer.text) as { opened: boolean; link: string; notice: string; again: string }
+    expect([answer.status, body.opened, body.notice, body.again]).toEqual([200, true, ReviewPage.TALK_OPENED, ReviewPage.OPEN_AGAIN])
+    const folder = talkFolder()
+    expect(filesOf(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json'])
+    expect(readFileSync(join(folder, '.mcp.json'), 'utf8')).toContain(`"http://127.0.0.1:${port}/review/proposal"`)
+    expect(body.link.startsWith(`claude://code/new?folder=${encodeURIComponent(folder)}&q=`)).toBe(true)
+    const message = decodeURIComponent(body.link.split('&q=')[1]!)
+    for (const part of ['Review talk · project job 1', 'Good pace.', 'Reject this at this stage.', 'Keep it small.', 'never job text, comments, project code or a file path']) {
+      expect(message).toContain(part)
+    }
+    // Opened later, the job shows the notice that names the talk, with the link that starts a fresh one.
+    const page = dom((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).text)
+    expect(page.querySelector('#talk-notice span')!.textContent).toBe('A review talk for this job was started on 26 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.')
+    expect([page.querySelector('#talk-notice')!.hasAttribute('hidden'), page.querySelector('#fresh-talk')!.textContent]).toEqual([false, ReviewPage.FRESH_TALK])
+    const button = page.querySelector<HTMLButtonElement>('#start-talk')!
+    expect([button.textContent, button.dataset.project, button.dataset.job, button.closest('.head') !== null]).toEqual([ReviewPage.START_TALK, project, 'job-1', true])
+  })
+
+  it('opens nothing and rewrites nothing on a second click, and writes the files again for a fresh talk', async () => {
+    await serve()
+    sample()
+    const cookie = await signIn()
+    expect((await startTalk(cookie)).status).toBe(200)
+    const folder = talkFolder()
+    const before = filesOf(folder).map(name => readFileSync(join(folder, name), 'utf8'))
+    const again = JSON.parse((await startTalk(cookie)).text) as Record<string, unknown>
+    expect(again).toEqual({ opened: false, notice: expect.stringContaining('was started on 26 Nov 2026'), fresh: ReviewPage.FRESH_TALK })
+    expect(filesOf(folder).map(name => readFileSync(join(folder, name), 'utf8'))).toEqual(before)
+    put('reviews.jsonl', [review({ comment: 'Changed my mind.' })])
+    const fresh = JSON.parse((await startTalk(cookie, { project, job_id: 'job-1', fresh: true })).text) as { opened: boolean; link: string }
+    expect([fresh.opened, readFileSync(join(folder, 'comments.md'), 'utf8').includes('Changed my mind.')]).toEqual([true, true])
+  })
+
+  it('asks for a comment first, says why a talk cannot be prepared, and marks nothing as started', async () => {
+    await serve()
+    put('actions.jsonl', [action()])
+    const cookie = await signIn()
+    const none = await startTalk(cookie)
+    expect([none.status, JSON.parse(none.text)]).toEqual([409, { error: 'Comment on the job or a step first.' }])
+    expect(existsSync(talkRoot())).toBe(false)
+    put('reviews.jsonl', [review()])
+    rmSync(proposeServer())
+    const cannot = await startTalk(cookie)
+    expect([cannot.status, (JSON.parse(cannot.text) as { error: string }).error]).toEqual([503, expect.stringMatching(/^The review talk could not be prepared: /)])
+    expect(existsSync(talkRoot())).toBe(false)
+    const page = dom((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).text)
+    expect([page.querySelector('#talk-notice')!.hasAttribute('hidden'), page.querySelector('#talk-notice')!.textContent]).toEqual([true, ''])
+    const unknown = await startTalk(cookie, { project, job_id: 'nope' })
+    expect(unknown.status).toBe(404)
+  })
+
+  it('refuses a start without the cookie, from another site or with the wrong method, and writes nothing', async () => {
+    await serve()
+    sample()
+    const cookie = await signIn()
+    expect((await startTalk(undefined)).status).toBe(401)
+    expect((await startTalk(cookie, undefined, { origin: 'http://evil.example' })).status).toBe(403)
+    expect((await startTalk(cookie, undefined, { origin: undefined })).status).toBe(403)
+    const wrong = await call('GET', ReviewRoute.TALK_PATH, { cookie })
+    expect([wrong.status, wrong.headers.allow]).toEqual([405, 'POST'])
+    expect(existsSync(talkRoot())).toBe(false)
+  })
+
+  it('keeps a proposal posted with the token for a job whose talk was started, echoes the token, and shows it on both tabs before → after', async () => {
+    await serve()
+    sample()
+    const cookie = await signIn()
+    expect((await startTalk(cookie)).status).toBe(200)
+    const first = await propose({ job_id: 'job-1', text: '# Guideline\nKeep it small.\nAsk first.\nNever add a dependency unasked.\n' })
+    expect([first.status, first.headers[SharedTokenFile.HEADER], (JSON.parse(first.text) as { kept: boolean }).kept]).toEqual([200, TOKEN, true])
+    const second = await propose({ job_id: 'job-1', text: '# Guideline\nKeep to the minimum feature.\nAsk first.\n' })
+    expect(second.status).toBe(200)
+    // The notice on both tabs links to the newest proposal.
+    for (const address of [ReviewRoute.address(project, 'job-1'), ReviewRoute.guidelineAddress()]) {
+      const page = dom((await call('GET', address, { cookie })).text)
+      expect([page.querySelector('#proposal-notice')!.hasAttribute('hidden'), page.querySelector('#proposal-link')!.textContent, page.querySelector('#proposal-link')!.getAttribute('href')])
+        .toEqual([false, ReviewPage.PROPOSAL_WAITING, ReviewRoute.proposalAddress(project, 'job-1')])
+    }
+    const guideline = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
+    expect([...guideline.querySelectorAll('nav.left a')].map(link => link.className)).toEqual(['proposal', 'version on'])
+    const view = dom((await call('GET', ReviewRoute.proposalAddress(project, 'job-1'), { cookie })).text)
+    const [left, right] = [...view.querySelectorAll('.halves section')]
+    expect([left!.querySelector('h3')!.textContent, right!.querySelector('h3')!.textContent]).toEqual(['Guideline v1 · current', 'Proposed v2'])
+    // The newer text stands on the right, whole; only the changed line is marked, as a deletion on the left and an insertion on the right.
+    expect([...left!.querySelectorAll('.line')].map(each => [each.tagName, each.textContent])).toEqual([['SPAN', '# Guideline'], ['DEL', 'Keep it small.'], ['SPAN', 'Ask first.']])
+    expect([...right!.querySelectorAll('.line')].map(each => [each.tagName, each.textContent])).toEqual([['SPAN', '# Guideline'], ['INS', 'Keep to the minimum feature.'], ['SPAN', 'Ask first.']])
+    expect(view.querySelector('main')!.textContent).toContain(ReviewPage.NOTHING_SAVED)
+    expect([...view.querySelectorAll('form, button, select, input, textarea')].length).toBe(0)
+    // What waits, for the page's script: no text, only where to open it.
+    const waiting = await call('GET', ReviewRoute.PROPOSAL_PATH, { cookie })
+    expect(JSON.parse(waiting.text)).toEqual({ waiting: [{ project, job_id: 'job-1', number: 1, ts: NOW, href: ReviewRoute.proposalAddress(project, 'job-1') }] })
+    expect((await call('GET', ReviewRoute.PROPOSAL_PATH, {})).status).toBe(401)
+    // Text from the talk is text on the page, never markup.
+    expect((await propose({ job_id: 'job-1', text: 'Ask before <b>any</b> push.' })).status).toBe(200)
+    const escaped = dom((await call('GET', ReviewRoute.proposalAddress(project, 'job-1'), { cookie })).text)
+    expect([escaped.querySelector('b'), escaped.querySelector('ins')!.textContent]).toEqual([null, 'Ask before <b>any</b> push.'])
+  })
+
+  it('keeps nothing without the token, with a wrong one, with an Origin, or from a caller that is not on loopback', async () => {
+    await serve()
+    sample()
+    const cookie = await signIn()
+    expect((await startTalk(cookie)).status).toBe(200)
+    const body = { job_id: 'job-1', text: 'New text.' }
+    expect((await propose(body, { [SharedTokenFile.HEADER]: undefined })).status).toBe(401)
+    expect((await propose(body, { [SharedTokenFile.HEADER]: OTHER_TOKEN })).status).toBe(401)
+    expect((await propose(body, { origin: origin() })).status).toBe(403)
+    expect((await propose(body, { origin: origin(), cookie })).status).toBe(403)
+    expect((await propose(body, { host: `evil.example:${port}` })).status).toBe(403)
+    for (const refused of [await propose(body, { [SharedTokenFile.HEADER]: undefined }), await propose(body, { origin: origin() })]) {
+      expect(refused.headers[SharedTokenFile.HEADER]).toBeUndefined()
+      expect(refused.text).not.toContain(TOKEN)
+    }
+    const away = direct('192.168.1.9', 'POST', { [SharedTokenFile.HEADER]: TOKEN }, JSON.stringify(body))
+    await reviewRoute!.handle(away.req, away.res, 3083, 'proposal')
+    expect(away.answer.status).toBe(403)
+    expect(reviewRoute!.proposals.newest()).toEqual([])
+  })
+
+  it('refuses a bad proposal and says why: not JSON, no text, too large, the same as now, an unknown job, a job with no talk', async () => {
+    await serve()
+    sample()
+    put('actions.jsonl', [...lines('actions.jsonl'), JSON.stringify(action({ job_id: 'job-2', step_id: 'other-1', ts: '2026-11-26T10:00:00.000Z' }))])
+    const cookie = await signIn()
+    expect((await startTalk(cookie)).status).toBe(200)
+    const cases: [unknown, number, string][] = [
+      ['not json', 400, 'The request body is not JSON'],
+      [{ job_id: 'job-1' }, 400, 'text must be the whole new guideline text'],
+      [{ job_id: 'job-1', text: '   ' }, 400, 'text must be the whole new guideline text'],
+      [{ text: 'New text.' }, 400, 'job_id must be non-empty text'],
+      [{ job_id: 'job-1', text: 'x'.repeat(ReviewRoute.MAX_BODY_BYTES) }, 413, `Request exceeds ${ReviewRoute.MAX_BODY_BYTES} bytes`],
+      [{ job_id: 'job-1', text: '# Guideline\nKeep it small.\nAsk first.\n' }, 400, 'The proposal is the same as the current version'],
+      [{ job_id: 'job-1', text: '# Guideline\r\nKeep it small.\r\nAsk first.\r\n' }, 400, 'The proposal is the same as the current version'],
+      [{ job_id: 'nope', text: 'New text.' }, 404, 'No listed project holds that job'],
+      [{ job_id: 'job-2', text: 'New text.' }, 409, 'No review talk was started for that job'],
+    ]
+    for (const [body, status, error] of cases) {
+      const answer = await propose(body)
+      expect([body === 'not json' ? body : Object.keys(body as object), answer.status, JSON.parse(answer.text)]).toEqual([body === 'not json' ? body : Object.keys(body as object), status, { error }])
+    }
+    expect(reviewRoute!.proposals.newest()).toEqual([])
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
+    expect(page.querySelector('#proposal-notice')!.hasAttribute('hidden')).toBe(true)
+    expect((await call('GET', ReviewRoute.proposalAddress(project, 'job-1'), { cookie })).status).toBe(404)
+  })
+
+  it('keeps a proposal under the one project whose talk for a shared job id was started, and refuses when both were started', async () => {
+    const other = join(root, 'other')
+    mkdirSync(join(other, FactoryRecordFile.FOLDER), { recursive: true })
+    await serve([project, other])
+    sample()
+    put('actions.jsonl', [action({ project: other })], other)
+    put('reviews.jsonl', [review({ project: other, comment: 'On the other project.' })], other)
+    const cookie = await signIn()
+    expect((await startTalk(cookie, { project: other, job_id: 'job-1' })).status).toBe(200)
+    expect((await propose({ job_id: 'job-1', text: 'For the other project.' })).status).toBe(200)
+    expect(reviewRoute!.proposals.newest().map(each => [each.project, each.text])).toEqual([[other, 'For the other project.']])
+    expect(reviewRoute!.proposals.of(project, 'job-1')).toBeUndefined()
+    expect((await startTalk(cookie, { project, job_id: 'job-1' })).status).toBe(200)
+    const both = await propose({ job_id: 'job-1', text: 'For which project?' })
+    expect([both.status, JSON.parse(both.text)]).toEqual([409, { error: 'Review talks for that job id were started in more than one project' }])
+    expect(reviewRoute!.proposals.newest().map(each => [each.project, each.text])).toEqual([[other, 'For the other project.']])
+  })
+
+  it('writes no record: the job log, the comments, the guideline folder and the project\'s .factory folder are as they were', async () => {
+    await serve()
+    sample()
+    const before = { actions: readFileSync(file('actions.jsonl'), 'utf8'), reviews: readFileSync(file('reviews.jsonl'), 'utf8'), guideline: readFileSync(join(root, 'guideline', 'v1.md'), 'utf8') }
+    const cookie = await signIn()
+    expect((await startTalk(cookie)).status).toBe(200)
+    expect((await startTalk(cookie, { project, job_id: 'job-1', fresh: true })).status).toBe(200)
+    expect((await propose({ job_id: 'job-1', text: 'New text.' })).status).toBe(200)
+    expect({ actions: readFileSync(file('actions.jsonl'), 'utf8'), reviews: readFileSync(file('reviews.jsonl'), 'utf8'), guideline: readFileSync(join(root, 'guideline', 'v1.md'), 'utf8') })
+      .toEqual(before)
+    expect([readdirSync(join(project, FactoryRecordFile.FOLDER)).sort(), readdirSync(join(root, 'guideline'))]).toEqual([['actions.jsonl', 'reviews.jsonl'], ['v1.md']])
+    // The talk folder is outside the project.
+    expect(talkFolder().startsWith(project)).toBe(false)
+  })
+
+  /** The page of one job in a browser stand-in whose `fetch` is the test's, with the page's script running; links it opens are written down. */
+  function talkBrowser(talk: { started?: string }, answers: (url: string, init: { method?: string; body?: string }) => Promise<{ ok: boolean; json: () => Promise<unknown> }>) {
+    const reviews = [review({ comment: 'Good pace.' })]
+    const shown: RecordedJob = { project, job_id: 'job-1', number: 1, started: NOW, stopped: null, last: NOW, steps: [{ automatic: false, ts: NOW, line: action() }], reviews }
+    const entry: ProjectJobs = { project, jobs: [shown], outside: [] }
+    const state = talk.started === undefined ? undefined : { project, job_id: 'job-1', number: 1, title: 'Review talk · project job 1', started: talk.started }
+    const html = new ReviewPage('nonce').view({ projects: [entry], project: entry, job: shown, outside: false, ...(state === undefined ? {} : { talk: state }) })
+    const sent: { url: string; method: string; body: unknown }[] = []
+    const opened: string[] = []
+    const timers: { run: () => void; ms: number }[] = []
+    const window = new JSDOM(html, { runScripts: 'dangerously', url: 'http://127.0.0.1:3083/review', beforeParse: view => {
+      // The page's repeated question, written down so the test can run it when it likes.
+      (view as unknown as { setInterval: unknown }).setInterval = (run: () => void, ms: number) => { timers.push({ run, ms }); return timers.length }
+      (view as unknown as { fetch: unknown }).fetch = (url: string, init: { method?: string; body?: string } = {}) => {
+        sent.push({ url, method: init.method ?? 'GET', body: init.body === undefined ? undefined : JSON.parse(init.body) })
+        return answers(url, init)
+      }
+      // A click on a link is where the browser would hand `claude://` to Claude Desktop; the stand-in writes it down instead.
+      view.HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) { opened.push(this.href) }
+    } }).window
+    const notice = () => window.document.querySelector('#talk-notice')!
+    /** A real click on a link of the page, which runs its handlers (the stand-in `click` above only writes the address down). */
+    const press = (link: Element) => { link.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })) }
+    return { window, sent, opened, notice, timers, press }
+  }
+  const json = (ok: boolean, body: unknown) => Promise.resolve({ ok, json: () => Promise.resolve(body) })
+
+  it('the button posts the job, shows the notice with "Open Claude Desktop again" and opens the link, without leaving the page', async () => {
+    const link = 'claude://code/new?folder=%2Ftalk&q=Review%20talk'
+    const page = talkBrowser({}, () => json(true, { opened: true, link, notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
+    expect(page.notice().hasAttribute('hidden')).toBe(true)
+    page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
+    await settle(); await settle()
+    expect(page.sent).toEqual([{ url: ReviewRoute.TALK_PATH, method: 'POST', body: { project, job_id: 'job-1', fresh: false } }])
+    expect([page.notice().hasAttribute('hidden'), page.notice().querySelector('span')!.textContent]).toEqual([false, ReviewPage.TALK_OPENED])
+    expect([page.notice().querySelector('a')!.textContent, page.notice().querySelector('a')!.getAttribute('href')]).toEqual([ReviewPage.OPEN_AGAIN, link])
+    expect([page.opened, page.window.location.href]).toEqual([[link], 'http://127.0.0.1:3083/review'])
+    page.window.close()
+  })
+
+  it('a second click shows the notice that names the talk; "Start a fresh talk instead" posts again with fresh; a refusal shows its reason', async () => {
+    const answers = [
+      { ok: true, body: { opened: false, notice: 'A review talk for this job was started on 26 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.', fresh: ReviewPage.FRESH_TALK } },
+      { ok: true, body: { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN } },
+      { ok: false, body: { error: 'The review talk could not be prepared: the factory\'s mask cannot be had' } },
+    ]
+    const page = talkBrowser({}, () => { const next = answers.shift()!; return json(next.ok, next.body) })
+    page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
+    await settle(); await settle()
+    expect(page.notice().querySelector('span')!.textContent).toContain('Continue it in Claude Desktop')
+    expect(page.opened).toEqual([])
+    page.press(page.notice().querySelector('#fresh-talk')!)
+    await settle(); await settle()
+    expect(page.sent.map(each => (each.body as { fresh: boolean }).fresh)).toEqual([false, true])
+    expect(page.opened).toEqual(['claude://code/new?folder=x&q=y'])
+    page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
+    await settle(); await settle()
+    expect(page.notice().textContent).toBe('The review talk could not be prepared: the factory\'s mask cannot be had')
+    page.window.close()
+  })
+
+  it('ignores a second click, on the button or the fresh link, while a start runs, and takes clicks again once it is answered', async () => {
+    let answer: () => void = () => {}
+    const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z' }, () => new Promise(resolve => {
+      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }) }) }
+    }))
+    const button = page.window.document.querySelector<HTMLButtonElement>('#start-talk')!
+    button.click()
+    button.click()
+    page.press(page.notice().querySelector('#fresh-talk')!)
+    expect([page.sent.length, button.disabled]).toEqual([1, true])
+    answer()
+    await settle(); await settle()
+    expect([button.disabled, page.notice().querySelector('a')!.textContent, page.opened]).toEqual([false, ReviewPage.OPEN_AGAIN, ['claude://code/new?folder=x&q=y']])
+    button.click()
+    expect(page.sent.length).toBe(2)
+    page.window.close()
+  })
+
+  it('a job whose talk was started shows its notice on opening, and its fresh link posts with fresh', async () => {
+    const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z' }, () => json(true, { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
+    expect(page.notice().querySelector('span')!.textContent).toBe('A review talk for this job was started on 25 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.')
+    page.press(page.notice().querySelector('#fresh-talk')!)
+    await settle(); await settle()
+    expect(page.sent).toEqual([{ url: ReviewRoute.TALK_PATH, method: 'POST', body: { project, job_id: 'job-1', fresh: true } }])
+    expect(page.window.location.href).toBe('http://127.0.0.1:3083/review')
+    page.window.close()
+  })
+
+  it('the proposal notice appears without a reload: the page asks when its window gets focus, and every 5 seconds', async () => {
+    {
+      let waiting: object[] = []
+      const page = talkBrowser({}, () => json(true, { waiting }))
+      const notice = page.window.document.querySelector('#proposal-notice')!
+      expect([notice.hasAttribute('hidden'), page.sent]).toEqual([true, []])
+      waiting = [{ project, job_id: 'job-1', number: 1, ts: NOW, href: ReviewRoute.proposalAddress(project, 'job-1') }]
+      page.window.dispatchEvent(new page.window.Event('focus'))
+      await settle(); await settle()
+      expect(page.sent).toEqual([{ url: ReviewRoute.PROPOSAL_PATH, method: 'GET', body: undefined }])
+      expect([notice.hasAttribute('hidden'), page.window.document.querySelector('#proposal-link')!.getAttribute('href')]).toEqual([false, ReviewRoute.proposalAddress(project, 'job-1')])
+      waiting = []
+      expect(page.timers.map(timer => timer.ms)).toEqual([ReviewPage.POLL_MS])
+      page.timers[0]!.run()
+      await settle(); await settle()
+      expect([page.sent.length, notice.hasAttribute('hidden')]).toEqual([2, true])
+      page.window.close()
+    }
   })
 })
 
@@ -1060,7 +1413,9 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     for (const [session, written] of Object.entries(sample.transcripts)) writeFileSync(join(transcripts, `${session}.jsonl`), written.map(line => JSON.stringify(line)).join('\n') + '\n')
     cpSync(join(FACTORY, 'lib', 'fixtures', 'guideline'), join(root, 'factory', 'guideline'), { recursive: true })
     expect(existsSync(built), `${built} is missing: run the factory's build`).toBe(true)
-    await serve([a, b], new SampleRecords(claudeHome))
+    const records = new SampleRecords(claudeHome)
+    // The real built propose server, next to the real built job log file.
+    await serve([a, b], records, talksFor(records, join(FACTORY, 'lib', 'dist', 'proposeServer.js')))
     return { a, b, cookie: await signIn() }
   }
   const jobsOf = (page: Document) => [...page.querySelectorAll('nav a.job')].map(link => [...link.querySelectorAll('span')].filter(part => part.parentElement === link).map(part => part.textContent))
@@ -1159,5 +1514,91 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect(page.querySelector('.guideline-text')!.textContent).toBe(readFileSync(join(FACTORY, 'lib', 'fixtures', 'guideline', 'v2.md'), 'utf8').split('---\n')[2])
     // The plugin's own reader comes from the same built file and is built with no location: it finds the factory repository itself.
     expect(typeof (await new FactoryRecordsModule(built).guidelineReader()).read).toBe('function')
+  })
+
+  /** Every file under a folder, as paths below it, sorted. */
+  const filesUnder = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
+    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).sort()
+  /** Starts the talk of the sample's job-a1, which has the whole job's comment, after a second comment on its permission answer. */
+  async function startSampleTalk(a: string, cookie: string): Promise<{ folder: string; link: string }> {
+    expect((await comment(cookie, { project: a, job_id: 'job-a1', step_id: 'a1-2', comment: 'Keep to the minimum feature.' })).status).toBe(200)
+    const answer = await call('POST', ReviewRoute.TALK_PATH, { origin: origin(), cookie, 'content-type': 'application/json' }, JSON.stringify({ project: a, job_id: 'job-a1' }))
+    const body = JSON.parse(answer.text) as { opened: boolean; link: string }
+    expect([answer.status, body.opened]).toEqual([200, true])
+    const folder = readdirSync(talkRoot()).map(name => join(talkRoot(), name))[0]!
+    return { folder, link: body.link }
+  }
+  /** Starts the server `.mcp.json` names as Claude Desktop would, `${HOME}` expanded, and calls its tool over standard input and output once per text. */
+  async function proposeOverStdio(folder: string, texts: readonly string[]): Promise<{ isError?: boolean; content: { text: string }[] }[]> {
+    const mcp = JSON.parse(readFileSync(join(folder, '.mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args: string[] }> }
+    const { command, args } = mcp.mcpServers[TalkFolder.SERVER_NAME]!
+    const expand = (value: string) => value.replaceAll('${HOME}', homedir())
+    const child = spawn(expand(command), args.map(expand), { cwd: folder, stdio: ['pipe', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString('utf8') })
+    const answerTo = async (id: number) => {
+      for (let tries = 0; tries < 200; tries++) {
+        const found = out.split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line) as { id?: number; result?: unknown }).find(each => each.id === id)
+        if (found) return found.result
+        await new Promise(resolve => { setTimeout(resolve, 25) })
+      }
+      throw new Error(`no answer to ${id}`)
+    }
+    const send = (message: object) => { child.stdin.write(`${JSON.stringify(message)}\n`) }
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } } })
+    await answerTo(1)
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    const results = []
+    for (const [index, text] of texts.entries()) {
+      send({ jsonrpc: '2.0', id: 10 + index, method: 'tools/call', params: { name: 'propose_guideline_change', arguments: { job_id: 'job-a1', text } } })
+      results.push(await answerTo(10 + index) as { isError?: boolean; content: { text: string }[] })
+    }
+    child.stdin.end()
+    await new Promise(resolve => { child.on('close', resolve) })
+    return results
+  }
+
+  it('starts the sample job\'s talk, and the built propose server, started with Node over stdio, proposes twice: the page shows the newer text and no record changed', async () => {
+    const { a, cookie } = await serveSample()
+    const recordsBefore = () => ({ actions: readFileSync(file('actions.jsonl', a), 'utf8'), reviews: readFileSync(file('reviews.jsonl', a), 'utf8'),
+      guideline: Object.fromEntries(readdirSync(join(root, 'factory', 'guideline')).map(name => [name, readFileSync(join(root, 'factory', 'guideline', name), 'utf8')])) })
+    const { folder, link } = await startSampleTalk(a, cookie)
+    const before = recordsBefore()
+    expect(filesUnder(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json'])
+    expect(readFileSync(join(folder, '.claude', 'settings.json'), 'utf8')).toBe(TalkFolder.SETTINGS)
+    const message = decodeURIComponent(link.split('&q=')[1]!)
+    for (const part of ['Review talk · project-a job 1', 'Good pace.', 'Keep to the minimum feature.', 'Reject a feature for an edge case', 'never job text, comments, project code or a file path']) {
+      expect(message).toContain(part)
+    }
+    const current = readFileSync(join(FACTORY, 'lib', 'fixtures', 'guideline', 'v2.md'), 'utf8').split('---\n')[2]!
+    const results = await proposeOverStdio(folder, [`${current}- First idea.\n`, `${current}- Ask before adding a dependency.\n`])
+    expect(results.map(result => [result.isError ?? false, result.content[0]!.text])).toEqual([[false, expect.stringContaining('is on the review page')], [false, expect.stringContaining('is on the review page')]])
+    const view = dom((await call('GET', ReviewRoute.proposalAddress(a, 'job-a1'), { cookie })).text)
+    expect([...view.querySelectorAll('.halves ins')].map(each => each.textContent)).toEqual(['- Ask before adding a dependency.'])
+    expect(view.querySelector('.halves h3')!.textContent).toBe('Guideline v2 · current')
+    expect(recordsBefore()).toEqual(before)
+    expect(readdirSync(join(a, FactoryRecordFile.FOLDER)).sort()).toEqual(['actions.jsonl', 'decisions.jsonl', 'requests.jsonl', 'reviews.jsonl'])
+  })
+
+  it('writes masked copies only: a secret and the owner\'s home path planted raw in the job log, the comments and the guideline are in no talk file and no part of the link', async () => {
+    const { a, cookie } = await serveSample()
+    const secret = 'sk-made-up-0000000000000000', home = `${homedir()}/private-notes.md`
+    // Planted raw, past every mask: straight into the files on disk.
+    put('actions.jsonl', [...lines('actions.jsonl', a), JSON.stringify({ ts: '2026-11-22T11:30:00.000Z', project: a, job_id: 'job-a1', step_id: 'a1-planted', kind: 'message_in',
+      summary: `Read ${home} and use ${secret}.`, from: 'owner', to: 'super agent' })], a)
+    put('reviews.jsonl', [...lines('reviews.jsonl', a), JSON.stringify({ ts: '2026-11-22T12:30:00.000Z', project: a, job_id: 'job-a1', comment: `Never print ${secret}; see ${home}.` })], a)
+    const v2 = join(root, 'factory', 'guideline', 'v2.md')
+    writeFileSync(v2, `${readFileSync(v2, 'utf8')}- Keep ${secret} out of ${home}.\n`)
+    const { folder, link } = await startSampleTalk(a, cookie)
+    for (const name of filesUnder(folder)) {
+      const text = readFileSync(join(folder, name), 'utf8')
+      expect([name, text.includes(secret), text.includes(homedir())]).toEqual([name, false, false])
+    }
+    // The planted texts did reach the talk, masked.
+    expect(readFileSync(join(folder, 'comments.md'), 'utf8')).toContain('~/private-notes.md')
+    expect(readFileSync(join(folder, 'guideline.md'), 'utf8')).toContain('~/private-notes.md')
+    expect(readFileSync(join(folder, 'job.md'), 'utf8')).toContain('~/private-notes.md')
+    const decoded = decodeURIComponent(link.split('&q=')[1]!)
+    expect([decoded.includes(secret), decoded.includes(homedir()), link.includes(encodeURIComponent(secret)), link.includes(encodeURIComponent(homedir()))]).toEqual([false, false, false, false])
   })
 })

@@ -7,8 +7,12 @@
  * `GuidelineReader` reads them from the factory repository.
  * The factory's `JobsReader` builds the jobs from each project's `.factory/` records and its `StepDetailReader` reads a step's detail through the step's
  * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
+ * A job's header has "Start review talk": it prepares the job's review talk folder outside every repository and hands the browser a link that opens
+ * Claude Desktop on it (`talk.ts`). The talk's one tool posts a proposed guideline text back to `POST /review/proposal`, with the shared token; the page
+ * shows the newest proposal per job as before → after on the Guideline tab (`diff.ts`) and saves nothing.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
- * everything but the sign-in form needs the cookie the owner gets by typing the shared token (`token.ts`) into that form once.
+ * everything but the sign-in form needs the cookie the owner gets by typing the shared token (`token.ts`) into that form once. The one address a program
+ * posts to, the talk's proposal address, takes the shared token itself instead of the cookie, and no Origin, as `/assess` does.
  * The page loads nothing from anywhere else and brings no colours of its own: its style names DSH's design tokens only.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -20,6 +24,8 @@ import {
   FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type GuidelineRead, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
+import { TextDiff, type DiffLine } from './diff.ts'
+import { GuidelineProposals, ReviewTalks, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 
 /** Where the page gets the shared token from, on every request. `undefined` means there is no usable token. */
@@ -59,6 +65,23 @@ export class ReviewAccess {
     if (!ReviewAccess.LOOPBACK_ADDRESSES.has(req.socket.remoteAddress ?? '')) throw new ReviewRefusal(403, 'Loopback request required')
   }
 
+  /**
+   * Admits a program on this machine that sends the shared token, as `/assess` does, and returns the token to send back: the review talk's propose tool.
+   * The Host header and the caller's address must be loopback, there must be no Origin (a browser always sends one with a POST, so no web page gets in),
+   * then this side's token file must be usable (503) and the caller's `x-factory-token` the same token (401). Reads no body.
+   */
+  admitTool(req: IncomingMessage, port: number): string {
+    const host = req.headers.host
+    if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) throw new ReviewRefusal(403, 'Loopback request required')
+    if (req.headers.origin !== undefined) throw new ReviewRefusal(403, 'Browser requests are refused at this address')
+    if (!ReviewAccess.LOOPBACK_ADDRESSES.has(req.socket.remoteAddress ?? '')) throw new ReviewRefusal(403, 'Loopback request required')
+    const token = this.tokens.read()
+    if (token === undefined) throw new ReviewRefusal(503, 'The review page has no usable token file, so it answers nobody')
+    const sent = req.headers[SharedTokenFile.HEADER]
+    if (typeof sent !== 'string' || sent === '' || !SharedTokenFile.same(sent, token)) throw new ReviewRefusal(401, 'The shared token is missing or wrong')
+    return token
+  }
+
   /** Whether the request carries the cookie that proves the shared token as the token file holds it now. With no usable token file nobody is signed in. */
   signedIn(req: IncomingMessage): boolean {
     const token = this.tokens.read()
@@ -95,7 +118,13 @@ export class ReviewAccess {
  * What one page shows: every listed project, the picked one, and in it the picked job, or the automatic answers that fell in no job (`outside`), or neither
  * when the project has no job yet. In a job, `step` is the picked step and `detail` what the factory's `StepDetailReader` read for it.
  */
-export interface ReviewView { projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean; step?: TimelineStep; detail?: StepDetail }
+export interface ReviewView {
+  projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean; step?: TimelineStep; detail?: StepDetail
+  /** The job's review talk, when it was started. */
+  talk?: TalkState
+  /** The guideline changes waiting for the owner's answer, newest first. */
+  waiting?: readonly GuidelineProposal[]
+}
 
 /**
  * The owner's comments on one job as the page shows them: one for the whole job and one per step, each the newest line for it in file order,
@@ -141,6 +170,15 @@ export class ReviewPage {
   static readonly TAB_GUIDELINE = 'Guideline'
   static readonly NO_GUIDELINE = 'No guideline yet. The first review talk writes version 1.'
   static readonly NO_GUIDELINE_FOLDER = 'The guideline folder was not found, so the super agent is running without a guideline.'
+  static readonly START_TALK = 'Start review talk'
+  static readonly TALK_OPENED = 'Review talk opened in Claude Desktop. Confirm the folder there and press send.'
+  static readonly OPEN_AGAIN = 'Open Claude Desktop again'
+  static readonly FRESH_TALK = 'Start a fresh talk instead'
+  static readonly CANNOT_PREPARE = 'The review talk could not be prepared: '
+  static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
+  static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
+  /** How often the page asks whether a proposal is waiting, in milliseconds; it also asks when its window gets focus. */
+  static readonly POLL_MS = 5000
   /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */
   static readonly WHOLE_JOB_KINDS: ReadonlySet<JobLogLine['kind']> = new Set(['job_start', 'job_stop'])
   /** What a part of a step reads when no record holds it: the label stays, never a blank or a guess. */
@@ -154,8 +192,8 @@ export class ReviewPage {
   }
   /** The super agent's answer, in words. */
   static readonly DECISIONS: Record<Extract<StepWhy, { by: 'super_agent' }>['decision'], string> = { approve: 'Approved', deny: 'Denied', ask_owner: 'Handed to the owner' }
-  /** What each kind of job log line is called on the page. */
-  private static readonly HEADINGS: Record<JobLogLine['kind'], string> = {
+  /** What each kind of job log line is called on the page, and in the review talk's files. */
+  static readonly HEADINGS: Record<JobLogLine['kind'], string> = {
     job_start: 'Job started', job_stop: 'Job stopped', permission_answer: 'Permission answered', fork_answer: 'Fork answered',
     message_in: 'Message received', message_out: 'Message sent', session_start: 'Session started', session_steer: 'Session steered',
   }
@@ -194,13 +232,31 @@ export class ReviewPage {
     '.tabs a { padding: 4px 10px; border-radius: 8px; color: inherit; text-decoration: none; }',
     '.tabs a.on { background: var(--dsw-alias-bg-layer-2); }',
     'pre.guideline-text { text-wrap-mode: wrap; overflow-wrap: anywhere; overflow-x: auto; font-family: var(--ds-font-family-code); font-size: 12px; }',
+    '.head { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
+    '.head .crumb { border-bottom: 0; }',
+    'button.primary { padding: 4px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); cursor: pointer; }',
+    '.notice { margin: 8px 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font-size: 12px; }',
+    '.notice .small { font-size: 11px; }',
+    '.left a.proposal { border-left: 3px solid var(--dsw-alias-brand-primary); }',
+    '.halves { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }',
+    '.halves h3 { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); }',
+    'pre.diff { margin: 0; text-wrap-mode: wrap; overflow-wrap: anywhere; font-family: var(--ds-font-family-code); font-size: 12px; }',
+    '.diff .line { display: block; min-height: 1.45em; text-decoration: none; }',
+    '.diff del.line { text-decoration: line-through; background: color-mix(in oklab, var(--dsw-alias-state-error-primary) 14%, transparent); }',
+    '.diff ins.line { background: color-mix(in oklab, var(--dsw-alias-state-success-primary) 14%, transparent); }',
   ].join('\n')
   /**
-   * The script that runs in the owner's browser. It talks only to this page's own comment address.
+   * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
+   * on a page without its element. The parts are joined with a semicolon, or each would be read as a call of the one before it.
+   */
+  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript()].join(';\n') }
+
+  /**
+   * The comment field's part of the script. It talks only to this page's own comment address.
    * When the page is left (the tab closes, or a link to another job is followed) with text that was not saved yet, it sends that text once more
    * in a way the browser finishes after the page is gone (`keepalive`), so a comment typed inside the pause is not lost.
    */
-  private static script(): string {
+  private static commentScript(): string {
     return `(() => {
   const field = document.getElementById('comment'), status = document.getElementById('comment-status')
   if (!field || !status) return
@@ -232,6 +288,79 @@ export class ReviewPage {
     saved = text
     send(text, true).catch(() => {})
   })
+})()`
+  }
+
+  /**
+   * The review talk button's part of the script. A click posts the job to the talk address; the answer says what to show. When a talk was prepared it
+   * shows the notice with "Open Claude Desktop again" and opens the answer's `claude://` link, which hands it to Claude Desktop: the page does not
+   * navigate away. When the talk was started before, it shows the notice that names it, with "Start a fresh talk instead", which posts again with
+   * `fresh`. A refusal shows the page's own reason. Every text is set as text, never as markup. The button is disabled while a start runs, and a click
+   * then, on it or on the fresh link, is ignored.
+   */
+  private static talkScript(): string {
+    return `(() => {
+  const button = document.getElementById('start-talk'), notice = document.getElementById('talk-notice')
+  if (!button || !notice) return
+  const openLink = link => { const anchor = document.createElement('a'); anchor.href = link; anchor.click() }
+  const show = (text, again, fresh) => {
+    notice.replaceChildren()
+    const words = document.createElement('span'); words.textContent = text; notice.append(words)
+    if (again) { const link = document.createElement('a'); link.href = again.link; link.textContent = again.label; notice.append(' ', link) }
+    if (fresh) {
+      const link = document.createElement('a'); link.href = '#'; link.id = 'fresh-talk'; link.className = 'small'; link.textContent = fresh
+      link.addEventListener('click', event => { event.preventDefault(); void start(true) })
+      notice.append(' ', link)
+    }
+    notice.hidden = false
+  }
+  // One start at a time: a second click while one runs is ignored, so two requests never prepare the same folder at once.
+  const start = async fresh => {
+    if (button.disabled) return
+    button.disabled = true
+    try { await send(fresh) } finally { button.disabled = false }
+  }
+  const send = async fresh => {
+    let answer, body = {}
+    try {
+      answer = await fetch(${JSON.stringify(ReviewRoute.TALK_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ project: button.dataset.project, job_id: button.dataset.job, fresh }) })
+      body = await answer.json().catch(() => ({}))
+    } catch { show(${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}); return }
+    if (!answer.ok) { show(typeof body.error === 'string' ? body.error : ${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}); return }
+    if (body.opened === true && typeof body.link === 'string') { show(body.notice, { link: body.link, label: body.again }); openLink(body.link) }
+    else show(body.notice, undefined, body.fresh)
+  }
+  button.addEventListener('click', () => { void start(false) })
+  const fresh = document.getElementById('fresh-talk')
+  if (fresh) fresh.addEventListener('click', event => { event.preventDefault(); void start(true) })
+})()`
+  }
+
+  /**
+   * The proposal notice's part of the script: every ${ReviewPage.POLL_MS / 1000} seconds, and whenever the window gets focus, it asks the page's own
+   * proposal address what waits, and shows the notice with a link to the newest proposal, or hides it when none waits. It never switches the tab.
+   */
+  private static pollScript(): string {
+    return `(() => {
+  const notice = document.getElementById('proposal-notice'), link = document.getElementById('proposal-link')
+  if (!notice || !link) return
+  let asking = false
+  const ask = async () => {
+    if (asking) return
+    asking = true
+    try {
+      const answer = await fetch(${JSON.stringify(ReviewRoute.PROPOSAL_PATH)}, { credentials: 'same-origin' })
+      if (answer.ok) {
+        const { waiting } = await answer.json()
+        const newest = Array.isArray(waiting) ? waiting[0] : undefined
+        if (newest && typeof newest.href === 'string') { link.href = newest.href; notice.hidden = false } else notice.hidden = true
+      }
+    } catch {}
+    asking = false
+  }
+  setInterval(() => { void ask() }, ${ReviewPage.POLL_MS})
+  window.addEventListener('focus', () => { void ask() })
 })()`
   }
 
@@ -267,6 +396,7 @@ export class ReviewPage {
     let crumb = `<span title="${ReviewPage.escape(project.project)}">${name}</span>`
     let middle: string
     let panel = ''
+    let talk = ''
     if (view.outside) {
       crumb += ` › ${ReviewPage.OUTSIDE}`
       middle = `<h2>${ReviewPage.OUTSIDE} · ${ReviewPage.count(project.outside.length, 'automatic answer')}</h2>
@@ -277,6 +407,7 @@ ${project.outside.map(answer => ReviewPage.automaticRow(answer)).join('\n')}
       middle = `<p>${ReviewPage.escape(ReviewPage.NO_JOB)}</p>`
     } else {
       crumb += ` › Job ${job.number} · ${ReviewPage.escape(ReviewPage.span(job))}${job.guideline_version === undefined ? '' : ` · <span class="pill">guideline ${ReviewPage.escape(job.guideline_version)}</span>`}`
+      talk = ReviewPage.talkHead(job, view.talk)
       const comments = new JobComments(job)
       middle = `${ReviewPage.commentList(job, comments)}<h2>Timeline · ${ReviewPage.count(job.steps.length, 'step')}</h2>
 <ol>
@@ -288,8 +419,9 @@ ${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
 ${this.commentField(job, view.step, comments)}
 </aside>`
     }
-    return this.document(`${ReviewPage.tabs('jobs')}
-<div class="crumb">${crumb}</div>
+    const head = talk === '' ? `<div class="crumb">${crumb}</div>` : `<div class="head"><div class="crumb">${crumb}</div>${talk}`
+    return this.document(`${ReviewPage.tabs('jobs', view.waiting ?? [])}
+${head}
 <div class="cols${panel === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Projects and jobs">
 ${ReviewPage.left(view)}
@@ -298,47 +430,112 @@ ${ReviewPage.left(view)}
 ${middle}
 </main>
 ${panel}
-</div>`)
+</div>`, true)
   }
 
   /**
-   * The Guideline tab: left, the versions newest first, each with its date and the job whose review led to it; in the middle, the picked version's text,
-   * shown as written. With no version it says there is no guideline yet, and when the factory repository was not found it says so with the reader's reason.
+   * The rest of a job's header: the "Start review talk" button, then the header's end and, under it, the review talk notice. The notice is empty and
+   * hidden until a click fills it, unless the job's talk was started before: then it names the talk, with the link that starts a fresh one.
+   */
+  private static talkHead(job: RecordedJob, talk: TalkState | undefined): string {
+    const button = `<button type="button" id="start-talk" class="primary" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.START_TALK}</button></div>`
+    if (talk === undefined) return `${button}\n<div id="talk-notice" class="notice" role="status" hidden></div>`
+    return `${button}\n<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>`
+  }
+
+  /** The review talk notice for a talk that was started before: its date, and its name to find it by in Claude Desktop. */
+  static talkStarted(talk: TalkState): string {
+    const day = new Date(talk.started).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    return `A review talk for this job was started on ${day}. Continue it in Claude Desktop: '${talk.title}'.`
+  }
+
+  /**
+   * The Guideline tab: left, the proposals that wait for the owner's answer, newest first, above the versions, newest first, each with its date and the
+   * job whose review led to it; in the middle, the picked version's text, shown as written. With no version it says there is no guideline yet, and when
+   * the factory repository was not found it says so with the reader's reason.
+   * With a proposal `open`, the middle shows it before → after instead: the current version on the left, the proposal on the right, both whole, removed
+   * lines marked as deletions and added lines as insertions (`TextDiff`), under the line "Nothing is saved until you accept."
    * It only reads: there is no control on it.
    */
-  guideline(read: GuidelineRead, picked: GuidelineVersion | undefined): string {
+  guideline(read: GuidelineRead, picked: GuidelineVersion | undefined, waiting: readonly GuidelineProposal[] = [], open?: GuidelineProposal): string {
     let crumb = ReviewPage.TAB_GUIDELINE
     let left = ''
     let middle: string
-    if (read.folder === null) {
+    if (open !== undefined) {
+      crumb += ` › Proposal from ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}`
+      left = read.versions.map(each => ReviewPage.versionRow(each, read, undefined)).join('\n')
+      middle = ReviewPage.proposalView(read, open)
+    } else if (read.folder === null) {
       middle = `<p>${ReviewPage.escape(ReviewPage.NO_GUIDELINE_FOLDER)}</p>${read.reason === null ? '' : `\n<p class="meta">${ReviewPage.escape(read.reason)}</p>`}`
     } else if (picked === undefined) {
       middle = `<p>${ReviewPage.escape(ReviewPage.NO_GUIDELINE)}</p>`
     } else {
       crumb += ` › v${picked.version}`
-      left = read.versions.map(each => `<a class="version${each.version === picked.version ? ' on' : ''}" href="${ReviewPage.escape(ReviewRoute.guidelineAddress(each.version))}">\
-<span>v${each.version}${each.version === read.current?.version ? ' · current' : ''}</span><span class="l2">${ReviewPage.escape(ReviewPage.sourceOf(each))}</span></a>`).join('\n')
+      left = read.versions.map(each => ReviewPage.versionRow(each, read, picked)).join('\n')
       middle = `<h2>Guideline v${picked.version}${picked.version === read.current?.version ? ' · current' : ''}</h2>
 <p class="meta">${ReviewPage.escape(ReviewPage.sourceOf(picked))}</p>
 <pre class="guideline-text">${ReviewPage.escape(picked.text)}</pre>`
     }
-    return this.document(`${ReviewPage.tabs('guideline')}
+    const proposals = waiting.map(each => {
+      const on = open !== undefined && each.project === open.project && each.job_id === open.job_id
+      return `<a class="proposal${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.proposalAddress(each.project, each.job_id))}">\
+<span>Proposal · ${ReviewPage.escape(TalkTexts.nameOf(each.project))} job ${each.number}</span><span class="l2">${ReviewPage.escape(ReviewPage.when(each.ts))}</span></a>`
+    })
+    return this.document(`${ReviewPage.tabs('guideline', waiting)}
 <div class="crumb">${crumb}</div>
 <div class="cols">
 <nav class="left" aria-label="Guideline versions">
-${left}
+${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}
 </nav>
 <main>
 ${middle}
 </main>
-</div>`)
+</div>`, true)
   }
 
-  /** The two tabs, the picked one marked. */
-  private static tabs(on: 'jobs' | 'guideline'): string {
+  /** One version in the Guideline tab's list, marked when it is the picked one. */
+  private static versionRow(each: GuidelineVersion, read: GuidelineRead, picked: GuidelineVersion | undefined): string {
+    return `<a class="version${each.version === picked?.version ? ' on' : ''}" href="${ReviewPage.escape(ReviewRoute.guidelineAddress(each.version))}">\
+<span>v${each.version}${each.version === read.current?.version ? ' · current' : ''}</span><span class="l2">${ReviewPage.escape(ReviewPage.sourceOf(each))}</span></a>`
+  }
+
+  /**
+   * A proposal before → after: the current version as the page reads it now on the left, the proposed text on the right, each whole and line by line.
+   * A removed line is a `<del>`, an added line an `<ins>`, so the change is marked for assistive technology too, not only by its tint.
+   */
+  private static proposalView(read: GuidelineRead, open: GuidelineProposal): string {
+    const current = read.current
+    const { before, after } = new TextDiff(current?.text ?? '', open.text).sides()
+    const lines = (side: readonly DiffLine[]) => side.map(line => {
+      const tag = line.mark === 'removed' ? 'del' : line.mark === 'added' ? 'ins' : 'span'
+      return `<${tag} class="line">${ReviewPage.escape(line.text)}</${tag}>`
+    }).join('')
+    const next = (current?.version ?? 0) + 1
+    return `<h2>Proposed change · from the review talk on ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}</h2>
+<p class="meta">Proposed ${ReviewPage.escape(ReviewPage.when(open.ts))}</p>
+<p>${ReviewPage.NOTHING_SAVED}</p>
+<div class="halves">
+<section aria-label="Current version"><h3>${current === null ? ReviewPage.escape(ReviewPage.NO_GUIDELINE) : `Guideline v${current.version} · current`}</h3><pre class="diff">${lines(before)}</pre></section>
+<section aria-label="Proposed version"><h3>Proposed v${next}</h3><pre class="diff">${lines(after)}</pre></section>
+</div>`
+  }
+
+  /** The day and time of a moment, on this machine's clock. */
+  private static when(ts: string): string {
+    return `${new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}, ${ReviewPage.clock(ts)}`
+  }
+
+  /**
+   * The two tabs, the picked one marked, and under them the proposal notice: shown with a link to the newest waiting proposal when one waits, else
+   * there and hidden, so the page's script can show it when one comes.
+   */
+  private static tabs(on: 'jobs' | 'guideline', waiting: readonly GuidelineProposal[]): string {
     const tab = (which: 'jobs' | 'guideline', href: string, label: string) =>
       `<a class="tab${which === on ? ' on' : ''}" href="${ReviewPage.escape(href)}"${which === on ? ' aria-current="page"' : ''}>${label}</a>`
-    return `<nav class="tabs" aria-label="Tabs">${tab('jobs', ReviewRoute.PATH, ReviewPage.TAB_JOBS)}${tab('guideline', ReviewRoute.guidelineAddress(), ReviewPage.TAB_GUIDELINE)}</nav>`
+    const newest = waiting[0]
+    const href = newest === undefined ? ReviewRoute.guidelineAddress() : ReviewRoute.proposalAddress(newest.project, newest.job_id)
+    return `<nav class="tabs" aria-label="Tabs">${tab('jobs', ReviewRoute.PATH, ReviewPage.TAB_JOBS)}${tab('guideline', ReviewRoute.guidelineAddress(), ReviewPage.TAB_GUIDELINE)}</nav>
+<div id="proposal-notice" class="notice" role="status"${newest === undefined ? ' hidden' : ''}><a id="proposal-link" href="${ReviewPage.escape(href)}">${ReviewPage.PROPOSAL_WAITING}</a></div>`
   }
 
   /** A version's date and the job whose review led to it, as far as its front matter says them. */
@@ -360,8 +557,7 @@ ${middle}
 <textarea id="comment" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}"${
   stepId === undefined ? '' : ` data-step="${ReviewPage.escape(stepId)}"`}>${ReviewPage.escape(comments.of(stepId) ?? '')}</textarea>
 <p id="comment-status" role="status"></p>
-</div>
-<script nonce="${this.nonce}">${ReviewPage.script()}</script>`
+</div>`
   }
 
   /**
@@ -515,7 +711,8 @@ ${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocal
   private static clock(ts: string): string { return new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }) }
   private static count(n: number, what: string): string { return `${n} ${what}${n === 1 ? '' : 's'}` }
 
-  private document(body: string): string {
+  /** The whole document. `withScript` adds the page's one script, which a sign-in form or a plain notice does not need. */
+  private document(body: string, withScript = false): string {
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -528,7 +725,7 @@ ${ReviewPage.STYLE}
 <body>
 <h1>Review</h1>
 ${body}
-</body>
+${withScript ? `<script nonce="${this.nonce}">${ReviewPage.script()}</script>\n` : ''}</body>
 </html>
 `
   }
@@ -546,8 +743,8 @@ interface AnonymousRoute {
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   auth: 'anonymous'
 }
-/** Which of the page's three addresses a request is for. */
-type ReviewTarget = 'page' | 'login' | 'comment'
+/** Which of the page's five addresses a request is for. */
+type ReviewTarget = 'page' | 'login' | 'comment' | 'talk' | 'proposal'
 
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
@@ -558,31 +755,50 @@ type ReviewTarget = 'page' | 'login' | 'comment'
  * `POST /review/comment` takes `{ project, job_id, step_id?, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`, on one
  * step when `step_id` is given, else on the whole job; a changed comment is one more line. It answers 400 for an empty comment, a body that is not that
  * object, an automatic answer's step or the job's start or stop row as `step_id`, 404 for a job no listed project holds or a step not in that job, 413 for a
- * body over 64 KiB, and 401 without the cookie. It is the page's only address that writes, and it writes nothing but a comment line.
- * `ReviewAccess.admit` runs first on every request (403), then the method is checked (405), then the cookie; a body is read only after all three.
+ * body over 64 KiB, and 401 without the cookie. It is the page's only address that writes a record, and it writes nothing but a comment line.
+ * `POST /review/talk` takes `{ project, job_id, fresh? }` from the page's button and prepares the job's review talk folder (`ReviewTalks`, outside every
+ * repository and every project): 200 with the `claude://` link and the notice, or, for a job whose talk was started before, 200 with the notice that
+ * names it and no link, unless `fresh` is true. 409 for a job with no comment, 503 when the talk cannot be prepared, 404 for an unknown job.
+ * `POST /review/proposal` is the review talk's tool posting `{ job_id, text }`: like `/assess` it takes no cookie and no Origin but the shared token in
+ * `x-factory-token`, and its 200 answer sends the token back. The text is kept in memory as the newest proposal of that job, which must be a listed job
+ * whose talk was started: 400 for a bad body or a text equal to the current version, 404 for an unknown job, 409 for a job with no talk, 413 over 64 KiB.
+ * `GET /review/proposal` tells the signed-in page what waits, newest first, so its notice appears without a reload.
+ * `ReviewAccess.admit` runs first on every request (403), then the method is checked (405), then the cookie; a body is read only after all three. The
+ * one exception is `POST /review/proposal`, where `ReviewAccess.admitTool` takes the place of all three.
  * It refuses a web server that is not bound to 127.0.0.1. The token is never logged and never put in a page.
  */
 export class ReviewRoute {
   static readonly PATH = '/review'
   static readonly LOGIN_PATH = '/review/login'
   static readonly COMMENT_PATH = '/review/comment'
+  static readonly TALK_PATH = '/review/talk'
+  static readonly PROPOSAL_PATH = '/review/proposal'
   static readonly MAX_BODY_BYTES = 64 * 1024
   private readonly projects: readonly string[]
   private readonly access: ReviewAccess
   private readonly writer: ReviewWriter
+  private readonly talks: ReviewTalks
+  /** The proposals waiting for the owner's answer: in memory only, so a DSH restart forgets them, and nothing of them is saved. */
+  readonly proposals = new GuidelineProposals()
+  /**
+   * `talks` prepares the review talks; by default under `TalkFolder.ROOT`, with the token file of `tokens` (when it is a `SharedTokenFile`) and the
+   * propose server next to the records module's built file.
+   */
   constructor(projects: readonly string[], tokens: ReviewTokenSource = new SharedTokenFile(), private readonly records: RecordsSource = new FactoryRecordsModule(),
-    private readonly now: () => Date = () => new Date()) {
+    private readonly now: () => Date = () => new Date(), talks?: ReviewTalks) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     this.projects = [...new Set(projects.map(project => resolve(project)))]
     this.access = new ReviewAccess(tokens)
     this.writer = new ReviewWriter(records)
+    this.talks = talks ?? new ReviewTalks({ records, tokenFile: tokens instanceof SharedTokenFile ? tokens.path : SharedTokenFile.DEFAULT_PATH, words: ReviewPage, now })
   }
 
-  /** Adds the page's three addresses to the web server and returns the function that removes them. */
+  /** Adds the page's five addresses to the web server and returns the function that removes them. */
   register(ctx: Context): () => void {
     if (ctx.webServer.host !== '127.0.0.1') throw new Error('The factory /review page requires a loopback Web server')
-    const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.LOGIN_PATH, 'login'], [ReviewRoute.COMMENT_PATH, 'comment']]
+    const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.LOGIN_PATH, 'login'], [ReviewRoute.COMMENT_PATH, 'comment'],
+      [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal']]
     // Anonymous to DSH: the page has its own sign-in, with the token the factory and this side already share.
     const disposers = targets.map(([path, target]) => {
       const route: AnonymousRoute = { kind: 'exact', path, auth: 'anonymous', handler: (req, res) => this.handle(req, res, ctx.webServer.port, target) }
@@ -591,28 +807,36 @@ export class ReviewRoute {
     return () => { for (const dispose of disposers) dispose() }
   }
 
-  /** Answers one HTTP request. A refusal becomes its status, as a page for the two addresses a person sees and as `{ error }` for the comment address. */
+  /**
+   * Answers one HTTP request. A refusal becomes its status, as a page for the two addresses a person sees and as `{ error }` for the three a script or a
+   * program posts to.
+   */
   async handle(req: IncomingMessage, res: ServerResponse, port: number, target: ReviewTarget): Promise<void> {
     const page = new ReviewPage(randomBytes(16).toString('base64'))
     const state = { bodyRead: false }
     try {
+      // The talk's tool: a program with the shared token, not the owner's browser.
+      if (target === 'proposal' && req.method === 'POST') { await this.propose(req, res, port, state); return }
       this.access.admit(req, port)
-      const method = target === 'page' ? 'GET' : 'POST'
-      if (req.method !== method) throw Object.assign(new ReviewRefusal(405, `Only ${method} is allowed`), { allow: method })
+      const method = target === 'page' || target === 'proposal' ? 'GET' : 'POST'
+      const allow = target === 'proposal' ? 'GET, POST' : method
+      if (req.method !== method) throw Object.assign(new ReviewRefusal(405, `Only ${allow} is allowed`), { allow })
       if (target === 'login') await this.login(req, res, state)
       else if (!this.access.signedIn(req)) throw new ReviewRefusal(401, 'Sign in with the shared token first')
       else if (target === 'comment') await this.comment(req, res, state)
+      else if (target === 'talk') await this.talk(req, res, port, state)
+      else if (target === 'proposal') ReviewRoute.sendJson(res, 200, { waiting: this.waiting() })
       else await this.show(req, res, page)
     } catch (error) {
       // A caller refused before its body was read may still be sending it: the upload is read and thrown away, so the caller receives the answer and not a broken connection.
       if (!state.bodyRead) req.resume()
       // An answer that was already begun cannot be replaced by another one: the connection is cut, so the browser sees a failure and not half a page.
       if (res.headersSent) { res.destroy(); return }
-      const refusal = error instanceof ReviewRefusal ? error : error instanceof RecordsRefusal ? new ReviewRefusal(error.status, error.message) : undefined
+      const refusal = error instanceof ReviewRefusal ? error : error instanceof RecordsRefusal || error instanceof TalkRefusal ? new ReviewRefusal(error.status, error.message) : undefined
       // Any other error's own text is left out: it could quote a record or a path.
       const status = refusal?.status ?? 500, message = refusal?.message ?? 'The review page failed'
       const headers: Record<string, string> = status === 405 ? { allow: (error as { allow?: string }).allow ?? 'GET' } : {}
-      if (target === 'comment') ReviewRoute.sendJson(res, status, { error: message }, headers)
+      if (target === 'comment' || target === 'talk' || target === 'proposal') ReviewRoute.sendJson(res, status, { error: message }, headers)
       // Without the cookie the page is the sign-in form, and nothing else: no record content.
       else if (status === 401 || (target === 'login' && status === 503)) ReviewRoute.sendPage(res, status, page.signIn(target === 'login' ? message : undefined), page, headers)
       else ReviewRoute.sendPage(res, status, page.notice(message), page, headers)
@@ -628,6 +852,11 @@ export class ReviewRoute {
     return `${ReviewRoute.PATH}?${query}`
   }
 
+  /** The Guideline tab's address that opens the proposal waiting for one job. */
+  static proposalAddress(project: string, jobId: string): string {
+    return `${ReviewRoute.PATH}?${new URLSearchParams({ tab: 'guideline', proposal: '1', project, job: jobId })}`
+  }
+
   /** The Guideline tab's address, on the version numbered `version` when one is given. */
   static guidelineAddress(version?: number): string {
     const query = new URLSearchParams({ tab: 'guideline' })
@@ -638,7 +867,7 @@ export class ReviewRoute {
   /** `GET /review` for a signed-in owner. */
   private async show(req: IncomingMessage, res: ServerResponse, page: ReviewPage): Promise<void> {
     const query = new URL(req.url ?? ReviewRoute.PATH, 'http://127.0.0.1').searchParams
-    if (query.get('tab') === 'guideline') { this.showGuideline(res, page, query.get('version'), await this.records.guidelineReader()); return }
+    if (query.get('tab') === 'guideline') { this.showGuideline(res, page, query, await this.records.guidelineReader()); return }
     const projects = await this.read()
     const wantedProject = query.get('project'), wantedJob = query.get('job'), wantedStep = query.get('step'), outside = query.get('outside') === '1'
     if (projects.length === 0) { ReviewRoute.sendPage(res, 200, page.notice(ReviewPage.NO_PROJECT), page); return }
@@ -649,19 +878,86 @@ export class ReviewRoute {
     if (project === undefined) throw new ReviewRefusal(404, wantedProject !== null ? 'That project is not listed' : 'No listed project holds that job')
     const job = outside ? undefined : wantedJob === null ? project.jobs[0] : project.jobs.find(each => each.job_id === wantedJob)
     if (!outside && wantedJob !== null && job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
-    if (wantedStep === null) { ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside }), page); return }
+    const talk = job === undefined ? undefined : this.talks.stateOf(job)
+    const shown = { projects, project, job, outside, waiting: this.proposals.newest(), ...(talk === undefined ? {} : { talk }) }
+    if (wantedStep === null) { ReviewRoute.sendPage(res, 200, page.view(shown), page); return }
     const step = job?.steps.find(each => ReviewPage.stepIdOf(each) === wantedStep)
     if (job === undefined || step === undefined) throw new ReviewRefusal(404, 'That step is not in this job')
     const detail = (await this.records.stepReader()).read(project.project, step)
-    ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside, step, detail }), page)
+    ReviewRoute.sendPage(res, 200, page.view({ ...shown, step, detail }), page)
   }
 
-  /** The Guideline tab, on the version asked for, else on the current one. */
-  private showGuideline(res: ServerResponse, page: ReviewPage, wanted: string | null, reader: { read(): GuidelineRead }): void {
+  /** The Guideline tab: on a waiting proposal when `proposal=1` names one by `project` and `job`, else on the version asked for, else on the current one. */
+  private showGuideline(res: ServerResponse, page: ReviewPage, query: URLSearchParams, reader: { read(): GuidelineRead }): void {
     const read = reader.read()
+    const waiting = this.proposals.newest()
+    if (query.get('proposal') === '1') {
+      const open = this.proposals.of(query.get('project') ?? '', query.get('job') ?? '')
+      if (open === undefined) throw new ReviewRefusal(404, 'That proposal is not waiting')
+      ReviewRoute.sendPage(res, 200, page.guideline(read, undefined, waiting, open), page)
+      return
+    }
+    const wanted = query.get('version')
     const picked = wanted === null ? read.current ?? undefined : read.versions.find(each => String(each.version) === wanted)
     if (wanted !== null && picked === undefined) throw new ReviewRefusal(404, 'That guideline version does not exist')
-    ReviewRoute.sendPage(res, 200, page.guideline(read, picked), page)
+    ReviewRoute.sendPage(res, 200, page.guideline(read, picked, waiting), page)
+  }
+
+  /** What `GET /review/proposal` answers: each waiting proposal's job and time, and the address that opens it, newest first. No text. */
+  private waiting(): { project: string; job_id: string; number: number; ts: string; href: string }[] {
+    return this.proposals.newest().map(each => ({ project: each.project, job_id: each.job_id, number: each.number, ts: each.ts,
+      href: ReviewRoute.proposalAddress(each.project, each.job_id) }))
+  }
+
+  /** `POST /review/talk` for a signed-in owner: prepares the job's review talk, or names the one started before. */
+  private async talk(req: IncomingMessage, res: ServerResponse, port: number, state: { bodyRead: boolean }): Promise<void> {
+    state.bodyRead = true
+    const { project, job_id, fresh } = await ReviewRoute.objectOf(req) as { project?: unknown; job_id?: unknown; fresh?: unknown }
+    if (project !== undefined && (typeof project !== 'string' || project === '')) throw new ReviewRefusal(400, 'project must be non-empty text')
+    if (typeof job_id !== 'string' || job_id === '') throw new ReviewRefusal(400, 'job_id must be non-empty text')
+    if (fresh !== undefined && typeof fresh !== 'boolean') throw new ReviewRefusal(400, 'fresh must be true or false')
+    const job = (await this.read()).filter(each => project === undefined || each.project === project).flatMap(each => each.jobs).find(known => known.job_id === job_id)
+    if (job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
+    // The address the talk's tool posts to: this web server, on loopback.
+    const started = await this.talks.start(job, `http://127.0.0.1:${port}${ReviewRoute.PROPOSAL_PATH}`, fresh === true)
+    if (started.opened) ReviewRoute.sendJson(res, 200, { opened: true, link: started.link, notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN })
+    else ReviewRoute.sendJson(res, 200, { opened: false, notice: ReviewPage.talkStarted(started.state), fresh: ReviewPage.FRESH_TALK })
+  }
+
+  /**
+   * `POST /review/proposal` from the review talk's tool, with the shared token: keeps `{ job_id, text }` as the newest proposal of that job and sends the
+   * token back. The job must be a listed job whose talk was started, so a stray caller with the token cannot put text on the page for any job.
+   */
+  private async propose(req: IncomingMessage, res: ServerResponse, port: number, state: { bodyRead: boolean }): Promise<void> {
+    const token = this.access.admitTool(req, port)
+    state.bodyRead = true
+    const { job_id, text } = await ReviewRoute.objectOf(req) as { job_id?: unknown; text?: unknown }
+    if (typeof job_id !== 'string' || job_id === '') throw new ReviewRefusal(400, 'job_id must be non-empty text')
+    if (typeof text !== 'string' || text.trim() === '') throw new ReviewRefusal(400, 'text must be the whole new guideline text')
+    const jobs = (await this.read()).flatMap(each => each.jobs).filter(known => known.job_id === job_id)
+    if (jobs.length === 0) throw new ReviewRefusal(404, 'No listed project holds that job')
+    const talked = jobs.filter(known => this.talks.stateOf(known) !== undefined)
+    if (talked.length === 0) throw new ReviewRefusal(409, 'No review talk was started for that job')
+    if (talked.length > 1) throw new ReviewRefusal(409, 'Review talks for that job id were started in more than one project')
+    const job = talked[0]!
+    const current = (await this.records.guidelineReader()).read().current
+    // Compared as the before → after view compares: line endings made the same, so a proposal that differs only in them is not a change.
+    const same = (value: string) => value.replace(/\r\n?/g, '\n').trim()
+    if (current !== null && same(current.text) === same(text)) throw new ReviewRefusal(400, 'The proposal is the same as the current version')
+    this.proposals.put({ project: job.project, job_id, number: job.number, text, ts: this.now().toISOString() })
+    ReviewRoute.sendJson(res, 200, { kept: true, message: `The proposal for ${TalkTexts.nameOf(job.project)} job ${job.number} is on the review page. Nothing is saved until the owner accepts it.` },
+      { [SharedTokenFile.HEADER]: token })
+  }
+
+  /** The request body as a JSON object: 400 when it is not JSON or not an object, 413 over the limit. */
+  private static async objectOf(req: IncomingMessage): Promise<Record<string, unknown>> {
+    let body: unknown
+    try { body = JSON.parse(await ReviewRoute.readBody(req)) } catch (error) {
+      if (error instanceof ReviewRefusal) throw error
+      throw new ReviewRefusal(400, 'The request body is not JSON')
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new ReviewRefusal(400, 'The request body must be an object')
+    return body as Record<string, unknown>
   }
 
   /** `POST /review/login`: the token comes in the form's body, never in the address. */

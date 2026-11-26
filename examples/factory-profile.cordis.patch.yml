@@ -42,7 +42,9 @@
     # write in first, and job_stop when DSH stops. Started anywhere else, DSH logs one warning and records only the answers.
     # Every session, judges included, starts with the current version of the owner's decision guideline (guideline/v<N>.md in
     # the factory's folder) in its system prompt and keeps it until DSH stops; job_start names that version (guideline_version).
-    # The review page asks once for the token in the token file above, in a sign-in form.
+    # The review page asks once for the token in the token file above, in a sign-in form. A job's "Start review talk" writes the
+    # talk's folder under ~/.config/zees-factory/review-talks/ and opens Claude Desktop on it; the talk's one tool is the built
+    # lib/dist/proposeServer.js next to this file, and nothing is set up by hand.
     recordsModule: <absolute path of lib/dist/jobLog.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/jobLog.js>
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

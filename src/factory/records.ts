@@ -126,8 +126,12 @@ export class FactoryRecordFile {
   }
 }
 
-/** Cleans one line of either file: the result holds no secret and nothing that says who the owner is. Each method throws when the line is not in its shape. */
-export interface RecordsMasker { maskAction(line: JobLogLine): JobLogLine; maskReview(line: ReviewLine): ReviewLine }
+/**
+ * Cleans one line of either file: the result holds no secret and nothing that says who the owner is. Each method throws when the line is not in its shape.
+ * `maskText` cleans one plain text with the same mask, for the review talk's files and the opening message of its link (`talk.ts`). It is optional so a
+ * built file from before the review talk still masks comments; the review talk refuses to start without it.
+ */
+export interface RecordsMasker { maskAction(line: JobLogLine): JobLogLine; maskReview(line: ReviewLine): ReviewLine; maskText?(text: string): string }
 /** Reads one project's job log and comments. It skips what it cannot read and never throws. */
 export interface RecordsReader { read(project: string): ReadJobLog }
 /** Reads every listed project's records back as jobs, one entry per project in the order given. It skips what it cannot read and never throws. */

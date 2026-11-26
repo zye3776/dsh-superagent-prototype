@@ -153,9 +153,10 @@ export class JudgeAnswer {
    * @param judge - says which files the judge ever read.
    * @param reads - the full paths of the files the judge read with the `read` tool while it answered this request.
    * @param tokens - the tokens of every answer the judge gave for this request, added up.
+   * @param helperReads - the full paths of the files the judge's helpers read for this request.
    * @throws UnusableAnswer when the temp-folder rule needs the judge's word on what the action does to a path and the answer's `temp` does not give it.
    */
-  verdict(request: AssessRequest, judge: Pick<AskedJudge, 'readPath'>, reads: readonly string[], tokens = 0): Verdict {
+  verdict(request: AssessRequest, judge: Pick<AskedJudge, 'readPath' | 'pathOf'>, reads: readonly string[], tokens = 0, helperReads: readonly string[] = []): Verdict {
     // Only an action that is hard to undo may go to the owner; `risk` does not count here, because a risky action can still be easy to take back.
     const refused = this.decision === 'ask_owner' && this.undo !== 'hard'
     const rule = new TempRule(request)
@@ -168,7 +169,7 @@ export class JudgeAnswer {
       return {
         decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk,
         reason: decision === 'ask_owner' ? `${this.reason} ${JudgeAnswer.HARD_TO_UNDO} ${broken.reason}` : broken.reason,
-        alternative: decision === 'deny' ? broken.alternative : '', cites: broken.cites, reads: this.readsOf(judge, reads), tokens,
+        alternative: decision === 'deny' ? broken.alternative : '', cites: broken.cites, reads: this.readsOf(judge, reads, helperReads), tokens,
       }
     }
     return {
@@ -177,21 +178,27 @@ export class JudgeAnswer {
       // Only a deny says what to do instead; an alternative the judge wrote for another decision is left out.
       alternative: decision !== 'deny' ? '' : this.alternative === '' ? JudgeAnswer.ALTERNATIVE : this.alternative,
       cites: this.cites === '' ? JudgeAnswer.CITES : this.cites,
-      reads: this.readsOf(judge, reads), tokens,
+      reads: this.readsOf(judge, reads, helperReads), tokens,
     }
   }
 
   /**
    * The files to record: those read for this request, then those the judge listed and read earlier in its Session. A listed file it never read is left out.
    * `used` is the judge's own word, and `false` for a file it read and did not list.
+   * Then the files only its helpers read, marked `by: 'helper'`; a file the judge read itself is recorded once, as the judge's. A helper's file counts as used
+   * when the judge listed it as used: the listed path, made full as the judge's own reads are (`pathOf`), is that exact file.
    */
-  private readsOf(judge: Pick<AskedJudge, 'readPath'>, reads: readonly string[]): DecisionRead[] {
+  private readsOf(judge: Pick<AskedJudge, 'readPath' | 'pathOf'>, reads: readonly string[], helperReads: readonly string[] = []): DecisionRead[] {
     const used = new Map<string, boolean>()
     for (const read of this.listed) {
       const full = judge.readPath(read.path)
       if (full !== undefined) used.set(full, (used.get(full) ?? false) || read.used)
     }
-    return [...new Set([...reads, ...used.keys()])].map(path => ({ path, used: used.get(path) ?? false }))
+    const own = [...new Set([...reads, ...used.keys()])]
+    const listedUsed = new Set(this.listed.filter(read => read.used).map(read => judge.pathOf(read.path)))
+    const helperUsed = (path: string) => listedUsed.has(path)
+    return [...own.map(path => ({ path, used: used.get(path) ?? false })),
+      ...[...new Set(helperReads)].filter(path => !own.includes(path)).map(path => ({ path, used: helperUsed(path), by: 'helper' as const }))]
   }
 
   /**
@@ -306,6 +313,7 @@ export class ModelJudge implements Judge {
     const judge = await ModelJudge.opened(this.judges.open(request.project, request.session_id), signal)
     const question = new JudgeQuestion(request)
     const reads: string[] = []
+    const helperReads: string[] = []
     // The cost of the decision is every question asked for it: the first one and the repair question.
     let tokens = 0
     // The brief is taken when the question is sent, so a question that waits behind another one names the files as they are then.
@@ -313,8 +321,9 @@ export class ModelJudge implements Judge {
     for (let attempt = 1; ; attempt++) {
       const reply = await ModelJudge.asked(judge, text, signal)
       for (const path of reply.reads) if (!reads.includes(path)) reads.push(path)
+      for (const path of reply.helperReads ?? []) if (!helperReads.includes(path)) helperReads.push(path)
       tokens += reply.tokens
-      try { return JudgeAnswer.parse(reply.text).verdict(request, judge, reads, tokens) }
+      try { return JudgeAnswer.parse(reply.text).verdict(request, judge, reads, tokens, helperReads) }
       catch (error) {
         if (!(error instanceof UnusableAnswer)) throw error
         if (attempt === 2) throw new AssessRefusal(503, ModelJudge.UNUSABLE)

@@ -26,14 +26,21 @@ export interface FakeAgent {
   allowed: string[][]
   /** The texts sent to the agent, in order. */
   asked: string[]
+  /** Every tool registered on the agent's own scope, in order (the judge's `docs_lookup`). */
+  registered: FakeTool[]
   session: { id: string; snapshotEvents(): FakeEvent[] }
 }
+
+/** A tool registered on an agent, as the stand-in keeps it. */
+export interface FakeTool { name: string; description: string; parameters: unknown; execute(args: unknown, execution: { signal?: AbortSignal }): Promise<{ text: string }> }
+/** How the stand-in behaves. `restrictable`: when set, an allow list that names another tool throws, as DSH's `restrict` does for a tool it does not know. */
+export interface FakeDshOptions { restrictable?: readonly string[] }
 
 /**
  * Builds the stand-in. A Session exists once `create` made it, or once a test puts an agent into `agents`, as a Session DSH kept from an earlier run.
  * An agent answers each message with `reply`'s text, a moment later; `reply` may first make tool calls through the agent's guards.
  */
-export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`) {
+export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`, options: FakeDshOptions = {}) {
   const agents = new Map<string, FakeAgent>()
   /** Runs `agent`'s guards on one tool call: the first refusal wins. */
   const guarded = (agent: FakeAgent, execution: FakeExecution): string | undefined => {
@@ -47,9 +54,16 @@ export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`) {
   const agentOf = (id: string): FakeAgent => {
     const events: FakeEvent[] = []
     let idle = Promise.resolve()
-    const agent = { id, guards: [] as GuardFunction[], allowed: [] as string[][], asked: [] as string[], session: { id, snapshotEvents: () => [...events] },
+    const agent = { id, guards: [] as GuardFunction[], allowed: [] as string[][], asked: [] as string[], registered: [] as FakeTool[],
+      session: { id, snapshotEvents: () => [...events] },
       ctx: { tools: {
-        restrict: vi.fn((filter: { allow: string[] }) => { agent.allowed.push(filter.allow); return () => {} }),
+        restrict: vi.fn((filter: { allow: string[] }) => {
+          const unknown = options.restrictable === undefined ? [] : filter.allow.filter(name => !options.restrictable!.includes(name))
+          if (unknown.length > 0) throw new Error(`tools.restrict() names unknown global tools ${unknown.join(', ')}`)
+          agent.allowed.push(filter.allow)
+          return () => {}
+        }),
+        register: vi.fn((tool: FakeTool) => { agent.registered.push(tool); return () => {} }),
         guard: vi.fn((guard: GuardFunction) => { agent.guards.push(guard); return () => {} }),
       } },
       followup: vi.fn((message: { content: { type: string; text: string }[] }) => {

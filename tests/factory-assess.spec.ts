@@ -269,7 +269,7 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
 })
 
 it('is a plugin that needs the web server and DSH\'s Session services, and mounts the route for the configured projects', () => {
-  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']])
+  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets', 'tools']])
   expect(plugin.Config({ guardModule: '/factory/lib/dist/judgeGuard.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, guardModule: '/factory/lib/dist/judgeGuard.js', approvalSeconds: 120 })
   expect(() => plugin.Config({ guardModule: 'relative/judgeGuard.js' })).toThrow()
   expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath(), approvalSeconds: 120 })
@@ -284,9 +284,14 @@ it('is a plugin that needs the web server and DSH\'s Session services, and mount
   const registered: Route[] = []
   const dispose = vi.fn()
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return dispose } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() }, tools: { guard: vi.fn(() => () => {}) } }
   plugin.apply(ctx as never, plugin.Config({ projects: [project] }))
   expect(registered.map(route => route.path)).toEqual(['/assess', '/ask', '/claim'])
+  // The one global guard that holds every helper of a judge to the factory's strict guard; it lets any other agent's call through.
+  expect(ctx.tools.guard).toHaveBeenCalledTimes(1)
+  const helperGuard = (ctx.tools.guard.mock.calls as unknown as [(execution: unknown) => string | undefined][])[0]![0]
+  expect(helperGuard({ name: 'write', arguments: {}, agent: { session: { header: { id: 'worker', agentPreset: 'standard' } } } })).toBeUndefined()
+  expect(helperGuard({ name: 'read', arguments: {}, agent: { session: { header: { id: 'h', agentPreset: 'dsh-superagent-judge-helper' } } } })).toMatch(/no known judge/)
 })
 
 it('is a plugin that reads the shared token from the configured token file, masks with the configured mask module, guards its judges with the configured guard module and answers with the judge\'s decision', async () => {
@@ -297,7 +302,7 @@ it('is a plugin that reads the shared token from the configured token file, mask
   const registered: Route[] = []
   const dsh = fakeDsh(judgeReply)
   const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() }, tools: { guard: vi.fn(() => () => {}) } }
   // Without a guard module the plugin's route opens no judge Session and writes nothing.
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath() }))
   const unguarded = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
@@ -573,7 +578,7 @@ it('holds an approve for the configured approvalSeconds when it runs as the plug
   const registered: Route[] = []
   const dsh = fakeDsh(judgeReply)
   const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() }, tools: { guard: vi.fn(() => () => {}) } }
   const guardPath = join(root, 'fake-guard.mjs')
   writeFileSync(guardPath, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), maskModule: maskPath(), guardModule: guardPath, approvalSeconds: 30 }))

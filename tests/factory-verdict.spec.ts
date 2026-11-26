@@ -376,7 +376,7 @@ describe('ModelJudge', () => {
   })
 
   it('refuses with 503 when the judge cannot be asked', async () => {
-    const broken: AskedJudge = { brief: () => 'brief', consult: () => Promise.reject(new Error('planted-detail')), readPath: () => undefined }
+    const broken: AskedJudge = { brief: () => 'brief', consult: () => Promise.reject(new Error('planted-detail')), readPath: () => undefined, pathOf: (path: string) => path }
     expect(await refusalOf(new ModelJudge({ open: async () => broken }).decide(requests.plain()))).toEqual({ status: 503, message: ModelJudge.NOT_ASKED })
   })
 })
@@ -648,6 +648,38 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     }
     expect(fake.refusals).toHaveLength(3)
     expect(verdict.reads).toEqual([{ path: inProject(RecordedRequests.SCRIPT), used: true }])
+  })
+
+  it('records the files only a helper read with by: "helper", and the factory\'s real mask and schema accept the line (story 2.22)', async () => {
+    put(inProject(RecordedRequests.SOURCE))
+    put(inProject('src/b.ts'))
+    put(inProject('nested/src/a.ts'))
+    let judges!: JudgeSessions
+    let parent = ''
+    const helperCall = (path: string) => judges.helperRefusal({ name: 'read', arguments: { file_path: path },
+      agent: { session: { header: { id: 'helper-1', agentPreset: JudgeSessions.HELPER_PRESET, parentSession: parent } } } })
+    const helperRefusals: (string | undefined)[] = []
+    const dsh = fakeDsh((_question, run) => {
+      run({ name: 'subagent', arguments: { description: 'check the sources', prompt: 'Read src/a.ts and src/b.ts and say what they do.' } })
+      helperRefusals.push(helperCall(RecordedRequests.SOURCE), helperCall('src/b.ts'), helperCall(RecordedRequests.SECRET), helperCall('nested/src/a.ts'))
+      run(readOf(RecordedRequests.SCRIPT))
+      return JSON.stringify(answer({ reads: [{ path: RecordedRequests.SCRIPT, used: true }, { path: RecordedRequests.SOURCE, used: true }] }))
+    })
+    judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD))
+    parent = (await judges.open(project, requests.editedScript().session_id)).id
+    const verdict = await new ModelJudge(judges).decide(requests.editedScript())
+    expect(helperRefusals.slice(0, 2)).toEqual([undefined, undefined])
+    expect(helperRefusals[2]).toMatch(/secret list/)
+    expect(verdict.reads).toEqual([
+      { path: inProject(RecordedRequests.SCRIPT), used: true },
+      { path: inProject(RecordedRequests.SOURCE), used: true, by: 'helper' },
+      { path: inProject('src/b.ts'), used: false, by: 'helper' },
+      // Same tail as the listed src/a.ts, but another file: not used.
+      { path: inProject('nested/src/a.ts'), used: false, by: 'helper' },
+    ])
+    const masker = await new FactoryMaskModule(join(FACTORY, 'lib', 'dist', 'decisionMask.js')).maskerFor(project)
+    const masked = masker.mask({ ...verdict, seconds: 1, ts: new Date().toISOString(), project })
+    expect(masked.reads.map(read => read.by)).toEqual([undefined, 'helper', 'helper', 'helper'])
   })
 })
 

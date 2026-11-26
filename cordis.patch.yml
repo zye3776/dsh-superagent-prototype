@@ -203,6 +203,11 @@
     # agent-instructions plugin: the project's AGENTS.md and CLAUDE.md, which the judged worker can write, must not become the
     # judge's own instructions; the judge reads them as project files. A preset row cannot set the sandbox, so the plugin sets DSH's `read-only` permission preset on each judge Session, allows only the
     # tools read, grep, glob and bash, and checks every call with the factory's guard.
+    # Story 2.22 adds helpers and documentation lookups: the `delegation` group lets the judge start read-only helpers on a
+    # faster model (`subagent`) and wait for their answers (`wait_agent`). The judge cannot pick the helper's model or preset (no
+    # modelSelection, modelDiscovery or allowedAgentPresets), and a helper cannot delegate further (maxDepth 1, and the helper
+    # preset has no delegation group). The plugin admits these tools only with a factory guard that has the judge variant, and
+    # registers its own `docs_lookup` tool, so no MCP client is loaded here.
     - id: dsh-superagent-judge-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true
@@ -211,6 +216,76 @@
         name: Factory judge (dsh-superagent)
         description: For the judge Sessions of the factory's /assess route only, not for manual selection. Read-only tools; the factory plugin sets the read-only sandbox and its guard.
         order: 92
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: shell
+            name: cordis:group
+            group: true
+            isolate:
+              shell: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                disabled: !!js process.platform === 'win32'
+              - id: pwsh-sandbox
+                name: '@deepseek-ai/dsh-pwsh-sandbox'
+                disabled: !!js process.platform !== 'win32'
+              # No background jobs: a command that reaches its timeout is killed.
+              - id: tool-bash
+                name: '@deepseek-ai/dsh-tool-bash'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  enableRunInBackground: false
+                  promoteOnTimeout: false
+              - id: tool-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh'
+                disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              # wait_agent, send_message and list_agents; no interrupt_agent. The plugin lets the judge use only wait_agent.
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              # JudgeSessions.HELPER_PRESET in src/factory/judge.ts. The helpers run on the judge's own provider and key
+              # (OPENROUTER_API_KEY), on a faster model built for focused subagent tasks.
+              - id: judge-helpers
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  agentPreset: dsh-superagent-judge-helper
+                  agentOptions:
+                    provider: openrouter
+                    model: google/gemini-3.5-flash-lite
+                    reasoningEffort: low
+                  maxDepth: 1
+    # The agent preset of the judge's helpers (story 2.22): the read-only agents a judge starts to check a claim for it. The same
+    # rows as the judge preset, and nothing more: no delegation (a helper cannot start another), no background jobs, skills,
+    # compaction or web. Off unless a profile turns it on (examples/factory-profile.cordis.patch.yml). A helper inherits the judge
+    # Session's `read-only` sandbox, and the plugin's global helper guard checks every helper call with the factory's strict guard.
+    - id: dsh-superagent-judge-helper-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      disabled: true
+      config:
+        id: dsh-superagent-judge-helper
+        name: Factory judge helper (dsh-superagent)
+        description: For the helpers of the factory's judge Sessions only, not for manual selection. Read-only tools; the factory plugin checks every call with its guard.
+        order: 93
         plugins:
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'

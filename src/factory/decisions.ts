@@ -11,8 +11,8 @@ import { closeSync, constants, lstatSync, openSync, writeSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-/** One file the judge read, and whether it used it. */
-export interface DecisionRead { path: string; used: boolean }
+/** One file the judge read, and whether it used it. `by: 'helper'` marks a file only one of the judge's helpers read. */
+export interface DecisionRead { path: string; used: boolean; by?: 'helper' }
 /** A decision in the shape the factory's `lib/decisionSchema` checks. */
 export interface Decision {
   decision_id: string

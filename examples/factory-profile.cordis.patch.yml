@@ -17,5 +17,8 @@
   disabled: false
   config:
     # Projects the route may write a decision into. Each must already have its .factory folder, which the factory creates.
+    # tokenFile is left out on purpose: it defaults to ~/.config/zees-factory/superagent-token, the file the factory's setup
+    # writes (mode 0600). The factory sends that token with each request; the route answers nobody without it.
+    # Until that setup (the factory's story 7) writes it, make one by hand: (umask 077; openssl rand -hex 32 > ~/.config/zees-factory/superagent-token)
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

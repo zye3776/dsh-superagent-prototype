@@ -1,41 +1,57 @@
 /** The factory's `/assess` route, served by a real HTTP server on loopback, writing into a temporary project. */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { AssessRoute, DecisionsFile, StubJudge } from '../src/factory/assess.ts'
 import * as plugin from '../src/factory/index.ts'
+import { SharedTokenFile } from '../src/factory/token.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
 interface Route { kind: string; path: string; auth?: string; handler: Handler }
 interface Answer { status: number; text: string; body: Record<string, unknown>; headers: IncomingMessage['headers'] }
 
 const NOW = '2026-11-23T08:09:10.123Z'
+/** The token both sides share in these tests, another one of the same length, and one of another length. */
+const TOKEN = 'test-token_0123456789abcdefghijklmnopqrstuvwxyz'
+const OTHER_TOKEN = 'test-token_0123456789abcdefghijklmnopqrstuvwxyZ'
+const LONGER_TOKEN = `${TOKEN}0`
 let root = '', project = '', server: Server | undefined, port = 0
+/** The route's token file: outside the project, as the real one is. */
+const tokenPath = () => join(root, 'superagent-token')
+function writeToken(content: string = TOKEN, mode = 0o600): void {
+  rmSync(tokenPath(), { force: true })
+  writeFileSync(tokenPath(), content)
+  // Set after writing: the mode given to writeFileSync is cut down by the umask.
+  chmodSync(tokenPath(), mode)
+}
 const file = () => join(project, DecisionsFile.FOLDER, DecisionsFile.FILE)
 const lines = () => readFileSync(file(), 'utf8').split('\n').filter(line => line !== '')
 /** A masked request as the factory posts it; `project` is the raw path. */
 const sample = (fields: Record<string, unknown> = {}) => ({ request_id: 'req-1', request_key: 'k1', session_id: 's1', tool_name: 'Bash',
   tool_input: { command: 'ls' }, reason: 'List files', project, ...fields })
 
-/** Serves the route of a fake DSH web server over real HTTP, and returns the route as it was registered. */
+/** Serves the route of a fake DSH web server over real HTTP, reading the token file of the test, and returns the route as it was registered. */
 async function serve(projects: string[] = [project]): Promise<Route> {
   let route: Route | undefined
   server = createServer((req, res) => { void route!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { route = registered; return () => {} } } }
-  new AssessRoute(projects, new StubJudge(), () => new Date(NOW)).register(ctx as never)
+  new AssessRoute(projects, new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW)).register(ctx as never)
   return route!
 }
-function call(method: string, body?: unknown, headers: Record<string, string> = {}): Promise<Answer> {
+/** Sends one request with the valid token, unless `headers` gives another one or `undefined` for none. */
+function call(method: string, body?: unknown, headers: Record<string, string | undefined> = {}): Promise<Answer> {
   const sent = body === undefined ? undefined : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
   return new Promise((resolve, reject) => {
     // Without a length, Node sends the body in chunks, so the route cannot refuse it by its length up front.
     const length = sent && !('transfer-encoding' in headers) ? { 'content-length': String(sent.length) } : {}
-    const req = request({ host: '127.0.0.1', port, path: '/assess', method, headers: { ...length, ...headers } }, res => {
+    const all = Object.fromEntries(Object.entries({ [SharedTokenFile.HEADER]: TOKEN, ...length, ...headers }).filter(([, value]) => value !== undefined))
+    const req = request({ host: '127.0.0.1', port, path: '/assess', method, headers: all as Record<string, string> }, res => {
       const chunks: Buffer[] = []
       res.on('data', (chunk: Buffer) => { chunks.push(chunk) })
       res.on('end', () => {
@@ -53,6 +69,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'factory-assess-'))
   project = join(root, 'project')
   mkdirSync(join(project, DecisionsFile.FOLDER), { recursive: true })
+  writeToken()
 })
 afterEach(async () => {
   await new Promise<void>(resolve => { server ? server.close(() => { resolve() }) : resolve() })
@@ -77,6 +94,9 @@ it('answers a valid request with the stub decision and appends the same line las
     choice: null, risk: 'high', reason: StubJudge.REASON, alternative: '', cites: '', reads: [], tokens: 0, seconds: expect.any(Number), ts: NOW, project })
   expect(answer.body.seconds).toBeGreaterThanOrEqual(0)
   expect(lines()).toEqual(['{"earlier":true}', answer.text])
+  // The reply carries the token in its header, and the token is in neither the reply's body nor the file.
+  expect(answer.headers[SharedTokenFile.HEADER]).toBe(TOKEN)
+  expect(readFileSync(file(), 'utf8')).not.toContain(TOKEN)
   // A second request gets a decision of its own, after the first.
   const second = await call('POST', sample({ request_id: 'req-2' }), { host: `localhost:${port}` })
   expect(second.body.request_id).toBe('req-2')
@@ -142,9 +162,11 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
 
 it('is a plugin that needs only the web server and mounts the route for the configured projects', () => {
   expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer']])
-  expect(plugin.Config({ projects: [project] })).toEqual({ projects: [project] })
-  expect(plugin.Config({})).toEqual({ projects: [] })
+  expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath() })
+  expect(plugin.Config({})).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH })
+  expect(SharedTokenFile.DEFAULT_PATH).toBe(join(homedir(), '.config', 'zees-factory', 'superagent-token'))
   expect(() => plugin.Config({ projects: ['relative'] })).toThrow()
+  expect(() => plugin.Config({ tokenFile: 'relative/token' })).toThrow()
   const registered: Route[] = []
   const dispose = vi.fn()
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return dispose } },
@@ -153,7 +175,138 @@ it('is a plugin that needs only the web server and mounts the route for the conf
   expect(registered.map(route => route.path)).toEqual(['/assess'])
 })
 
+it('is a plugin that reads the shared token from the configured token file', async () => {
+  // Not the file the other tests use, so only `tokenFile` can have led the route to it.
+  const configured = join(root, 'configured-token')
+  writeFileSync(configured, `${OTHER_TOKEN}\n`)
+  chmodSync(configured, 0o600)
+  const registered: Route[] = []
+  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured }))
+  const accepted = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
+  await registered[0]!.handler(accepted.req, accepted.res)
+  expect([accepted.answer.status, accepted.answer.headers[SharedTokenFile.HEADER]]).toEqual([200, OTHER_TOKEN])
+  // The token of the default test file is not the configured one.
+  const refused = direct('127.0.0.1')
+  await registered[0]!.handler(refused.req, refused.res)
+  expect(refused.answer.status).toBe(401)
+  expect(lines()).toHaveLength(1)
+})
+
 it('matches a listed project written with a trailing slash', async () => {
   await serve([`${project}/`])
   expect((await call('POST', sample())).status).toBe(200)
+})
+
+it('refuses a caller that sends no token or another token, before reading the body, and writes nothing', async () => {
+  await serve()
+  const refused = { error: 'The shared token is missing or wrong' }
+  for (const sent of [undefined, '', OTHER_TOKEN, LONGER_TOKEN, TOKEN.slice(0, -1), `${TOKEN}, ${TOKEN}`]) {
+    const answer = await call('POST', sample(), { [SharedTokenFile.HEADER]: sent })
+    expect([sent, answer.status, answer.body]).toEqual([sent, 401, refused])
+    // A refusal never carries the token, in its header or in its text.
+    expect(answer.headers[SharedTokenFile.HEADER]).toBeUndefined()
+    expect(answer.text).not.toContain(TOKEN)
+  }
+  // The body is not read: one that is not JSON, or over the limit, gets the same answer.
+  expect((await call('POST', '{not json', { [SharedTokenFile.HEADER]: OTHER_TOKEN })).status).toBe(401)
+  expect((await call('POST', sample({ reason: 'x'.repeat(AssessRoute.MAX_BODY_BYTES) }), { [SharedTokenFile.HEADER]: undefined })).status).toBe(401)
+  expect(existsSync(file())).toBe(false)
+})
+
+it('answers nobody while its own token file is missing, a symlink, open to others or malformed', async () => {
+  await serve()
+  const refused = { error: 'The route has no usable token file, so it answers nobody' }
+  const states: (() => void)[] = [
+    () => { rmSync(tokenPath()) },
+    () => { writeToken(TOKEN, 0o644) },
+    () => { writeToken(TOKEN, 0o640) },
+    () => { writeToken('too-short') },
+    () => { writeToken('') },
+    () => {
+      const real = join(root, 'real-token')
+      writeFileSync(real, TOKEN, { mode: 0o600 })
+      rmSync(tokenPath(), { force: true })
+      symlinkSync(real, tokenPath())
+    },
+  ]
+  for (const [index, change] of states.entries()) {
+    change()
+    const answer = await call('POST', sample())
+    expect([index, answer.status, answer.body]).toEqual([index, 503, refused])
+    expect(answer.text).not.toContain(tokenPath())
+    // Even a caller without the token learns only that the route is not set up.
+    expect((await call('POST', sample(), { [SharedTokenFile.HEADER]: undefined })).status).toBe(503)
+  }
+  expect(existsSync(file())).toBe(false)
+})
+
+it('reads its token file on every request, so a replaced token works without a restart', async () => {
+  await serve()
+  expect((await call('POST', sample())).status).toBe(200)
+  writeToken(`${OTHER_TOKEN}\n`)
+  expect((await call('POST', sample())).status).toBe(401)
+  const answer = await call('POST', sample(), { [SharedTokenFile.HEADER]: OTHER_TOKEN })
+  expect([answer.status, answer.headers[SharedTokenFile.HEADER]]).toEqual([200, OTHER_TOKEN])
+  expect(lines()).toHaveLength(2)
+})
+
+it('checks in a fixed order: host and origin, the caller\'s address, the method, its own token file, then the caller\'s token', async () => {
+  await serve()
+  const none = { [SharedTokenFile.HEADER]: undefined }
+  expect((await call('POST', sample(), { ...none, host: `example.com:${port}` })).status).toBe(403)
+  expect((await call('GET', undefined, { ...none, origin: 'https://example.com' })).status).toBe(403)
+  expect((await call('GET', undefined, none)).status).toBe(405)
+  rmSync(tokenPath())
+  expect((await call('GET', undefined, none)).status).toBe(405)
+  expect((await call('POST', sample(), none)).status).toBe(503)
+  expect(existsSync(file())).toBe(false)
+})
+
+/** A request that never touched the network, as a caller at `remoteAddress` would have sent it, and the reply the route gives it. */
+function direct(remoteAddress: string | undefined, headers: Record<string, string> = {}) {
+  const req = Object.assign(Readable.from([Buffer.from(JSON.stringify(sample()))]), { method: 'POST', socket: { remoteAddress },
+    headers: { host: '127.0.0.1:3083', [SharedTokenFile.HEADER]: TOKEN, ...headers } })
+  const resume = vi.spyOn(req, 'resume')
+  const answer = { status: 0, headers: {} as Record<string, string>, text: '' }
+  const res = { writeHead: (status: number, sent: Record<string, string>) => { answer.status = status; answer.headers = sent }, end: (text: string) => { answer.text = text } }
+  return { req: req as unknown as IncomingMessage, res: res as unknown as ServerResponse, answer, resume }
+}
+
+it('refuses a caller whose address is not loopback, whatever its Host header and token say', async () => {
+  const route = new AssessRoute([project], new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW))
+  for (const address of ['192.168.1.9', '10.0.0.1', '::ffff:192.168.1.9', 'fe80::1', '127.0.0.2', '', undefined]) {
+    const { req, res, answer, resume } = direct(address)
+    await route.handle(req, res, 3083)
+    expect([address, answer.status, JSON.parse(answer.text)]).toEqual([address, 403, { error: 'Loopback request required' }])
+    // The upload it did not read is thrown away.
+    expect(resume).toHaveBeenCalled()
+  }
+  expect(existsSync(file())).toBe(false)
+  for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+    const { req, res, answer } = direct(address)
+    await route.handle(req, res, 3083)
+    expect([address, answer.status, answer.headers[SharedTokenFile.HEADER]]).toEqual([address, 200, TOKEN])
+  }
+  expect(lines()).toHaveLength(3)
+})
+
+it('throws away the upload of a caller it refuses before the body, so the caller receives the answer', async () => {
+  const route = new AssessRoute([project], new SharedTokenFile(tokenPath()))
+  const refusals: [Record<string, string>, string | undefined, number][] = [
+    [{ host: 'example.com:3083' }, '127.0.0.1', 403], [{ origin: 'https://example.com' }, '127.0.0.1', 403], [{}, '192.168.1.9', 403],
+    [{ [SharedTokenFile.HEADER]: OTHER_TOKEN }, '127.0.0.1', 401],
+  ]
+  for (const [headers, address, status] of refusals) {
+    const { req, res, answer, resume } = direct(address, headers)
+    await route.handle(req, res, 3083)
+    expect([answer.status, resume.mock.calls.length]).toEqual([status, 1])
+  }
+  // Over real HTTP: 8 MiB sent in pieces by a caller without the token is answered, not cut off.
+  await serve()
+  const upload = 'x'.repeat(8 * 1024 * 1024)
+  expect((await call('POST', upload, { [SharedTokenFile.HEADER]: undefined, 'transfer-encoding': 'chunked' })).status).toBe(401)
+  expect((await call('PUT', upload, { 'transfer-encoding': 'chunked' })).status).toBe(405)
+  expect(existsSync(file())).toBe(false)
 })

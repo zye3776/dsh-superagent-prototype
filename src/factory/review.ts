@@ -1,8 +1,9 @@
 /**
  * The owner's review page, served at `/review` on DSH's web server: it shows what the super agent did in each job and takes the owner's comment on a job.
  * Left, the listed (target) projects and the jobs of the picked one, newest first; in the middle, the picked job's timeline, which also holds the requests
- * the fixed checks answered on their own while the job ran, and the job's always-open comment field. The factory's `JobsReader` builds the jobs from each
- * project's `.factory/` records (`records.ts`); this page groups nothing itself. It writes only comment lines, each masked with the factory's own mask first.
+ * the fixed checks answered on their own while the job ran, and the job's always-open comment field; right, the detail of the step picked in the timeline.
+ * The factory's `JobsReader` builds the jobs from each project's `.factory/` records and its `StepDetailReader` reads a step's detail through the step's
+ * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
  * everything but the sign-in form needs the cookie the owner gets by typing the shared token (`token.ts`) into that form once.
  * The page loads nothing from anywhere else and brings no colours of its own: its style names DSH's design tokens only.
@@ -12,7 +13,10 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { createHmac, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, isAbsolute, resolve } from 'node:path'
-import { FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type TimelineStep } from './records.ts'
+import {
+  FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type StepAsked, type StepDetail,
+  type StepOutcome, type StepWhy, type TimelineStep,
+} from './records.ts'
 import { SharedTokenFile } from './token.ts'
 
 /** Where the page gets the shared token from, on every request. `undefined` means there is no usable token. */
@@ -86,9 +90,9 @@ export class ReviewAccess {
 
 /**
  * What one page shows: every listed project, the picked one, and in it the picked job, or the automatic answers that fell in no job (`outside`), or neither
- * when the project has no job yet.
+ * when the project has no job yet. In a job, `step` is the picked step and `detail` what the factory's `StepDetailReader` read for it.
  */
-export interface ReviewView { projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean }
+export interface ReviewView { projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean; step?: TimelineStep; detail?: StepDetail }
 
 /**
  * Builds the HTML of the review page. Every piece of text from a record or a request is escaped before it goes into the page.
@@ -109,6 +113,18 @@ export class ReviewPage {
   static readonly SAVING = 'Saving…'
   static readonly SAVED = 'Saved'
   static readonly NOT_SAVED = 'Not saved. Your text is kept here; it is tried again when you type.'
+  static readonly PICK_STEP = 'Pick a step in the timeline to see its detail.'
+  /** What a part of a step reads when no record holds it: the label stays, never a blank or a guess. */
+  static readonly NOT_RECORDED = 'Not recorded'
+  /** The step detail's five parts, in the order the panel shows them. */
+  static readonly PARTS = { asked: 'What was asked', why: 'Why', looked_at: 'What it looked at', next: 'What happened next', cost: 'Cost' } as const
+  /** What happened after a request, in words. */
+  static readonly OUTCOMES: Record<StepOutcome['outcome'], string> = {
+    ran_ok: 'Ran and succeeded', ran_failed: 'Ran and failed', refused: 'Refused', owner_no: 'The owner said no',
+    unknown: 'Cannot be told yet: the worker\'s transcript holds no result for it',
+  }
+  /** The super agent's answer, in words. */
+  static readonly DECISIONS: Record<Extract<StepWhy, { by: 'super_agent' }>['decision'], string> = { approve: 'Approved', deny: 'Denied', ask_owner: 'Handed to the owner' }
   /** What each kind of job log line is called on the page. */
   private static readonly HEADINGS: Record<JobLogLine['kind'], string> = {
     job_start: 'Job started', job_stop: 'Job stopped', permission_answer: 'Permission answered', fork_answer: 'Fork answered',
@@ -119,8 +135,10 @@ export class ReviewPage {
     'h1 { font-size: 13px; }',
     'h2 { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); margin: 16px 0 8px; }',
     '.crumb { font-size: 12px; color: var(--dsw-alias-label-secondary); padding-bottom: 8px; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
-    '.cols { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }',
-    '@media (max-width: 1100px) { .cols { grid-template-columns: 1fr; } }',
+    '.cols { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; }',
+    '.cols.with-detail { grid-template-columns: 260px minmax(0, 1fr) 360px; }',
+    '.detail { position: sticky; top: 16px; }',
+    '@media (max-width: 1100px) { .cols, .cols.with-detail { grid-template-columns: 1fr; } }',
     '.left a { display: block; padding: 6px 8px; border-radius: 8px; color: inherit; text-decoration: none; }',
     '.left a.on { background: var(--dsw-alias-bg-layer-2); }',
     '.left span { display: block; }',
@@ -129,6 +147,11 @@ export class ReviewPage {
     'ol { list-style: none; padding: 0; }',
     'li { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
     'li.auto { color: var(--dsw-alias-label-tertiary); }',
+    'li a.step { display: block; color: inherit; text-decoration: none; }',
+    'li.on { background: var(--dsw-alias-bg-layer-2); }',
+    '.lbl { font-size: 11px; color: var(--dsw-alias-label-tertiary); margin-top: 12px; }',
+    '.val.none { color: var(--dsw-alias-label-tertiary); }',
+    '.detail p { margin: 4px 0; }',
     'time, code { font-family: var(--ds-font-family-code); font-size: 11px; }',
     'time { color: var(--dsw-alias-label-tertiary); }',
     'code { overflow-wrap: anywhere; }',
@@ -221,21 +244,26 @@ ${project.outside.map(answer => ReviewPage.automaticRow(answer)).join('\n')}
       const comment = job.reviews.findLast(review => review.step_id === undefined)?.comment ?? ''
       middle = `<h2>Timeline · ${ReviewPage.count(job.steps.length, 'step')}</h2>
 <ol>
-${job.steps.map(step => ReviewPage.row(step)).join('\n')}
+${job.steps.map(step => ReviewPage.row(step, job, view.step)).join('\n')}
 </ol>
 <label for="comment">Your comment on this job</label>
 <textarea id="comment" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.escape(comment)}</textarea>
 <p id="comment-status" role="status"></p>
 <script nonce="${this.nonce}">${ReviewPage.script()}</script>`
     }
+    const panel = job !== undefined && !view.outside
     return this.document(`<div class="crumb">${crumb}</div>
-<div class="cols">
+<div class="cols${panel ? ' with-detail' : ''}">
 <nav class="left" aria-label="Projects and jobs">
 ${ReviewPage.left(view)}
 </nav>
 <main>
 ${middle}
 </main>
+${!panel ? '' : `<aside class="detail" aria-label="Step detail">
+${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
+<p>${ReviewPage.escape(ReviewPage.PICK_STEP)}</p>` : ReviewPage.detail(view.step, view.detail)}
+</aside>`}
 </div>`)
   }
 
@@ -265,26 +293,79 @@ ${projects.join('\n')}
 ${jobs.join('\n')}`
   }
 
-  /** One row of a timeline. */
-  private static row(step: TimelineStep): string {
-    if (step.automatic) return ReviewPage.automaticRow(step.answer)
+  /** A step's id in the page's address: a job log line's `step_id`, or an automatic answer's `request_id`. */
+  static stepIdOf(step: TimelineStep): string { return step.automatic ? step.answer.request_id : step.line.step_id }
+
+  /** One row of a job's timeline: a link that picks the step, marked when it is the picked one. */
+  private static row(step: TimelineStep, job: RecordedJob, picked: TimelineStep | undefined): string {
+    const id = ReviewPage.stepIdOf(step)
+    const on = picked !== undefined && ReviewPage.stepIdOf(picked) === id
+    const link = { href: ReviewRoute.address(job.project, job.job_id, false, id), on }
+    if (step.automatic) return ReviewPage.automaticRow(step.answer, link)
     const line = step.line
     const who = line.from === undefined || line.to === undefined ? '' : ` <span class="who">· ${ReviewPage.escape(line.from)} ──▶ ${ReviewPage.escape(line.to)}</span>`
     const pill = line.guideline_version === undefined ? '' : ` <span class="pill">guideline ${ReviewPage.escape(line.guideline_version)}</span>`
     const cost = [line.tokens === undefined ? '' : `${line.tokens.toLocaleString('en-US')} tokens`, line.ms === undefined ? '' : `${(line.ms / 1000).toFixed(1)} s`].filter(part => part !== '')
-    return `<li>${ReviewPage.time(line.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>${who}${pill}<div>${
-      ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}</li>`
+    return ReviewPage.item([], '', link, `${ReviewPage.time(line.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>${who}${pill}<div>${
+      ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}`)
+  }
+
+  /** A timeline row: its content inside a link that picks the step when `link` is given, else as it is; the picked row is marked `on`. */
+  private static item(classes: readonly string[], attributes: string, link: { href: string; on: boolean } | undefined, content: string): string {
+    const names = link?.on === true ? [...classes, 'on'] : classes
+    const open = `<li${names.length === 0 ? '' : ` class="${names.join(' ')}"`}${attributes}>`
+    if (link === undefined) return `${open}${content}</li>`
+    return `${open}<a class="step" href="${ReviewPage.escape(link.href)}"${link.on ? ' aria-current="true"' : ''}>${content}</a></li>`
   }
 
   /** A request the fixed checks answered: dimmed, named "automatic yes" or "automatic no", with what was asked in full and no comment field. */
-  private static automaticRow(answer: AutomaticAnswer): string {
-    const input = answer.tool_input
-    const command = input !== null && typeof input === 'object' && typeof (input as { command?: unknown }).command === 'string' ? (input as { command: string }).command : undefined
-    const asked = command ?? JSON.stringify(input) ?? String(input)
-    return `<li class="auto" data-automatic="${answer.answer}">${ReviewPage.time(answer.ts)} <strong>${ReviewPage.escape(answer.tool_name)}</strong> <span class="pill">${
-      ReviewPage.AUTOMATIC[answer.answer]}</span><div>Asked: <code>${ReviewPage.escape(asked)}</code></div>${
+  private static automaticRow(answer: AutomaticAnswer, link?: { href: string; on: boolean }): string {
+    return ReviewPage.item(['auto'], ` data-automatic="${answer.answer}"`, link, `${ReviewPage.time(answer.ts)} <strong>${ReviewPage.escape(answer.tool_name)}</strong> <span class="pill">${
+      ReviewPage.AUTOMATIC[answer.answer]}</span><div>Asked: <code>${ReviewPage.escape(ReviewPage.inputText(answer.tool_input))}</code></div>${
       answer.reason === '' ? '' : `<div class="meta">Reason given: ${ReviewPage.escape(answer.reason)}</div>`}<div class="meta">${
-      ReviewPage.escape(answer.session_id)} · ${ReviewPage.CHECKED}</div></li>`
+      ReviewPage.escape(answer.session_id)} · ${ReviewPage.CHECKED}</div>`)
+  }
+
+  /** A tool's input as the owner reads it: a command as it is, anything else as JSON. */
+  private static inputText(input: unknown): string {
+    const command = input !== null && typeof input === 'object' && typeof (input as { command?: unknown }).command === 'string' ? (input as { command: string }).command : undefined
+    return command ?? JSON.stringify(input) ?? String(input)
+  }
+
+  /**
+   * The step detail panel: what was asked, why, what it looked at, what happened next, and the cost, each under its label and shown in full.
+   * A part no record holds keeps its label and reads "Not recorded".
+   */
+  private static detail(step: TimelineStep, detail: StepDetail): string {
+    const heading = step.automatic ? ReviewPage.AUTOMATIC[step.answer.answer] : ReviewPage.HEADINGS[step.line.kind] ?? step.line.kind
+    const part = (label: string, value: string | undefined) =>
+      `<div class="lbl">${label}</div>${value === undefined ? `<div class="val none">${ReviewPage.NOT_RECORDED}</div>` : `<div class="val">${value}</div>`}`
+    const { asked, why, looked_at: read, next, cost } = detail
+    return `<h2>Step detail · ${ReviewPage.time(step.ts)} · ${ReviewPage.escape(heading)}</h2>
+${part(ReviewPage.PARTS.asked, asked === null ? undefined : ReviewPage.askedHtml(asked))}
+${part(ReviewPage.PARTS.why, why === null ? undefined : ReviewPage.whyHtml(why))}
+${part(ReviewPage.PARTS.looked_at, read === null ? undefined : read.length === 0 ? '<p>Nothing was read.</p>'
+    : read.map(each => `<p><code>${ReviewPage.escape(each.path)}</code> · ${each.used ? 'used' : 'not used'}</p>`).join(''))}
+${part(ReviewPage.PARTS.next, next === null ? undefined : `<p>${ReviewPage.escape(ReviewPage.OUTCOMES[next.outcome] ?? next.outcome)}</p>${
+    next.detail === '' ? '' : `<p><code>${ReviewPage.escape(next.detail)}</code></p>`}`)}
+${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocaleString('en-US')} tokens · ${cost.seconds.toFixed(1)} s`)}`
+  }
+
+  private static askedHtml(asked: StepAsked): string {
+    if (asked.kind === 'message') {
+      return `<p class="who">${ReviewPage.escape(asked.from)} ──▶ ${ReviewPage.escape(asked.to)}</p><p>${ReviewPage.escape(asked.text)}</p>`
+    }
+    if (asked.kind === 'step') return `<p>${ReviewPage.escape(asked.text)}</p>`
+    return `<p>Tool: ${ReviewPage.escape(asked.tool_name)} · <code>${ReviewPage.escape(ReviewPage.inputText(asked.tool_input))}</code></p><p>${
+      asked.reason === '' ? 'The worker gave no reason.' : `Reason given by the worker: ${ReviewPage.escape(asked.reason)}`}</p><p class="meta">Session ${
+      ReviewPage.escape(asked.session_id)}</p>`
+  }
+
+  private static whyHtml(why: StepWhy): string {
+    if (why.by === 'fixed_checks') return `<p>${ReviewPage.AUTOMATIC[why.answer]} · ${ReviewPage.CHECKED}</p>`
+    return `<p><strong>${ReviewPage.DECISIONS[why.decision] ?? ReviewPage.escape(why.decision)}</strong> · risk ${ReviewPage.escape(why.risk)}</p><p>${ReviewPage.escape(why.reason)}</p>${
+      why.choice === null ? '' : `<p>Chosen: ${ReviewPage.escape(why.choice)}</p>`}${why.alternative === '' ? '' : `<p>Instead: ${ReviewPage.escape(why.alternative)}</p>`}${
+      why.cites === '' ? '' : `<p class="meta">Rests on: ${ReviewPage.escape(why.cites)}</p>`}`
   }
 
   /** The project's folder name, which is what the owner calls it; the full path is in the link's title. */
@@ -342,8 +423,8 @@ type ReviewTarget = 'page' | 'login' | 'comment'
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
  * `GET /review` shows the first listed project and its newest job; `?project=<path>` picks a project, `&job=<id>` one of its jobs (a `job` alone is looked
- * for in every project), and `&outside=1` its answers outside a job. A project or job no listed project holds is 404. Without the cookie it answers 401
- * with the sign-in form and no record content.
+ * for in every project), `&step=<id>` one step of that job, whose detail fills the right panel, and `&outside=1` its answers outside a job. A project,
+ * job or step that is not there is 404. Without the cookie it answers 401 with the sign-in form and no record content.
  * `POST /review/login` takes the token from the form, and answers 303 to `/review` with the cookie set, 401 for a wrong or empty token, 503 with no token file.
  * `POST /review/comment` takes `{ job_id, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`; it answers 400 for an
  * empty comment or a body that is not that object, 404 for a job no listed project holds, 413 for a body over 64 KiB, and 401 without the cookie.
@@ -407,10 +488,11 @@ export class ReviewRoute {
     }
   }
 
-  /** The page's address for a project, one of its jobs, or its answers outside a job. */
-  static address(project: string, jobId?: string, outside = false): string {
+  /** The page's address for a project, one of its jobs or one step of it (`ReviewPage.stepIdOf`), or its answers outside a job. */
+  static address(project: string, jobId?: string, outside = false, stepId?: string): string {
     const query = new URLSearchParams({ project })
     if (jobId !== undefined) query.set('job', jobId)
+    if (stepId !== undefined) query.set('step', stepId)
     if (outside) query.set('outside', '1')
     return `${ReviewRoute.PATH}?${query}`
   }
@@ -419,7 +501,7 @@ export class ReviewRoute {
   private async show(req: IncomingMessage, res: ServerResponse, page: ReviewPage): Promise<void> {
     const projects = await this.read()
     const query = new URL(req.url ?? ReviewRoute.PATH, 'http://127.0.0.1').searchParams
-    const wantedProject = query.get('project'), wantedJob = query.get('job'), outside = query.get('outside') === '1'
+    const wantedProject = query.get('project'), wantedJob = query.get('job'), wantedStep = query.get('step'), outside = query.get('outside') === '1'
     if (projects.length === 0) { ReviewRoute.sendPage(res, 200, page.notice(ReviewPage.NO_PROJECT), page); return }
     let project: ProjectJobs | undefined
     if (wantedProject !== null) project = projects.find(each => each.project === wantedProject)
@@ -428,7 +510,11 @@ export class ReviewRoute {
     if (project === undefined) throw new ReviewRefusal(404, wantedProject !== null ? 'That project is not listed' : 'No listed project holds that job')
     const job = outside ? undefined : wantedJob === null ? project.jobs[0] : project.jobs.find(each => each.job_id === wantedJob)
     if (!outside && wantedJob !== null && job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
-    ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside }), page)
+    if (wantedStep === null) { ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside }), page); return }
+    const step = job?.steps.find(each => ReviewPage.stepIdOf(each) === wantedStep)
+    if (job === undefined || step === undefined) throw new ReviewRefusal(404, 'That step is not in this job')
+    const detail = (await this.records.stepReader()).read(project.project, step)
+    ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside, step, detail }), page)
   }
 
   /** `POST /review/login`: the token comes in the form's body, never in the address. */

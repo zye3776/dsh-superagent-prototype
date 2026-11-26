@@ -8,7 +8,7 @@ import { Readable } from 'node:stream'
 import { JSDOM } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
-import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine } from '../src/factory/records.ts'
+import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute } from '../src/factory/review.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
@@ -685,24 +685,160 @@ it('lists the answers outside a job on their own, with no comment field', () => 
   expect(page.querySelector('nav a.job.on')!.getAttribute('href')).toBe(ReviewRoute.address(project, undefined, true))
 })
 
+/** A job of three steps: the start, a permission answer, and a message. */
+function threeSteps(): { job: RecordedJob; entry: ProjectJobs; answer: JobLogLine; message: JobLogLine } {
+  const started = action(), answer = action({ step_id: 'step-2', ts: '2026-11-26T08:10:00.000Z', kind: 'permission_answer', summary: 'Approved: run the tests.', ref: 'decision-1', tokens: 1, ms: 1 })
+  const message = action({ step_id: 'step-3', ts: '2026-11-26T08:20:00.000Z', kind: 'message_in', summary: 'Start the ready stories.', from: 'owner', to: 'super agent' })
+  const job: RecordedJob = { project, job_id: 'job-1', number: 1, started: started.ts, stopped: null, last: message.ts, reviews: [],
+    steps: [started, answer, message].map(line => ({ automatic: false as const, ts: line.ts, line })) }
+  return { job, entry: { project, jobs: [job], outside: [] }, answer, message }
+}
+/** A permission answer's detail with every part recorded. */
+const FULL: StepDetail = {
+  asked: { kind: 'request', tool_name: 'Bash', tool_input: { command: 'bun test' }, reason: 'Run the tests.', session_id: 'worker-1' },
+  looked_at: [{ path: 'stories/4-2.md', used: true }, { path: 'package.json', used: false }],
+  why: { by: 'super_agent', decision: 'approve', choice: null, risk: 'low', reason: 'The story\'s own tests change nothing <outside>.', alternative: '', cites: 'story 4.2' },
+  next: { outcome: 'ran_ok', tool_use_id: 'toolu_1', detail: '12 pass\n0 fail' },
+  cost: { tokens: 980, seconds: 2.2 },
+}
+const NONE: StepDetail = { asked: null, looked_at: null, why: null, next: null, cost: null }
+/** The step detail panel as label → value text, in the order shown. */
+const partsOf = (page: Document) => [...page.querySelectorAll('aside.detail .lbl')].map(label => [label.textContent, label.nextElementSibling!.textContent])
+
+it('makes every timeline row a link to its step, and marks the picked row', () => {
+  const { job, entry, answer } = threeSteps()
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step: job.steps[1], detail: FULL }))
+  expect([...page.querySelectorAll('ol li a.step')].map(link => link.getAttribute('href'))).toEqual(['step-1', 'step-2', 'step-3'].map(id => ReviewRoute.address(project, 'job-1', false, id)))
+  expect([...page.querySelectorAll('ol li')].map(row => [row.className, row.querySelector('a')!.getAttribute('aria-current')])).toEqual([['', null], ['on', 'true'], ['', null]])
+  expect(page.querySelector('aside.detail h2')!.textContent).toMatch(/^Step detail · \d\d:\d\d · Permission answered$/)
+  expect(ReviewPage.stepIdOf(job.steps[1]!)).toBe(answer.step_id)
+  // The whole-job comment field stays in the middle panel.
+  expect([page.querySelectorAll('textarea').length, page.querySelector('main textarea')!.id]).toEqual([1, 'comment'])
+})
+
+it('shows all five parts of a permission answer in full, in the panel\'s order, as text and never as markup', () => {
+  const { job, entry } = threeSteps()
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step: job.steps[1], detail: FULL }))
+  expect(partsOf(page)).toEqual([
+    ['What was asked', 'Tool: Bash · bun testReason given by the worker: Run the tests.Session worker-1'],
+    ['Why', 'Approved · risk lowThe story\'s own tests change nothing <outside>.Rests on: story 4.2'],
+    ['What it looked at', 'stories/4-2.md · usedpackage.json · not used'],
+    ['What happened next', 'Ran and succeeded12 pass\n0 fail'],
+    ['Cost', '980 tokens · 2.2 s'],
+  ])
+  expect(page.querySelector('outside')).toBeNull()
+  expect(page.querySelectorAll('aside .none').length).toBe(0)
+})
+
+it('shows a message\'s text, sender and receiver, and says the other parts are not recorded', () => {
+  const { job, entry } = threeSteps()
+  const detail: StepDetail = { ...NONE, asked: { kind: 'message', text: 'Start the ready stories.', from: 'owner', to: 'super agent' } }
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step: job.steps[2], detail }))
+  expect(partsOf(page)).toEqual([
+    ['What was asked', 'owner ──▶ super agentStart the ready stories.'],
+    ['Why', 'Not recorded'], ['What it looked at', 'Not recorded'], ['What happened next', 'Not recorded'], ['Cost', 'Not recorded'],
+  ])
+})
+
+it('names the other answers, the fixed checks\' answer, an empty read list and every outcome in words', () => {
+  const { job, entry } = threeSteps()
+  const view = (detail: StepDetail) => partsOf(dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step: job.steps[1], detail })))
+  const denied: StepDetail = { ...FULL, looked_at: [], why: { by: 'super_agent', decision: 'deny', choice: 'the smaller fix', risk: 'high', reason: 'Too wide.', alternative: 'Ask first.', cites: '' } }
+  expect(view(denied).slice(1, 3)).toEqual([['Why', 'Denied · risk highToo wide.Chosen: the smaller fixInstead: Ask first.'], ['What it looked at', 'Nothing was read.']])
+  expect(view({ ...NONE, why: { by: 'fixed_checks', answer: 'refuse' } })[1]).toEqual(['Why', 'automatic no · answered by the fixed checks · not reviewed'])
+  const outcomes = (['ran_failed', 'refused', 'owner_no', 'unknown'] as const).map(outcome => view({ ...NONE, next: { outcome, tool_use_id: null, detail: '' } })[3]![1])
+  expect(outcomes).toEqual(['Ran and failed', 'Refused', 'The owner said no', 'Cannot be told yet: the worker\'s transcript holds no result for it'])
+  expect(view({ ...NONE, asked: { kind: 'step', text: 'Started a worker.' } })[0]).toEqual(['What was asked', 'Started a worker.'])
+})
+
+it('asks the owner to pick a step while none is picked, and shows no panel outside a job', () => {
+  const { job, entry } = threeSteps()
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false }))
+  expect([page.querySelector('aside.detail p')!.textContent, page.querySelectorAll('ol li.on').length]).toEqual([ReviewPage.PICK_STEP, 0])
+  const outside: ProjectJobs = { project, jobs: [], outside: [automatic()] }
+  const list = dom(new ReviewPage('nonce').view({ projects: [outside], project: outside, outside: true }))
+  expect([list.querySelector('aside'), list.querySelector('ol li a'), list.querySelector('.cols')!.className]).toEqual([null, null, 'cols'])
+  expect(page.querySelector('.cols')!.className).toBe('cols with-detail')
+})
+
+it('puts every text of a step\'s detail on the page as text, never as markup', () => {
+  const { job, entry } = threeSteps()
+  const mark = '<x>'
+  const request: StepDetail = {
+    asked: { kind: 'request', tool_name: mark, tool_input: { file_path: mark }, reason: mark, session_id: mark },
+    looked_at: [{ path: mark, used: true }],
+    why: { by: 'super_agent', decision: 'deny', choice: mark, risk: 'low', reason: mark, alternative: mark, cites: mark },
+    next: { outcome: 'ran_failed', tool_use_id: null, detail: mark },
+    cost: null,
+  }
+  const message: StepDetail = { ...NONE, asked: { kind: 'message', text: mark, from: mark, to: mark } }
+  for (const detail of [request, message]) {
+    const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false, step: job.steps[1], detail }))
+    expect(page.querySelector('x')).toBeNull()
+    expect(page.querySelector('aside.detail')!.textContent).toContain(mark)
+  }
+})
+
+it('serves a step\'s detail from the step reader at its address, and 404 for a step the job does not hold', async () => {
+  put('actions.jsonl', [action(), action({ step_id: 'step-2', ts: '2026-11-26T08:10:00.000Z', kind: 'permission_answer', summary: 'Approved: run the tests.', ref: 'decision-1' })])
+  writeFileSync(file('step-details.json'), JSON.stringify({ 'step-2': FULL }))
+  await serve()
+  const cookie = await signIn()
+  const picked = await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-2'), { cookie })
+  expect(picked.status).toBe(200)
+  expect(partsOf(dom(picked.text)).at(-1)).toEqual(['Cost', '980 tokens · 2.2 s'])
+  const plain = dom((await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-1'), { cookie })).text)
+  expect(partsOf(plain).map(([, value]) => value)).toEqual(Array(5).fill(ReviewPage.NOT_RECORDED))
+  const missing = await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-9'), { cookie })
+  expect([missing.status, dom(missing.text).querySelector('p')!.textContent]).toEqual([404, 'That step is not in this job'])
+  expect((await call('GET', `${ReviewRoute.address(project, undefined, true)}&step=step-1`, { cookie })).status).toBe(404)
+})
+
+it('answers 503 for a picked step when the records module has no step reader, and still shows the job without one', async () => {
+  put('actions.jsonl', [action()])
+  const source = readFileSync(recordsModule(root), 'utf8').replace('export class StepDetailReader', 'class StepDetailReader')
+  await serve([project], new FactoryRecordsModule(recordsModule(root, source)))
+  const cookie = await signIn()
+  expect((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).status).toBe(200)
+  const picked = await call('GET', ReviewRoute.address(project, 'job-1', false, 'step-1'), { cookie })
+  expect([picked.status, dom(picked.text).querySelector('p')!.textContent]).toEqual([503, 'The configured recordsModule does not export StepDetailReader, so no record is read'])
+})
+
 /** The factory's folder, when the environment says where it is: its built job log file and its review sample are read from it. */
 const FACTORY = process.env.ZEES_FACTORY_DIR?.trim() ?? ''
 const realTitle = FACTORY === '' ? 'the factory\'s real built JobsReader (SKIPPED: set ZEES_FACTORY_DIR to the factory\'s folder to run it)' : 'the factory\'s real built JobsReader'
 
 describe.skipIf(FACTORY === '')(realTitle, () => {
-  /** Writes the factory's review sample (`lib/fixtures/review-jobs.json`) into two projects and serves the page with the real built file. */
+  const built = join(FACTORY, 'lib', 'dist', 'jobLog.js')
+  /**
+   * The real built file, with its step reader looking for worker transcripts in `claudeHome` instead of this machine's Claude home.
+   * The plugin itself builds the reader with no arguments (`FactoryRecordsModule.stepReader`), which the last test checks.
+   */
+  class SampleRecords extends FactoryRecordsModule {
+    constructor(private readonly claudeHome: string) { super(built) }
+    override async stepReader(): Promise<StepSource> {
+      const { StepDetailReader } = await import(built) as { StepDetailReader: new (options: { claudeHome: string }) => StepSource }
+      return new StepDetailReader({ claudeHome: this.claudeHome })
+    }
+  }
+  /**
+   * Writes the factory's review sample (`lib/fixtures/review-jobs.json`) into two projects, its worker transcripts into a Claude home, and serves the page
+   * with the real built file.
+   */
   async function serveSample(): Promise<{ a: string; b: string; cookie: string }> {
-    const a = join(root, 'project-a'), b = join(root, 'project-b')
+    const a = join(root, 'project-a'), b = join(root, 'project-b'), claudeHome = join(root, 'claude-home')
     let text = readFileSync(join(FACTORY, 'lib', 'fixtures', 'review-jobs.json'), 'utf8')
     text = text.replaceAll('<project-a>', a).replaceAll('<project-b>', b)
-    const sample = JSON.parse(text) as { projects: Record<string, Record<string, (string | object)[]>> }
+    const sample = JSON.parse(text) as { projects: Record<string, Record<string, (string | object)[]>>; transcripts: Record<string, object[]> }
     for (const [folder, files] of Object.entries(sample.projects)) {
       mkdirSync(join(folder, FactoryRecordFile.FOLDER), { recursive: true })
       for (const [name, written] of Object.entries(files)) if (written.length > 0) put(name, written, folder)
     }
-    const built = join(FACTORY, 'lib', 'dist', 'jobLog.js')
+    const transcripts = join(claudeHome, 'projects', '-sample-worktree')
+    mkdirSync(transcripts, { recursive: true })
+    for (const [session, written] of Object.entries(sample.transcripts)) writeFileSync(join(transcripts, `${session}.jsonl`), written.map(line => JSON.stringify(line)).join('\n') + '\n')
     expect(existsSync(built), `${built} is missing: run the factory's build`).toBe(true)
-    await serve([a, b], new FactoryRecordsModule(built))
+    await serve([a, b], new SampleRecords(claudeHome))
     return { a, b, cookie: await signIn() }
   }
   const jobsOf = (page: Document) => [...page.querySelectorAll('nav a.job')].map(link => [...link.querySelectorAll('span')].filter(part => part.parentElement === link).map(part => part.textContent))
@@ -736,5 +872,39 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect([rowsOf(outside), outside.querySelector('textarea')]).toEqual([[['refuse', 'automatic no', 'Asked: {"file_path":"/etc/hosts","content":"x"}']], null])
     const other = dom((await call('GET', ReviewRoute.address(b), { cookie })).text)
     expect(rowsOf(other).map(row => row[1])).toEqual([null, null, 'automatic no', null])
+  })
+
+  it('shows all five parts of the sample\'s permission answer, with the same tokens and time as its decision record', async () => {
+    const { a, cookie } = await serveSample()
+    const page = dom((await call('GET', ReviewRoute.address(a, 'job-a1', false, 'a1-2'), { cookie })).text)
+    const decision = JSON.parse(lines('decisions.jsonl', a)[0]!) as { decision_id: string; tokens: number; seconds: number }
+    expect(decision.decision_id).toBe('decision-a1')
+    expect(partsOf(page)).toEqual([
+      ['What was asked', 'Tool: Bash · bun testReason given by the worker: Run the tests.Session worker-1'],
+      ['Why', 'Approved · risk lowRunning the story\'s own tests changes nothing outside the worktree.Rests on: story 4.2: the upload tests must pass'],
+      ['What it looked at', 'stories/4-2.md · usedpackage.json · not used'],
+      ['What happened next', 'Ran and succeeded12 pass\n0 fail'],
+      ['Cost', `${decision.tokens} tokens · ${decision.seconds.toFixed(1)} s`],
+    ])
+    expect(partsOf(page).at(-1)).toEqual(['Cost', '980 tokens · 2.2 s'])
+  })
+
+  it('shows the sample\'s message with its text, sender and receiver, and says the other parts are not recorded', async () => {
+    const { a, cookie } = await serveSample()
+    const page = dom((await call('GET', ReviewRoute.address(a, 'job-a2', false, 'a2-2'), { cookie })).text)
+    expect(partsOf(page)).toEqual([
+      ['What was asked', 'owner ──▶ super agentStart the ready stories.'],
+      ['Why', 'Not recorded'], ['What it looked at', 'Not recorded'], ['What happened next', 'Not recorded'], ['Cost', 'Not recorded'],
+    ])
+  })
+
+  it('shows an automatic answer\'s detail with the fixed checks\' answer, and the plugin\'s own step reader loads from the built file', async () => {
+    const { a, cookie } = await serveSample()
+    const page = dom((await call('GET', ReviewRoute.address(a, 'job-a1', false, 'req-a-yes'), { cookie })).text)
+    expect(partsOf(page).slice(0, 2)).toEqual([
+      ['What was asked', 'Tool: Bash · git push origin story-4-2Reason given by the worker: Share the branch.Session worker-1'],
+      ['Why', 'automatic yes · answered by the fixed checks · not reviewed'],
+    ])
+    expect(typeof (await new FactoryRecordsModule(built).stepReader()).read).toBe('function')
   })
 })

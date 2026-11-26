@@ -55,6 +55,24 @@ export interface RecordedJob {
 }
 /** One target project as the factory's `JobsReader` gives it: its jobs, newest first, and the automatic answers that fell in no job, in time order. */
 export interface ProjectJobs { project: string; jobs: RecordedJob[]; outside: AutomaticAnswer[] }
+/** What a step asked or said: a permission request in full, a message with its sender and receiver, or another step's own words. */
+export type StepAsked =
+  | { kind: 'request'; tool_name: string; tool_input: unknown; reason: string; session_id: string }
+  | { kind: 'message'; text: string; from: string; to: string }
+  | { kind: 'step'; text: string }
+/** Why the step went as it did: the super agent's decision and its reasoning, or the fixed checks' own answer. */
+export type StepWhy =
+  | { by: 'super_agent'; decision: 'approve' | 'deny' | 'ask_owner'; choice: string | null; risk: 'low' | 'medium' | 'high'; reason: string; alternative: string; cites: string }
+  | { by: 'fixed_checks'; answer: AutomaticAnswer['answer'] }
+/** What happened after a request, read from the worker's transcript: it ran and succeeded or failed, was refused, the owner said no, or it cannot be told yet. */
+export interface StepOutcome { outcome: 'ran_ok' | 'ran_failed' | 'refused' | 'owner_no' | 'unknown'; tool_use_id: string | null; detail: string }
+/**
+ * One step's detail as the factory's `StepDetailReader` gives it, read through the step's pointers from the records that hold each part. A part is `null`
+ * when no record holds it for this step. The shape is the factory's (`lib/jobLog`, `StepDetail`); this type follows it.
+ */
+export interface StepDetail {
+  asked: StepAsked | null; looked_at: { path: string; used: boolean }[] | null; why: StepWhy | null; next: StepOutcome | null; cost: { tokens: number; seconds: number } | null
+}
 
 /**
  * Represents a record that could not be written or read, with the HTTP status the review page answers.
@@ -114,19 +132,23 @@ export interface RecordsMasker { maskAction(line: JobLogLine): JobLogLine; maskR
 export interface RecordsReader { read(project: string): ReadJobLog }
 /** Reads every listed project's records back as jobs, one entry per project in the order given. It skips what it cannot read and never throws. */
 export interface JobsSource { read(projects: readonly string[]): ProjectJobs[] }
-/** Gives the masker of one project and the two readers. Each rejects with `RecordsRefusal(503)` when there is none. */
-export interface RecordsSource { maskerFor(project: string): Promise<RecordsMasker>; reader(): Promise<RecordsReader>; jobsReader(): Promise<JobsSource> }
+/** Reads one step's detail, for a step of a job of `project` as `JobsSource` gave it. It skips what it cannot read and never throws. */
+export interface StepSource { read(project: string, step: TimelineStep): StepDetail }
+/** Gives the masker of one project and the three readers. Each rejects with `RecordsRefusal(503)` when there is none. */
+export interface RecordsSource {
+  maskerFor(project: string): Promise<RecordsMasker>; reader(): Promise<RecordsReader>; jobsReader(): Promise<JobsSource>; stepReader(): Promise<StepSource>
+}
 /**
  * What the factory's built job log file exports: `JobLogMask.forProject(project)` gives the masker of that project, `new JobLogReader()` the reader of
- * one project's lines, and `new JobsReader()` the reader of the projects' jobs.
+ * one project's lines, `new JobsReader()` the reader of the projects' jobs, and `new StepDetailReader()` the reader of one step's detail.
  */
-interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown; JobsReader?: unknown }
+interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown; JobsReader?: unknown; StepDetailReader?: unknown }
 
 /**
  * The factory's job log code, loaded from its built file `lib/dist/jobLog.js`.
  * The file is imported on first use, not at start, so the plugin starts without it; a masker is built once for each project and each reader once.
- * Any failure is a 503: no path given, a path that is not absolute, a file that does not load, a file without `JobLogMask.forProject`, `JobLogReader`
- * or `JobsReader` (each checked only when it is needed), or a masker or reader that cannot be built.
+ * Any failure is a 503: no path given, a path that is not absolute, a file that does not load, a file without `JobLogMask.forProject`, `JobLogReader`,
+ * `JobsReader` or `StepDetailReader` (each checked only when it is needed), or a masker or reader that cannot be built.
  * Like the mask file of the decisions (`FactoryMaskModule`), Node keeps the file once it has loaded it, so a rebuilt file takes effect only after DSH restarts.
  * The refusal says which step failed and never repeats the error's own text, which could quote what was to be masked.
  */
@@ -134,6 +156,7 @@ export class FactoryRecordsModule implements RecordsSource {
   private readonly maskers = new Map<string, RecordsMasker>()
   private kept: RecordsReader | undefined
   private keptJobs: JobsSource | undefined
+  private keptSteps: StepSource | undefined
   readonly path: string | undefined
   constructor(path?: string) { this.path = path }
   async maskerFor(project: string): Promise<RecordsMasker> {
@@ -159,8 +182,12 @@ export class FactoryRecordsModule implements RecordsSource {
     this.keptJobs ??= await this.build('JobsReader', 'jobs reader')
     return this.keptJobs
   }
-  /** Builds the reader class the module exports as `name`, with no arguments; both readers have one method, `read`. */
-  private async build<Reader extends { read(arg: never): unknown }>(name: 'JobLogReader' | 'JobsReader', what: string): Promise<Reader> {
+  async stepReader(): Promise<StepSource> {
+    this.keptSteps ??= await this.build('StepDetailReader', 'step reader')
+    return this.keptSteps
+  }
+  /** Builds the reader class the module exports as `name`, with no arguments; every reader has one method, `read`. */
+  private async build<Reader extends { read(...args: never[]): unknown }>(name: 'JobLogReader' | 'JobsReader' | 'StepDetailReader', what: string): Promise<Reader> {
     const Class = (await this.load())[name]
     if (typeof Class !== 'function') throw new RecordsRefusal(503, `The configured recordsModule does not export ${name}, so no record is read`)
     let reader: unknown

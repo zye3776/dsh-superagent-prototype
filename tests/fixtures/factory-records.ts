@@ -1,6 +1,8 @@
 /**
  * A stand-in for the factory's built job log file (`lib/dist/jobLog.js`), with the same exports, for the tests of the job log and of the review page.
  * Its `JobsReader` only groups the job log into jobs: it reads no automatic answer, which the review page's tests check with the real built file.
+ * Its `StepDetailReader` follows no pointer: it gives the detail a test wrote for the step's id in the project's `.factory/step-details.json`, and a detail
+ * with every part `null` (not recorded) for any other step.
  * Its mask refuses an unknown kind or field, replaces one planted value in every text field and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
  */
 import { writeFileSync } from 'node:fs'
@@ -63,6 +65,14 @@ export class JobsReader {
       jobs.sort((a, b) => byTs({ ts: a.started }, { ts: b.started })).forEach((job, index) => { job.number = index + 1 })
       return { project, jobs: jobs.reverse(), outside: [] }
     })
+  }
+}
+export class StepDetailReader {
+  read(project, step) {
+    let details = {}
+    try { details = JSON.parse(readFileSync(join(project, '.factory', 'step-details.json'), 'utf8')) } catch {}
+    const id = step.automatic ? step.answer.request_id : step.line.step_id
+    return details[id] ?? { asked: null, looked_at: null, why: null, next: null, cost: null }
   }
 }
 `

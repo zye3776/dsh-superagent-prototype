@@ -64,7 +64,8 @@ export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export {
   FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogKind, type JobLogLine, type JobsSource, type JobStep,
-  type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type TimelineStep,
+  type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
+  type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
 export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
 export { SharedTokenFile } from './token.ts'

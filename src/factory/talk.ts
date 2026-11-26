@@ -16,8 +16,9 @@
  * copies only, also when a record on disk was already masked. Without a working mask nothing is written.
  * Proposals the talk sends back (`POST /review/proposal`, in `review.ts`) are kept here in memory, the newest per job, until a newer one replaces it.
  */
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import {
@@ -203,6 +204,13 @@ export class TalkFolder {
   /** The name of the talk's one MCP server, as Claude Desktop lists it. */
   static readonly SERVER_NAME = 'zees-factory-propose'
   static readonly FILES = { settings: join('.claude', 'settings.json'), mcp: '.mcp.json', job: 'job.md', comments: 'comments.md', guideline: 'guideline.md', state: 'talk.json' } as const
+  /**
+   * The git settings of the talk folder's own repository, given on every call so nothing comes from the owner's own git setup: a fixed author, no
+   * signing, no hooks, `main` as the first branch. The owner's global and system config files are not read at all (`GIT_CONFIG_GLOBAL`,
+   * `GIT_CONFIG_NOSYSTEM`), and no `GIT_*` variable of DSH's own environment reaches git.
+   */
+  static readonly GIT_CONFIG = ['-c', 'user.name=zees-factory', '-c', 'user.email=zees-factory@localhost', '-c', 'commit.gpgsign=false',
+    '-c', 'core.hooksPath=/dev/null', '-c', 'init.defaultBranch=main'] as const
   readonly path: string
   constructor(path: string) { this.path = path }
 
@@ -248,6 +256,10 @@ export class TalkFolder {
    * Writes the talk's files. `mask` cleans one text and throws when it cannot. Every text is masked before the first byte is written, so a mask that
    * fails leaves no folder behind. The two pinned files must come through the mask unchanged, since a changed one would no longer start the tool or
    * deny anything; if not, nothing is written. `talk.json` is written last: until it is there, the talk does not count as started.
+   * Then the folder is made its own git repository (once) and every file written is committed, a fresh talk as a new commit on top. Claude Desktop
+   * then takes the folder itself as the project, not a repository above it (the owner's home folder can be one), so a session it starts in a git
+   * worktree still holds the talk's files, its deny rules and its propose server. No remote is set; nothing is pushed. When git fails the start is
+   * refused and `talk.json` is removed again, so the talk does not count as started.
    */
   write(files: { mcp: string; job: string; comments: string; guideline: string; state: TalkState }, mask: (text: string) => string): void {
     const plain: [string, string][] = [[TalkFolder.FILES.settings, TalkFolder.SETTINGS], [TalkFolder.FILES.mcp, files.mcp], [TalkFolder.FILES.job, files.job],
@@ -267,6 +279,21 @@ export class TalkFolder {
       if (error instanceof TalkRefusal) throw error
       throw new TalkRefusal(503, `The review talk could not be prepared: the talk folder could not be written (${(error as NodeJS.ErrnoException).code ?? 'not a folder'})`)
     }
+    try {
+      this.git('init', '--quiet')
+      this.git('add', '--', ...masked.map(([name]) => name))
+      this.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', `Review talk files, started ${files.state.started}`)
+    } catch {
+      rmSync(join(this.path, TalkFolder.FILES.state), { force: true })
+      throw new TalkRefusal(503, 'The review talk could not be prepared: the talk folder could not be committed to its own git repository')
+    }
+  }
+
+  /** Runs one git command inside the talk folder, with `GIT_CONFIG` and an environment that holds none of the owner's git settings. */
+  private git(...args: string[]): void {
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')))
+    execFileSync('git', [...TalkFolder.GIT_CONFIG, ...args], { cwd: this.path, env: { ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+      stdio: 'ignore', timeout: 15_000 })
   }
 
   /** Replaces one file's text. NOFOLLOW makes the open fail on a symlink, and the opened file must be a regular file. */

@@ -1,4 +1,5 @@
 /** The review talk: its folder and pinned files, its opening message and link, starting it once per job, and the proposals it sends back. */
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -65,7 +66,9 @@ const talksOf = (records: RecordsSource, fields: Partial<ConstructorParameters<t
 const ADDRESS = 'http://127.0.0.1:3083/review/proposal'
 /** Every file under a folder, as paths below it, sorted. */
 function filesOf(folder: string): string[] {
-  return readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => relative(folder, join(entry.parentPath, entry.name))).sort()
+  // The talk folder's own git repository is left out here; its own test checks what it holds.
+  return readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => relative(folder, join(entry.parentPath, entry.name)))
+    .filter(name => !name.startsWith('.git/')).sort()
 }
 const messageOf = (link: string) => decodeURIComponent(/[?&]q=([^&]*)/.exec(link)![1]!)
 const folderOf = (link: string) => decodeURIComponent(/[?&]folder=([^&]*)/.exec(link)![1]!)
@@ -200,6 +203,67 @@ describe('ReviewTalks', () => {
     expect([fresh.opened, fresh.state.started]).toEqual([true, now])
     expect(readFileSync(join(folder, 'comments.md'), 'utf8')).toContain('Changed my mind.')
     expect(talk.stateOf(job())?.started).toBe(now)
+  })
+
+  /** Asks git about the talk folder, reading none of the owner's git settings. */
+  const git = (folder: string, ...args: string[]) => execFileSync('git', ['-C', folder, ...args], { encoding: 'utf8',
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_'))), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).trim()
+  const TALK_FILES = ['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json']
+
+  it('makes the talk folder its own git repository: one commit by the factory holding exactly the files written, on main, with no remote', async () => {
+    await talksOf(new StandInRecords()).start(job(), ADDRESS, false)
+    const folder = TalkFolder.of(talks, job()).path
+    expect(git(folder, 'rev-parse', '--show-toplevel')).toBe(realpathSync(folder))
+    expect(git(folder, 'log', '--format=%an <%ae> · %cn <%ce>')).toBe('zees-factory <zees-factory@localhost> · zees-factory <zees-factory@localhost>')
+    expect([git(folder, 'symbolic-ref', '--short', 'HEAD'), git(folder, 'remote'), git(folder, 'status', '--porcelain')]).toEqual(['main', '', ''])
+    expect(git(folder, 'ls-tree', '-r', '--name-only', 'HEAD').split('\n')).toEqual(TALK_FILES)
+    // The commit holds the files byte for byte, the pinned settings file among them.
+    for (const name of TALK_FILES) expect([name, git(folder, 'show', `HEAD:${name}`)]).toEqual([name, readFileSync(join(folder, name), 'utf8').trim()])
+    expect(`${git(folder, 'show', 'HEAD:.claude/settings.json')}\n`).toBe(TalkFolder.SETTINGS)
+  })
+
+  it('a second start adds no commit; a fresh talk commits the rewritten files on top and keeps the history', async () => {
+    let now = NOW
+    const talk = talksOf(new StandInRecords(), { now: () => new Date(now) })
+    await talk.start(job(), ADDRESS, false)
+    const folder = TalkFolder.of(talks, job()).path
+    await talk.start(job(), ADDRESS, false)
+    expect(git(folder, 'rev-list', '--count', 'HEAD')).toBe('1')
+    now = '2026-11-27T08:00:00.000Z'
+    await talk.start(job({ reviews: [review({ comment: 'Changed my mind.' })] }), ADDRESS, true)
+    expect(git(folder, 'log', '--format=%s').split('\n')).toEqual([`Review talk files, started ${now}`, `Review talk files, started ${NOW}`])
+    expect([git(folder, 'show', 'HEAD:comments.md').includes('Changed my mind.'), git(folder, 'show', 'HEAD~1:comments.md').includes('Changed my mind.')]).toEqual([true, false])
+    expect([git(folder, 'status', '--porcelain'), git(folder, 'ls-tree', '-r', '--name-only', 'HEAD').split('\n')]).toEqual(['', TALK_FILES])
+  })
+
+  it('reads and changes none of the owner\'s git settings: a global config that signs commits and names another author is not used, nor DSH\'s GIT_ variables', async () => {
+    const home = join(root, 'owner-home')
+    mkdirSync(home)
+    const config = join(home, '.gitconfig')
+    const owner = '[user]\n\tname = Owner\n\temail = owner@example.com\n[commit]\n\tgpgsign = true\n[core]\n\thooksPath = /nowhere\n'
+    writeFileSync(config, owner)
+    const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, GIT_DIR: process.env.GIT_DIR }
+    Object.assign(process.env, { HOME: home, GIT_CONFIG_GLOBAL: config, GIT_DIR: join(root, 'elsewhere.git') })
+    try {
+      await talksOf(new StandInRecords()).start(job(), ADDRESS, false)
+    } finally {
+      for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
+    }
+    const folder = TalkFolder.of(talks, job()).path
+    expect(git(folder, 'log', '--format=%an <%ae>')).toBe('zees-factory <zees-factory@localhost>')
+    expect([readFileSync(config, 'utf8'), existsSync(join(root, 'elsewhere.git'))]).toEqual([owner, false])
+  })
+
+  it('refuses with 503 and marks nothing as started when git cannot commit the folder', async () => {
+    const path = process.env.PATH
+    process.env.PATH = join(root, 'no-git-here')
+    let refused: TalkRefusal | undefined
+    const talk = talksOf(new StandInRecords())
+    try {
+      refused = await talk.start(job(), ADDRESS, false).then(() => undefined, (error: unknown) => error as TalkRefusal)
+    } finally { process.env.PATH = path }
+    expect([refused?.status, refused?.message]).toEqual([503, 'The review talk could not be prepared: the talk folder could not be committed to its own git repository'])
+    expect(talk.stateOf(job())).toBeUndefined()
   })
 
   it('refuses a job with no comment with 409 and writes no folder', async () => {

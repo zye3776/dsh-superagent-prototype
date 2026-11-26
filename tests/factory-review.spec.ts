@@ -1160,7 +1160,7 @@ describe('the review talk and its proposals', () => {
     call('POST', ReviewRoute.PROPOSAL_PATH, { 'content-type': 'application/json', [SharedTokenFile.HEADER]: TOKEN, ...headers }, typeof body === 'string' ? body : JSON.stringify(body))
   const talkFolder = () => readdirSync(talkRoot()).map(name => join(talkRoot(), name))[0]!
   const filesOf = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
-    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).sort()
+    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).filter(name => !name.startsWith('.git/')).sort()
 
   it('starts a talk on a signed-in click: the folder holds the pinned files and the job\'s files, and the answer carries the link and the notice', async () => {
     await serve()
@@ -1684,7 +1684,7 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
 
   /** Every file under a folder, as paths below it, sorted. */
   const filesUnder = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
-    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).sort()
+    .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).filter(name => !name.startsWith('.git/')).sort()
   /** Starts the talk of the sample's job-a1, which has the whole job's comment, after a second comment on its permission answer. */
   async function startSampleTalk(a: string, cookie: string): Promise<{ folder: string; link: string }> {
     expect((await comment(cookie, { project: a, job_id: 'job-a1', step_id: 'a1-2', comment: 'Keep to the minimum feature.' })).status).toBe(200)

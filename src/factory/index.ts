@@ -34,7 +34,7 @@ export const Config = s.object({
   guardModule: s.string().pattern(/^\//)
     .description('The factory\'s built judge guard file, lib/dist/judgeGuard.js in the factory\'s folder. Absolute path, no default; every tool call of a judge Session is checked with it, and without it no judge Session is opened and the route answers 503.'),
   recordsModule: s.string().pattern(/^\//)
-    .description('The factory\'s built job log file, lib/dist/jobLog.js in the factory\'s folder. Absolute path, no default; every job log line and every comment of the review page is masked with it before it is written, and the review page reads the records with it. Without it no job log line or comment is written and the review page answers 503.'),
+    .description('The factory\'s built job log file, lib/dist/jobLog.js in the factory\'s folder. Absolute path, no default; every job log line and every comment of the review page is masked with it before it is written, and the review page reads the records and the decision guideline\'s versions with it. Without it no job log line or comment is written and the review page answers 503.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -63,7 +63,7 @@ export { FactoryJob, type JobAnswer } from './job.ts'
 export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export {
-  FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogKind, type JobLogLine, type JobsSource, type JobStep,
+  FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogKind, type JobLogLine, type JobsSource, type JobStep,
   type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'

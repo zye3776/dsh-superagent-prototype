@@ -3,6 +3,8 @@
  * and on any step of it. Left, the listed (target) projects and the jobs of the picked one, newest first; in the middle, the job's comments together, then
  * its timeline, which also holds the requests the fixed checks answered on their own while the job ran, each comment echoed under its step; right, the
  * detail of the step picked in the timeline and, below it, the always-open comment field for that step or for the whole job.
+ * A second tab, "Guideline", lists the versions of the super agent's decision guideline, newest first, and shows the text of the picked one; the factory's
+ * `GuidelineReader` reads them from the factory repository.
  * The factory's `JobsReader` builds the jobs from each project's `.factory/` records and its `StepDetailReader` reads a step's detail through the step's
  * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
@@ -15,7 +17,7 @@ import { createHmac, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, isAbsolute, resolve } from 'node:path'
 import {
-  FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
+  FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type GuidelineRead, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
 import { SharedTokenFile } from './token.ts'
@@ -135,6 +137,10 @@ export class ReviewPage {
   static readonly JOB_COMMENT = 'Your comment on this job'
   static readonly COMMENTS = 'Comments'
   static readonly WHOLE_JOB = 'On the whole job'
+  static readonly TAB_JOBS = 'Jobs'
+  static readonly TAB_GUIDELINE = 'Guideline'
+  static readonly NO_GUIDELINE = 'No guideline yet. The first review talk writes version 1.'
+  static readonly NO_GUIDELINE_FOLDER = 'The guideline folder was not found, so the super agent is running without a guideline.'
   /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */
   static readonly WHOLE_JOB_KINDS: ReadonlySet<JobLogLine['kind']> = new Set(['job_start', 'job_stop'])
   /** What a part of a step reads when no record holds it: the label stays, never a blank or a guess. */
@@ -184,6 +190,10 @@ export class ReviewPage {
     'a { color: var(--dsw-alias-link); }',
     'textarea, input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font: inherit; color: inherit; background: var(--dsw-alias-bg-layer-1); }',
     'textarea { min-height: 120px; }',
+    '.tabs { display: flex; gap: 4px; margin-bottom: 8px; }',
+    '.tabs a { padding: 4px 10px; border-radius: 8px; color: inherit; text-decoration: none; }',
+    '.tabs a.on { background: var(--dsw-alias-bg-layer-2); }',
+    'pre.guideline-text { text-wrap-mode: wrap; overflow-wrap: anywhere; overflow-x: auto; font-family: var(--ds-font-family-code); font-size: 12px; }',
   ].join('\n')
   /**
    * The script that runs in the owner's browser. It talks only to this page's own comment address.
@@ -278,7 +288,8 @@ ${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
 ${this.commentField(job, view.step, comments)}
 </aside>`
     }
-    return this.document(`<div class="crumb">${crumb}</div>
+    return this.document(`${ReviewPage.tabs('jobs')}
+<div class="crumb">${crumb}</div>
 <div class="cols${panel === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Projects and jobs">
 ${ReviewPage.left(view)}
@@ -288,6 +299,53 @@ ${middle}
 </main>
 ${panel}
 </div>`)
+  }
+
+  /**
+   * The Guideline tab: left, the versions newest first, each with its date and the job whose review led to it; in the middle, the picked version's text,
+   * shown as written. With no version it says there is no guideline yet, and when the factory repository was not found it says so with the reader's reason.
+   * It only reads: there is no control on it.
+   */
+  guideline(read: GuidelineRead, picked: GuidelineVersion | undefined): string {
+    let crumb = ReviewPage.TAB_GUIDELINE
+    let left = ''
+    let middle: string
+    if (read.folder === null) {
+      middle = `<p>${ReviewPage.escape(ReviewPage.NO_GUIDELINE_FOLDER)}</p>${read.reason === null ? '' : `\n<p class="meta">${ReviewPage.escape(read.reason)}</p>`}`
+    } else if (picked === undefined) {
+      middle = `<p>${ReviewPage.escape(ReviewPage.NO_GUIDELINE)}</p>`
+    } else {
+      crumb += ` › v${picked.version}`
+      left = read.versions.map(each => `<a class="version${each.version === picked.version ? ' on' : ''}" href="${ReviewPage.escape(ReviewRoute.guidelineAddress(each.version))}">\
+<span>v${each.version}${each.version === read.current?.version ? ' · current' : ''}</span><span class="l2">${ReviewPage.escape(ReviewPage.sourceOf(each))}</span></a>`).join('\n')
+      middle = `<h2>Guideline v${picked.version}${picked.version === read.current?.version ? ' · current' : ''}</h2>
+<p class="meta">${ReviewPage.escape(ReviewPage.sourceOf(picked))}</p>
+<pre class="guideline-text">${ReviewPage.escape(picked.text)}</pre>`
+    }
+    return this.document(`${ReviewPage.tabs('guideline')}
+<div class="crumb">${crumb}</div>
+<div class="cols">
+<nav class="left" aria-label="Guideline versions">
+${left}
+</nav>
+<main>
+${middle}
+</main>
+</div>`)
+  }
+
+  /** The two tabs, the picked one marked. */
+  private static tabs(on: 'jobs' | 'guideline'): string {
+    const tab = (which: 'jobs' | 'guideline', href: string, label: string) =>
+      `<a class="tab${which === on ? ' on' : ''}" href="${ReviewPage.escape(href)}"${which === on ? ' aria-current="page"' : ''}>${label}</a>`
+    return `<nav class="tabs" aria-label="Tabs">${tab('jobs', ReviewRoute.PATH, ReviewPage.TAB_JOBS)}${tab('guideline', ReviewRoute.guidelineAddress(), ReviewPage.TAB_GUIDELINE)}</nav>`
+  }
+
+  /** A version's date and the job whose review led to it, as far as its front matter says them. */
+  private static sourceOf(version: GuidelineVersion): string {
+    const parts = [version.date ?? 'no date']
+    if (version.from_job !== null) parts.push(`from the review of job ${version.from_job}`)
+    return parts.join(' · ')
   }
 
   /**
@@ -570,10 +628,18 @@ export class ReviewRoute {
     return `${ReviewRoute.PATH}?${query}`
   }
 
+  /** The Guideline tab's address, on the version numbered `version` when one is given. */
+  static guidelineAddress(version?: number): string {
+    const query = new URLSearchParams({ tab: 'guideline' })
+    if (version !== undefined) query.set('version', String(version))
+    return `${ReviewRoute.PATH}?${query}`
+  }
+
   /** `GET /review` for a signed-in owner. */
   private async show(req: IncomingMessage, res: ServerResponse, page: ReviewPage): Promise<void> {
-    const projects = await this.read()
     const query = new URL(req.url ?? ReviewRoute.PATH, 'http://127.0.0.1').searchParams
+    if (query.get('tab') === 'guideline') { this.showGuideline(res, page, query.get('version'), await this.records.guidelineReader()); return }
+    const projects = await this.read()
     const wantedProject = query.get('project'), wantedJob = query.get('job'), wantedStep = query.get('step'), outside = query.get('outside') === '1'
     if (projects.length === 0) { ReviewRoute.sendPage(res, 200, page.notice(ReviewPage.NO_PROJECT), page); return }
     let project: ProjectJobs | undefined
@@ -588,6 +654,14 @@ export class ReviewRoute {
     if (job === undefined || step === undefined) throw new ReviewRefusal(404, 'That step is not in this job')
     const detail = (await this.records.stepReader()).read(project.project, step)
     ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside, step, detail }), page)
+  }
+
+  /** The Guideline tab, on the version asked for, else on the current one. */
+  private showGuideline(res: ServerResponse, page: ReviewPage, wanted: string | null, reader: { read(): GuidelineRead }): void {
+    const read = reader.read()
+    const picked = wanted === null ? read.current ?? undefined : read.versions.find(each => String(each.version) === wanted)
+    if (wanted !== null && picked === undefined) throw new ReviewRefusal(404, 'That guideline version does not exist')
+    ReviewRoute.sendPage(res, 200, page.guideline(read, picked), page)
   }
 
   /** `POST /review/login`: the token comes in the form's body, never in the address. */

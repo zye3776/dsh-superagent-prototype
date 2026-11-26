@@ -134,21 +134,32 @@ export interface RecordsReader { read(project: string): ReadJobLog }
 export interface JobsSource { read(projects: readonly string[]): ProjectJobs[] }
 /** Reads one step's detail, for a step of a job of `project` as `JobsSource` gave it. It skips what it cannot read and never throws. */
 export interface StepSource { read(project: string, step: TimelineStep): StepDetail }
-/** Gives the masker of one project and the three readers. Each rejects with `RecordsRefusal(503)` when there is none. */
+/** One version of the super agent's decision guideline, as the factory's `GuidelineReader` reads it from `guideline/v<N>.md` in the factory repository. */
+export interface GuidelineVersion { version: number; date: string | null; from_job: string | null; from_version: number | null; text: string }
+/**
+ * The guideline's versions, newest first, and the current one (the highest number). With none, `reason` says why: there is no version yet, or the factory
+ * repository was not found (`folder` is then null).
+ */
+export interface GuidelineRead { folder: string | null; versions: GuidelineVersion[]; current: GuidelineVersion | null; reason: string | null }
+/** Reads the guideline's versions. It never throws. */
+export interface GuidelineSource { read(): GuidelineRead }
+/** Gives the masker of one project and the four readers. Each rejects with `RecordsRefusal(503)` when there is none. */
 export interface RecordsSource {
   maskerFor(project: string): Promise<RecordsMasker>; reader(): Promise<RecordsReader>; jobsReader(): Promise<JobsSource>; stepReader(): Promise<StepSource>
+  guidelineReader(): Promise<GuidelineSource>
 }
 /**
  * What the factory's built job log file exports: `JobLogMask.forProject(project)` gives the masker of that project, `new JobLogReader()` the reader of
- * one project's lines, `new JobsReader()` the reader of the projects' jobs, and `new StepDetailReader()` the reader of one step's detail.
+ * one project's lines, `new JobsReader()` the reader of the projects' jobs, `new StepDetailReader()` the reader of one step's detail, and
+ * `new GuidelineReader()` the reader of the decision guideline's versions, which finds the factory repository itself.
  */
-interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown; JobsReader?: unknown; StepDetailReader?: unknown }
+interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown; JobsReader?: unknown; StepDetailReader?: unknown; GuidelineReader?: unknown }
 
 /**
  * The factory's job log code, loaded from its built file `lib/dist/jobLog.js`.
  * The file is imported on first use, not at start, so the plugin starts without it; a masker is built once for each project and each reader once.
  * Any failure is a 503: no path given, a path that is not absolute, a file that does not load, a file without `JobLogMask.forProject`, `JobLogReader`,
- * `JobsReader` or `StepDetailReader` (each checked only when it is needed), or a masker or reader that cannot be built.
+ * `JobsReader`, `StepDetailReader` or `GuidelineReader` (each checked only when it is needed), or a masker or reader that cannot be built.
  * Like the mask file of the decisions (`FactoryMaskModule`), Node keeps the file once it has loaded it, so a rebuilt file takes effect only after DSH restarts.
  * The refusal says which step failed and never repeats the error's own text, which could quote what was to be masked.
  */
@@ -157,6 +168,7 @@ export class FactoryRecordsModule implements RecordsSource {
   private kept: RecordsReader | undefined
   private keptJobs: JobsSource | undefined
   private keptSteps: StepSource | undefined
+  private keptGuideline: GuidelineSource | undefined
   readonly path: string | undefined
   constructor(path?: string) { this.path = path }
   async maskerFor(project: string): Promise<RecordsMasker> {
@@ -186,8 +198,12 @@ export class FactoryRecordsModule implements RecordsSource {
     this.keptSteps ??= await this.build('StepDetailReader', 'step reader')
     return this.keptSteps
   }
+  async guidelineReader(): Promise<GuidelineSource> {
+    this.keptGuideline ??= await this.build('GuidelineReader', 'guideline reader')
+    return this.keptGuideline
+  }
   /** Builds the reader class the module exports as `name`, with no arguments; every reader has one method, `read`. */
-  private async build<Reader extends { read(...args: never[]): unknown }>(name: 'JobLogReader' | 'JobsReader' | 'StepDetailReader', what: string): Promise<Reader> {
+  private async build<Reader extends { read(...args: never[]): unknown }>(name: 'JobLogReader' | 'JobsReader' | 'StepDetailReader' | 'GuidelineReader', what: string): Promise<Reader> {
     const Class = (await this.load())[name]
     if (typeof Class !== 'function') throw new RecordsRefusal(503, `The configured recordsModule does not export ${name}, so no record is read`)
     let reader: unknown

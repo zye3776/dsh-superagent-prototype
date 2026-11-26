@@ -1,5 +1,5 @@
 /** The factory's review page, served by a real HTTP server on loopback, reading and writing a temporary project through a stand-in records module. */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -8,7 +8,7 @@ import { Readable } from 'node:stream'
 import { JSDOM } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
-import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
+import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute } from '../src/factory/review.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
@@ -943,6 +943,71 @@ describe('comments on a job and on any step', () => {
   })
 })
 
+describe('the Guideline tab', () => {
+  const v = (version: number, fields: Partial<GuidelineVersion> = {}): GuidelineVersion =>
+    ({ version, date: `2026-11-2${version}`, from_job: version === 1 ? null : `job-${version}`, from_version: version === 1 ? null : version - 1, text: `Text of v${version}.`, ...fields })
+  /** The stand-in records module with a guideline reader that gives `read`. */
+  class GuidelineRecords extends FactoryRecordsModule {
+    constructor(private readonly given: GuidelineRead) { super(recordsModule(root)) }
+    override async guidelineReader(): Promise<GuidelineSource> { return { read: () => this.given } }
+  }
+  const twoVersions = (): GuidelineRead => {
+    const versions = [v(2, { text: 'Ask me before <b>any</b> push.\nKeep it small.' }), v(1)]
+    return { folder: '/factory/guideline', versions, current: versions[0]!, reason: null }
+  }
+  const versionsOf = (page: Document) => [...page.querySelectorAll('nav a.version')].map(link => [...link.querySelectorAll('span')].map(part => part.textContent))
+
+  it('lists the versions newest first with their date and source job, and opens the current one\'s text, escaped', async () => {
+    await serve([project], new GuidelineRecords(twoVersions()))
+    const answer = await call('GET', ReviewRoute.guidelineAddress(), { cookie: await signIn() })
+    expect(answer.status).toBe(200)
+    const page = dom(answer.text)
+    expect(versionsOf(page)).toEqual([['v2 · current', '2026-11-22 · from the review of job job-2'], ['v1', '2026-11-21']])
+    expect(page.querySelector('nav a.version.on')!.getAttribute('href')).toBe(ReviewRoute.guidelineAddress(2))
+    expect(page.querySelector('main h2')!.textContent).toBe('Guideline v2 · current')
+    expect(page.querySelector('.guideline-text')!.textContent).toBe('Ask me before <b>any</b> push.\nKeep it small.')
+    expect(page.querySelector('.guideline-text b')).toBeNull()
+    expect(page.querySelector('nav.tabs a.on')!.textContent).toBe(ReviewPage.TAB_GUIDELINE)
+  })
+
+  it('opens an older version with its own text, date and job, and refuses a version that does not exist with 404', async () => {
+    await serve([project], new GuidelineRecords(twoVersions()))
+    const cookie = await signIn()
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(1), { cookie })).text)
+    expect([page.querySelector('main h2')!.textContent, page.querySelector('main .meta')!.textContent, page.querySelector('.guideline-text')!.textContent])
+      .toEqual(['Guideline v1', '2026-11-21', 'Text of v1.'])
+    for (const wanted of ['9', 'two', '']) {
+      const answer = await call('GET', `${ReviewRoute.PATH}?tab=guideline&version=${wanted}`, { cookie })
+      expect([answer.status, answer.text.includes('That guideline version does not exist')]).toEqual([404, true])
+    }
+  })
+
+  it('says there is no guideline yet when the folder holds no version', async () => {
+    await serve([project], new GuidelineRecords({ folder: '/factory/guideline', versions: [], current: null, reason: 'No guideline yet. The first review talk writes version 1.' }))
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie: await signIn() })).text)
+    expect(page.querySelector('main')!.textContent!.trim()).toBe(ReviewPage.NO_GUIDELINE)
+    expect(page.querySelectorAll('nav a.version').length).toBe(0)
+  })
+
+  it('says the guideline folder was not found, with the reader\'s reason, when the factory repository is not known', async () => {
+    await serve([project], new GuidelineRecords({ folder: null, versions: [], current: null, reason: 'No zees-software-factory folder entry.' }))
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie: await signIn() })).text)
+    expect([...page.querySelectorAll('main p')].map(line => line.textContent)).toEqual([ReviewPage.NO_GUIDELINE_FOLDER, 'No zees-software-factory folder entry.'])
+  })
+
+  it('is reached from the Jobs tab, has no control, keeps the three routes, and needs the cookie', async () => {
+    const registered = await serve([project], new GuidelineRecords(twoVersions()))
+    expect(registered.map(route => route.path)).toEqual(['/review', '/review/login', '/review/comment'])
+    expect((await call('GET', ReviewRoute.guidelineAddress())).status).toBe(401)
+    const cookie = await signIn()
+    const jobs = dom((await call('GET', ReviewRoute.PATH, { cookie })).text)
+    expect([...jobs.querySelectorAll('nav.tabs a')].map(link => [link.textContent, link.getAttribute('href'), link.classList.contains('on')]))
+      .toEqual([['Jobs', '/review', true], ['Guideline', ReviewRoute.guidelineAddress(), false]])
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
+    expect([...page.querySelectorAll('form, button, select, input, textarea')].length).toBe(0)
+  })
+})
+
 /** The factory's folder, when the environment says where it is: its built job log file and its review sample are read from it. */
 const FACTORY = process.env.ZEES_FACTORY_DIR?.trim() ?? ''
 const realTitle = FACTORY === '' ? 'the factory\'s real built JobsReader (SKIPPED: set ZEES_FACTORY_DIR to the factory\'s folder to run it)' : 'the factory\'s real built JobsReader'
@@ -954,10 +1019,15 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
    * The plugin itself builds the reader with no arguments (`FactoryRecordsModule.stepReader`), which the last test checks.
    */
   class SampleRecords extends FactoryRecordsModule {
-    constructor(private readonly claudeHome: string) { super(built) }
+    constructor(private readonly claudeHome: string, private readonly factoryDir = join(root, 'factory')) { super(built) }
     override async stepReader(): Promise<StepSource> {
       const { StepDetailReader } = await import(built) as { StepDetailReader: new (options: { claudeHome: string }) => StepSource }
       return new StepDetailReader({ claudeHome: this.claudeHome })
+    }
+    /** The real guideline reader, pointed at a throwaway factory folder that holds a copy of the sample's guideline (`lib/fixtures/guideline`). */
+    override async guidelineReader(): Promise<GuidelineSource> {
+      const { GuidelineReader } = await import(built) as { GuidelineReader: new (options: { factoryDir: string }) => GuidelineSource }
+      return new GuidelineReader({ factoryDir: this.factoryDir })
     }
   }
   /**
@@ -976,6 +1046,7 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     const transcripts = join(claudeHome, 'projects', '-sample-worktree')
     mkdirSync(transcripts, { recursive: true })
     for (const [session, written] of Object.entries(sample.transcripts)) writeFileSync(join(transcripts, `${session}.jsonl`), written.map(line => JSON.stringify(line)).join('\n') + '\n')
+    cpSync(join(FACTORY, 'lib', 'fixtures', 'guideline'), join(root, 'factory', 'guideline'), { recursive: true })
     expect(existsSync(built), `${built} is missing: run the factory's build`).toBe(true)
     await serve([a, b], new SampleRecords(claudeHome))
     return { a, b, cookie: await signIn() }
@@ -1064,5 +1135,17 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect([html.includes(secret), html.includes('Too wide.')]).toEqual([false, false])
     const entries = [...dom(html).querySelectorAll('ul.comments li')].map(entry => [entry.querySelector('strong')!.textContent, entry.querySelector('.mine')!.textContent])
     expect(entries).toEqual([[ReviewPage.WHOLE_JOB, 'You: Good pace.'], ['Message received', 'You: Ask me next time.'], ['Session started', `You: ${written[2]!.comment}`]])
+  })
+
+  it('lists the sample guideline\'s versions and opens version 2 with its text, date and the job it came from', async () => {
+    const { cookie } = await serveSample()
+    const list = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
+    expect([...list.querySelectorAll('nav a.version')].map(link => [...link.querySelectorAll('span')].map(part => part.textContent)))
+      .toEqual([['v2 · current', '2026-11-24 · from the review of job job-a1'], ['v1', '2026-11-20']])
+    const page = dom((await call('GET', ReviewRoute.guidelineAddress(2), { cookie })).text)
+    expect([page.querySelector('main h2')!.textContent, page.querySelector('main .meta')!.textContent]).toEqual(['Guideline v2 · current', '2026-11-24 · from the review of job job-a1'])
+    expect(page.querySelector('.guideline-text')!.textContent).toBe(readFileSync(join(FACTORY, 'lib', 'fixtures', 'guideline', 'v2.md'), 'utf8').split('---\n')[2])
+    // The plugin's own reader comes from the same built file and is built with no location: it finds the factory repository itself.
+    expect(typeof (await new FactoryRecordsModule(built).guidelineReader()).read).toBe('function')
   })
 })

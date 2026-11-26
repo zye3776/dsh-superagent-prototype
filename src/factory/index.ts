@@ -2,6 +2,8 @@
  * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
  * Each run of the plugin is one job in the job log: its start, each permission answer, each message into or out of the main session, and its stop
  * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`.
+ * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
+ * `job_start` names the version (`guideline.ts`).
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -9,10 +11,12 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-permission-presets'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-workspace'
 import s from '@deepseek-ai/schemastery'
 import { AssessRoute } from './assess.ts'
 import { DecisionWriter, FactoryMaskModule } from './decisions.ts'
+import { GuidelineSection } from './guideline.ts'
 import { FactoryJob } from './job.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
@@ -22,7 +26,7 @@ import { SharedTokenFile } from './token.ts'
 import { ModelJudge } from './verdict.ts'
 
 export const name = 'dsh-superagent-factory'
-export const inject = ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']
+export const inject = ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets', 'systemPrompt']
 /** Plugin configuration of the dsh-superagent-factory entry. */
 export const Config = s.object({
   projects: s.array(s.string().pattern(/^\//)).default([])
@@ -45,7 +49,10 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   try { folder = process.cwd() } catch { /* told below */ }
   if (folder === undefined) warn('No job_start line was written: the folder DSH was started in is gone')
   const records = new FactoryRecordsModule(config.recordsModule)
-  const job = new FactoryJob(new JobRecorder(records, config.projects ?? []), folder, warn)
+  // Before any session exists, so every agent DSH creates gets the guideline, judges included.
+  const guideline = new GuidelineSection(records, warn)
+  guideline.install(ctx)
+  const job = new FactoryJob(new JobRecorder(records, config.projects ?? []), folder, warn, undefined, { versionOf: id => guideline.jobVersion(id) })
   new MainSessionWatch(job).install(ctx)
   ctx.effect(() => () => job.stop(), 'factory: job stop')
   const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
@@ -59,7 +66,8 @@ export function apply(ctx: Context, config: FactoryConfig): void {
 }
 export { AssessRoute, StubJudge, TempFactsShape, type AnswerLog, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
-export { FactoryJob, type JobAnswer } from './job.ts'
+export { GuidelineSection, type GuidelineAgent } from './guideline.ts'
+export { FactoryJob, type JobAnswer, type JobGuideline } from './job.ts'
 export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export {

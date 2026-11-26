@@ -40,6 +40,8 @@
     # folder). Its job_start line is added to that project's actions.jsonl when something first happens (you write in a session,
     # or a request is answered) or when DSH stops, then one line for each answer and each message into or out of the session you
     # write in first, and job_stop when DSH stops. Started anywhere else, DSH logs one warning and records only the answers.
+    # Every session, judges included, starts with the current version of the owner's decision guideline (guideline/v<N>.md in
+    # the factory's folder) in its system prompt and keeps it until DSH stops; job_start names that version (guideline_version).
     # The review page asks once for the token in the token file above, in a sign-in form.
     recordsModule: <absolute path of lib/dist/jobLog.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/jobLog.js>
     projects:

@@ -266,17 +266,18 @@ export class JobRecorder {
   }
   /**
    * Begins a job in `folder`, the folder DSH was started in: one `job_start` line with a new `step_id`. The line takes `job.jobId` when given, else a
-   * new `job_id`, and `job.dshSessionId` when given.
+   * new `job_id`, and `job.dshSessionId` and `job.guidelineVersion` when given.
    * Returns the line as it was handed to the mask, or `undefined` when none was written; `warn` is then called once with the reason. It never throws.
    */
-  async start(folder: string, warn: (message: string) => void, job: { jobId?: string; dshSessionId?: string } = {}): Promise<JobLogLine | undefined> {
+  async start(folder: string, warn: (message: string) => void, job: { jobId?: string; dshSessionId?: string; guidelineVersion?: string } = {}): Promise<JobLogLine | undefined> {
     let reason: string
     try {
       const project = this.listed(folder)
       if (project === undefined) reason = `the folder DSH was started in (${folder}) is not a listed project`
       else if (!FactoryRecordFile.hasFolder(project)) reason = `${project} has no ${FactoryRecordFile.FOLDER} folder yet`
       else {
-        const line = this.lineOf({ kind: 'job_start', project, jobId: job.jobId ?? this.newId(), summary: JobRecorder.START_SUMMARY, dshSessionId: job.dshSessionId })
+        const line = this.lineOf({ kind: 'job_start', project, jobId: job.jobId ?? this.newId(), summary: JobRecorder.START_SUMMARY,
+          dshSessionId: job.dshSessionId, guidelineVersion: job.guidelineVersion })
         await this.write(line)
         return line
       }

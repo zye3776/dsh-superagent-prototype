@@ -247,7 +247,7 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
 })
 
 it('is a plugin that needs the web server and DSH\'s Session services, and mounts the route for the configured projects', () => {
-  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']])
+  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets', 'systemPrompt']])
   expect(plugin.Config({ guardModule: '/factory/lib/dist/judgeGuard.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, guardModule: '/factory/lib/dist/judgeGuard.js' })
   expect(() => plugin.Config({ guardModule: 'relative/judgeGuard.js' })).toThrow()
   expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath() })

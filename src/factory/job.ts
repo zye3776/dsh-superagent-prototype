@@ -11,12 +11,18 @@ import { RecordsRefusal, type JobLogKind, type JobRecorder, type JobStep } from 
 
 /** What `/assess` tells the job about one decision it wrote. `seconds` is the time the judge took. */
 export interface JobAnswer { project: string; requestId: string; decisionId: string; decision: string; tokens?: number; seconds?: number }
+/**
+ * Says which decision guideline version is in force for `job_start`: the version the session `sessionId` runs under, or, without an id, the current
+ * one, written as `v<N>`; `undefined` when there is none. It never rejects.
+ */
+export interface JobGuideline { versionOf(sessionId?: string): Promise<string | undefined> }
 
 /**
  * Represents one job and writes its lines to the job log, in the order they are asked for, each through one promise chain.
  * - `job_start` is written once, at the first call of any method (`stop` too), so it is always the job's first line. It goes to the folder DSH was
  *   started in when that is a listed project, and carries the main session's id when `noteMainSession` came first. DSH opens its sessions only after
- *   it starts, so the id cannot be known when the plugin starts.
+ *   it starts, so the id cannot be known when the plugin starts. With a `guideline`, it also carries the decision guideline version that session
+ *   runs under, or the current one when no main session was noted.
  * - `job_start`, `job_stop` and the two message kinds go to that same project (the "home" project); the other kinds go to the project they concern.
  *   Without a home project the home lines are left out: `JobRecorder.start` has already said why, once.
  * - Nothing is written after `stop`. No method ever rejects: a line that is refused is told to `warn`, and each message is told only once.
@@ -28,14 +34,16 @@ export class FactoryJob {
   private readonly recorder: JobRecorder
   private readonly folder: string | undefined
   private readonly warn: (message: string) => void
+  private readonly guideline: JobGuideline | undefined
   private chain: Promise<void> = Promise.resolve()
   private started = false
   private stopped = false
   private home: string | undefined
   private mainSession: string | undefined
   private readonly warned = new Set<string>()
-  constructor(recorder: JobRecorder, folder: string | undefined, warn: (message: string) => void, newId: () => string = randomUUID) {
+  constructor(recorder: JobRecorder, folder: string | undefined, warn: (message: string) => void, newId: () => string = randomUUID, guideline?: JobGuideline) {
     this.recorder = recorder
+    this.guideline = guideline
     this.folder = folder
     this.warn = warn
     this.id = newId()
@@ -104,7 +112,9 @@ export class FactoryJob {
     if (this.started) return
     this.started = true
     if (this.folder === undefined) return
-    const line = await this.recorder.start(this.folder, message => { this.once(message) }, { jobId: this.id, dshSessionId: this.mainSession })
+    let guidelineVersion: string | undefined
+    try { guidelineVersion = await this.guideline?.versionOf(this.mainSession) } catch { /* the line is written without it */ }
+    const line = await this.recorder.start(this.folder, message => { this.once(message) }, { jobId: this.id, dshSessionId: this.mainSession, guidelineVersion })
     this.home = line?.project
   }
   private async recorded(step: JobStep): Promise<void> {

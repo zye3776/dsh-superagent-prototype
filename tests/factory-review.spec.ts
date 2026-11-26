@@ -676,6 +676,18 @@ it('shows an answer of the fixed checks in the job\'s timeline as automatic, wit
     .toEqual([['Job 1', expect.stringMatching(/ · ended without a stop$/), '3 steps · no comments yet'], ['Outside a job', '1 automatic answer']])
 })
 
+it('shows the guideline version a job ran under on its entry in the job list, in the crumb and on its start row', () => {
+  const started = action({ guideline_version: 'v2' }), other = action({ job_id: 'job-2', step_id: 'step-2', ts: '2026-11-25T08:00:00.000Z' })
+  const job: RecordedJob = { project, job_id: 'job-1', number: 2, started: started.ts, stopped: null, last: started.ts, reviews: [], guideline_version: 'v2',
+    steps: [{ automatic: false, ts: started.ts, line: started }] }
+  const before: RecordedJob = { project, job_id: 'job-2', number: 1, started: other.ts, stopped: null, last: other.ts, reviews: [], steps: [{ automatic: false, ts: other.ts, line: other }] }
+  const entry: ProjectJobs = { project, jobs: [job, before], outside: [] }
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false }))
+  expect([...page.querySelectorAll('nav a.job')].map(link => link.querySelector('.pill')?.textContent ?? null)).toEqual(['v2', null])
+  expect(page.querySelector('.crumb .pill')!.textContent).toBe('guideline v2')
+  expect(page.querySelector('ol li .pill')!.textContent).toBe('guideline v2')
+})
+
 it('lists the answers outside a job on their own, with no comment field', () => {
   const entry: ProjectJobs = { project, jobs: [], outside: [automatic(), automatic({ request_id: 'req-2', answer: 'refuse' })] }
   const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, outside: true }))

@@ -1,6 +1,7 @@
 /**
  * A stand-in for the factory's built job log file (`lib/dist/jobLog.js`), with the same exports, for the tests of the job log and of the review page.
  * Its `JobsReader` only groups the job log into jobs: it reads no automatic answer, which the review page's tests check with the real built file.
+ * Its `GuidelineReader` reads `guideline/v<N>.md` in the folder the module was written to.
  * Its `StepDetailReader` follows no pointer: it gives the detail a test wrote for the step's id in the project's `.factory/step-details.json`, and a detail
  * with every part `null` (not recorded) for any other step.
  * Its mask refuses an unknown kind or field, replaces one planted value in every text field and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
@@ -13,7 +14,7 @@ export const PLANTED = 'planted-secret-value'
 export const REDACTED = '[redacted-secret]'
 
 /** The source of the stand-in module. */
-export const FAKE_RECORDS = `import { readFileSync } from 'node:fs'
+export const FAKE_RECORDS = `import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 const clean = text => text.replaceAll(${JSON.stringify(PLANTED)}, ${JSON.stringify(REDACTED)})
 const KINDS = ['job_start', 'job_stop', 'permission_answer', 'fork_answer', 'message_in', 'message_out', 'session_start', 'session_steer']
@@ -65,6 +66,17 @@ export class JobsReader {
       jobs.sort((a, b) => byTs({ ts: a.started }, { ts: b.started })).forEach((job, index) => { job.number = index + 1 })
       return { project, jobs: jobs.reverse(), outside: [] }
     })
+  }
+}
+// Its guideline reader takes the folder the module sits in for the factory's folder: \`guideline/v<N>.md\` there, each file's whole text as the version's text.
+export class GuidelineReader {
+  read() {
+    const folder = new URL('guideline/', import.meta.url)
+    let names = []
+    try { names = readdirSync(folder) } catch {}
+    const versions = names.flatMap(name => /^v([1-9][0-9]*)\\.md$/.test(name) ? [{ version: Number(name.slice(1, -3)), date: null, from_job: null, from_version: null,
+      text: readFileSync(new URL(name, folder), 'utf8') }] : []).sort((a, b) => b.version - a.version)
+    return { folder: folder.pathname, versions, current: versions[0] ?? null, reason: versions.length ? null : 'No guideline yet.' }
   }
 }
 export class StepDetailReader {

@@ -1,4 +1,6 @@
 /** The job log writer and the comment writer on a temporary project: every line goes through the records module first, and without a working one nothing is written. */
+import { Context } from '@deepseek-ai/cordis'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -234,13 +236,26 @@ it('is wired into the plugin: a run writes job_start and job_stop to the folder 
   const cwd = vi.spyOn(process, 'cwd')
   try {
     cwd.mockReturnValue(project)
+    // The stand-in module takes its own folder for the factory's: the guideline's current version there is 2.
+    mkdirSync(join(root, 'guideline'))
+    writeFileSync(join(root, 'guideline', 'v1.md'), 'Version one.')
+    writeFileSync(join(root, 'guideline', 'v2.md'), 'Version two.')
     plugin.apply(ctx as never, plugin.Config({ projects: [project], recordsModule: recordsModule(root) }))
     expect(on).toHaveBeenCalledWith('session/event', expect.any(Function))
+    expect(on).toHaveBeenCalledWith('agent/created', expect.any(Function))
+    // A session DSH creates through the plugin's own listener starts with the guideline's current version.
+    const created = on.mock.calls.find(([name]) => name === 'agent/created')![1] as (payload: { agent: unknown }) => Promise<unknown>
+    const session = new Context()
+    try {
+      await session.plugin(SystemPrompt)
+      await created({ agent: { id: 'main-1', ctx: session } })
+      expect((await session.systemPrompt.assemble()).sections.find(section => section.name === plugin.GuidelineSection.NAME)?.text).toContain('Version two.')
+    } finally { await session.fiber.dispose() }
     // Nothing is written until something happens or the plugin stops.
     expect(existsSync(file('actions.jsonl'))).toBe(false)
     await stop()
     const [start, end] = lines('actions.jsonl').map(line => JSON.parse(line) as JobLogLine)
-    expect(start).toMatchObject({ project, kind: 'job_start', job_id: expect.stringMatching(/^[0-9a-f-]{36}$/) as string })
+    expect(start).toMatchObject({ project, kind: 'job_start', job_id: expect.stringMatching(/^[0-9a-f-]{36}$/) as string, guideline_version: 'v2' })
     expect(end).toMatchObject({ project, kind: 'job_stop', job_id: start!.job_id })
     expect(warn).not.toHaveBeenCalled()
     // Started in a folder that is not listed: no line, one warning, and the plugin still starts and stops.
@@ -249,19 +264,20 @@ it('is wired into the plugin: a run writes job_start and job_stop to the folder 
     await stop()
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls[0]).toEqual(['dsh-superagent-factory: %s', expect.stringContaining('is not a listed project')])
-    // No records module: the same.
+    // No records module: the same, and sessions start without the decision guideline, which is read with it.
     cwd.mockReturnValue(project)
     plugin.apply(ctx as never, plugin.Config({ projects: [project] }))
     await stop()
-    expect(warn).toHaveBeenCalledTimes(2)
-    expect(warn.mock.calls[1]![1]).toContain('No recordsModule is configured')
+    expect(warn).toHaveBeenCalledTimes(3)
+    expect(warn.mock.calls[1]![1]).toMatch(/^Sessions start without a decision guideline: No recordsModule is configured/)
+    expect(warn.mock.calls[2]![1]).toContain('No recordsModule is configured')
     expect(lines('actions.jsonl')).toHaveLength(2)
     // The start folder was deleted, so asking for it throws: one warning, and the plugin still starts and stops.
     cwd.mockImplementation(() => { throw new Error('ENOENT: no such file or directory, uv_cwd') })
     expect(() => { plugin.apply(ctx as never, plugin.Config({ projects: [project], recordsModule: recordsModule(root) })) }).not.toThrow()
     await stop()
-    expect(warn).toHaveBeenCalledTimes(3)
-    expect(warn.mock.calls[2]).toEqual(['dsh-superagent-factory: %s', 'No job_start line was written: the folder DSH was started in is gone'])
+    expect(warn).toHaveBeenCalledTimes(4)
+    expect(warn.mock.calls[3]).toEqual(['dsh-superagent-factory: %s', 'No job_start line was written: the folder DSH was started in is gone'])
     expect(lines('actions.jsonl')).toHaveLength(2)
   } finally { cwd.mockRestore() }
 })

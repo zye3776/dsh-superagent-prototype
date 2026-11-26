@@ -231,7 +231,8 @@ it('is wired into the plugin: a run writes job_start and job_stop to the folder 
   // The cleanups the plugin leaves, run as DSH runs them when it stops the plugin.
   const cleanups: (() => unknown)[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: () => () => {} }, effect: (effect: () => () => unknown) => { cleanups.push(effect()) },
-    logger: { info: vi.fn(), warn }, on }
+    // No connection service: the review page's hold on DSH's sign-in is never handed one.
+    logger: { info: vi.fn(), warn }, on, inject: () => () => {} }
   const stop = async () => { for (const cleanup of cleanups.splice(0)) await cleanup() }
   const cwd = vi.spyOn(process, 'cwd')
   try {

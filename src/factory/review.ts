@@ -11,13 +11,15 @@
  * Claude Desktop on it (`talk.ts`). The talk's one tool posts a proposed guideline text back to `POST /review/proposal`, with the shared token; the page
  * shows the newest proposal per job as before → after on the Guideline tab (`diff.ts`) and saves nothing.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
- * everything but the sign-in form needs the cookie the owner gets by typing the shared token (`token.ts`) into that form once. The one address a program
- * posts to, the talk's proposal address, takes the shared token itself instead of the cookie, and no Origin, as `/assess` does.
+ * DSH's own connection service must let it in: the page has no sign-in of its own and uses the one DSH's chat window uses (`ReviewSignIn`), so an
+ * owner who opened DSH goes straight in from the "Review" link in DSH's sidebar. The one address a program posts to, the talk's proposal address,
+ * takes the shared token (`token.ts`) instead, and no Origin, as `/assess` does.
  * The page loads nothing from anywhere else and brings no colours of its own: its style names DSH's design tokens only.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { createHmac, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, isAbsolute, resolve } from 'node:path'
 import {
@@ -38,20 +40,16 @@ export interface ReviewTokenSource { read(): string | undefined }
 export class ReviewRefusal extends Error { constructor(readonly status: 400 | 401 | 403 | 404 | 405 | 409 | 413 | 503, message: string) { super(message) } }
 
 /**
- * Decides who may use the review page.
- * `admit` runs on every request, the sign-in included, before anything is read: the Host header must name this web server on loopback, the caller's address
- * must be loopback, and an Origin header must be the page's own. A request that changes something (anything but GET) must carry that Origin, which a
- * browser adds to every such request; so another site's page cannot post here, and neither can a program that forgot who it is.
- * The owner proves the shared token once, in the sign-in form. The cookie they get back holds a keyed hash (HMAC-SHA256) of the token and never the token:
- * it is checked against the token file on every request, with no stored state, so it survives a DSH restart and stops working when the token file is replaced.
+ * The page's own checks, which run before DSH's sign-in is asked.
+ * `admit` runs on every browser request before anything is read: the Host header must name this web server on loopback, the caller's address must be
+ * loopback, and an Origin header must be the page's own. A request that changes something (anything but GET) must carry that Origin, which a browser
+ * adds to every such request; so another site's page cannot post here, and neither can a program that forgot who it is.
+ * `admitTool` lets in the one program that posts here, the review talk's propose tool, with the shared token instead of a browser's sign-in.
  * The token is written to no log line, page, URL or error message.
  */
 export class ReviewAccess {
-  static readonly COOKIE = 'factory_review'
   /** The addresses a caller on this machine connects from: IPv4, IPv6, and IPv4 as an IPv6 socket reports it. */
   static readonly LOOPBACK_ADDRESSES: ReadonlySet<string> = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
-  /** What the token signs to make the cookie's value. Changing it signs every browser out. */
-  private static readonly SIGNED_TEXT = 'zees-factory review page cookie v1'
   constructor(private readonly tokens: ReviewTokenSource = new SharedTokenFile()) {}
 
   /** Refuses with 403 a request that does not come from a page of this web server on this machine. Reads no body and no file. */
@@ -68,7 +66,7 @@ export class ReviewAccess {
   /**
    * Admits a program on this machine that sends the shared token, as `/assess` does, and returns the token to send back: the review talk's propose tool.
    * The Host header and the caller's address must be loopback, there must be no Origin (a browser always sends one with a POST, so no web page gets in),
-   * then this side's token file must be usable (503) and the caller's `x-factory-token` the same token (401). Reads no body.
+   * then this side's token file must be usable (503) and the caller's `x-factory-token` the same token (401). Reads no body. DSH's sign-in is not asked.
    */
   admitTool(req: IncomingMessage, port: number): string {
     const host = req.headers.host
@@ -81,36 +79,47 @@ export class ReviewAccess {
     if (typeof sent !== 'string' || sent === '' || !SharedTokenFile.same(sent, token)) throw new ReviewRefusal(401, 'The shared token is missing or wrong')
     return token
   }
+}
 
-  /** Whether the request carries the cookie that proves the shared token as the token file holds it now. With no usable token file nobody is signed in. */
-  signedIn(req: IncomingMessage): boolean {
-    const token = this.tokens.read()
-    if (token === undefined) return false
-    const sent = ReviewAccess.cookieOf(req)
-    return sent !== undefined && SharedTokenFile.same(sent, ReviewAccess.proofOf(token))
+/** The one call of DSH's connection service the page makes: `admit` applies DSH's Host and Origin checks and checks DSH's sign-in cookie. */
+export type ReviewConnection = Pick<HostConnectionHandle, 'admit'>
+
+/**
+ * The page's hold on DSH's own sign-in, the one DSH's chat window uses: the page has no sign-in step, token form or cookie of its own.
+ * DSH's connection service (`ctx.connection`) checks each browser request: its Host and Origin rules, and its signed `HttpOnly`, `SameSite=Strict`
+ * cookie, which DSH sets when the owner opens DSH and which the browser sends to every address of DSH's web server, `/review` included.
+ * The plugin hands the service over while DSH has it (`use`); without it every browser request is refused with 503, and there is no fallback.
+ */
+export class ReviewSignIn {
+  /** What a browser that is not signed in to DSH is told, and all it is told. */
+  static readonly SIGNED_OUT = 'Open dsh first, then use its Review link.'
+  /** What every browser request is told while DSH's connection service is not there. */
+  static readonly NO_SERVICE = 'The review page uses dsh\'s own sign-in, and dsh\'s connection service is not running or cannot answer, so the page answers nobody.'
+  private connection: ReviewConnection | undefined
+
+  /** Starts asking `connection` and returns the function that stops it, for when DSH takes the service away. */
+  use(connection: ReviewConnection): () => void {
+    this.connection = connection
+    return () => { if (this.connection === connection) this.connection = undefined }
   }
 
   /**
-   * Checks the token typed into the sign-in form and returns the `Set-Cookie` header that signs the browser in.
-   * Throws 503 when this side has no usable token file, and 401 when the typed token is empty or wrong.
+   * Refuses a browser request DSH does not let in: 401 when it is not signed in to DSH, 403 when DSH's Host or Origin rules refuse it, and 503 without
+   * the service or when the service itself cannot answer (it throws, or answers a status it does not name). Reads no body.
+   * A GET that DSH refuses as coming from another site (a link followed from elsewhere, which also carries no `SameSite=Strict` cookie) is shown the
+   * signed-out line too, so an owner who opens the page from outside DSH is told to go through DSH.
    */
-  signIn(typed: string): string {
-    const token = this.tokens.read()
-    if (token === undefined) throw new ReviewRefusal(503, 'The review page has no usable token file, so nobody can sign in')
-    if (typed === '' || !SharedTokenFile.same(typed, token)) throw new ReviewRefusal(401, 'The token is missing or wrong')
-    // Strict: the browser sends the cookie only with requests that start on this page's own site. HttpOnly: no script can read it.
-    return `${ReviewAccess.COOKIE}=${ReviewAccess.proofOf(token)}; Path=${ReviewRoute.PATH}; HttpOnly; SameSite=Strict`
-  }
-
-  /** The cookie's value for a token: a keyed hash of a fixed text, which says nothing about the token to anyone who does not hold it. */
-  private static proofOf(token: string): string { return createHmac('sha256', token).update(ReviewAccess.SIGNED_TEXT, 'utf8').digest('hex') }
-  /** The value of the page's cookie in the request, or `undefined`. */
-  private static cookieOf(req: IncomingMessage): string | undefined {
-    for (const part of (req.headers.cookie ?? '').split(';')) {
-      const at = part.indexOf('=')
-      if (at > 0 && part.slice(0, at).trim() === ReviewAccess.COOKIE) return part.slice(at + 1).trim()
-    }
-    return undefined
+  check(req: IncomingMessage): void {
+    const connection = this.connection
+    if (connection === undefined) throw new ReviewRefusal(503, ReviewSignIn.NO_SERVICE)
+    let admission: ReturnType<ReviewConnection['admit']>
+    try { admission = connection.admit(req) } catch { throw new ReviewRefusal(503, ReviewSignIn.NO_SERVICE) }
+    if ('peer' in admission) return
+    // DSH 0.2.1 rejects with 401 or 403; a later DSH may also answer 503. Anything else is taken as "cannot answer".
+    const status: number = admission.rejection
+    if (status === 401 || (status === 403 && req.method === 'GET')) throw new ReviewRefusal(401, ReviewSignIn.SIGNED_OUT)
+    if (status === 403) throw new ReviewRefusal(403, 'Requests from another site are refused')
+    throw new ReviewRefusal(503, ReviewSignIn.NO_SERVICE)
   }
 }
 
@@ -372,15 +381,8 @@ export class ReviewPage {
     return `default-src 'none'; style-src 'nonce-${this.nonce}'; script-src 'nonce-${this.nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`
   }
 
-  /** The sign-in form: one token field. `message` says why the last try was refused, when there was one. */
-  signIn(message?: string): string {
-    return this.document(`${message === undefined ? '' : `<p role="alert">${ReviewPage.escape(message)}</p>`}
-<form method="post" action="${ReviewRoute.LOGIN_PATH}">
-<label for="token">Token</label>
-<input id="token" name="token" type="password" autocomplete="off" required autofocus>
-<button type="submit">Sign in</button>
-</form>`)
-  }
+  /** The page of a browser not signed in to DSH: the one line `ReviewSignIn.SIGNED_OUT`, and nothing else, not even the title line. */
+  signedOut(): string { return this.document(`<p>${ReviewPage.escape(ReviewSignIn.SIGNED_OUT)}</p>`, false, false) }
 
   /** A page that says one thing, such as that no job is recorded yet. */
   notice(text: string): string { return this.document(`<p>${ReviewPage.escape(text)}</p>`) }
@@ -711,8 +713,8 @@ ${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocal
   private static clock(ts: string): string { return new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }) }
   private static count(n: number, what: string): string { return `${n} ${what}${n === 1 ? '' : 's'}` }
 
-  /** The whole document. `withScript` adds the page's one script, which a sign-in form or a plain notice does not need. */
-  private document(body: string, withScript = false): string {
+  /** The whole document. `withScript` adds the page's one script, which a plain notice does not need; `heading` the page's title line. */
+  private document(body: string, withScript = false, heading = true): string {
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -723,8 +725,7 @@ ${ReviewPage.STYLE}
 </style>
 </head>
 <body>
-<h1>Review</h1>
-${body}
+${heading ? '<h1>Review</h1>\n' : ''}${body}
 ${withScript ? `<script nonce="${this.nonce}">${ReviewPage.script()}</script>\n` : ''}</body>
 </html>
 `
@@ -743,39 +744,40 @@ interface AnonymousRoute {
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   auth: 'anonymous'
 }
-/** Which of the page's five addresses a request is for. */
-type ReviewTarget = 'page' | 'login' | 'comment' | 'talk' | 'proposal'
+/** Which of the page's four addresses a request is for. */
+type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal'
 
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
  * `GET /review` shows the first listed project and its newest job; `?project=<path>` picks a project, `&job=<id>` one of its jobs (a `job` alone is looked
  * for in every project), `&step=<id>` one step of that job, whose detail fills the right panel, and `&outside=1` its answers outside a job. A project,
- * job or step that is not there is 404. Without the cookie it answers 401 with the sign-in form and no record content.
- * `POST /review/login` takes the token from the form, and answers 303 to `/review` with the cookie set, 401 for a wrong or empty token, 503 with no token file.
+ * job or step that is not there is 404. A browser DSH has not signed in gets 401 and the one line `ReviewSignIn.SIGNED_OUT`, and no record content.
  * `POST /review/comment` takes `{ project, job_id, step_id?, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`, on one
  * step when `step_id` is given, else on the whole job; a changed comment is one more line. It answers 400 for an empty comment, a body that is not that
  * object, an automatic answer's step or the job's start or stop row as `step_id`, 404 for a job no listed project holds or a step not in that job, 413 for a
- * body over 64 KiB, and 401 without the cookie. It is the page's only address that writes a record, and it writes nothing but a comment line.
+ * body over 64 KiB, and 401 without DSH's sign-in. It is the page's only address that writes a record, and it writes nothing but a comment line.
  * `POST /review/talk` takes `{ project, job_id, fresh? }` from the page's button and prepares the job's review talk folder (`ReviewTalks`, outside every
  * repository and every project): 200 with the `claude://` link and the notice, or, for a job whose talk was started before, 200 with the notice that
  * names it and no link, unless `fresh` is true. 409 for a job with no comment, 503 when the talk cannot be prepared, 404 for an unknown job.
- * `POST /review/proposal` is the review talk's tool posting `{ job_id, text }`: like `/assess` it takes no cookie and no Origin but the shared token in
+ * `POST /review/proposal` is the review talk's tool posting `{ job_id, text }`: like `/assess` it takes no sign-in and no Origin but the shared token in
  * `x-factory-token`, and its 200 answer sends the token back. The text is kept in memory as the newest proposal of that job, which must be a listed job
  * whose talk was started: 400 for a bad body or a text equal to the current version, 404 for an unknown job, 409 for a job with no talk, 413 over 64 KiB.
- * `GET /review/proposal` tells the signed-in page what waits, newest first, so its notice appears without a reload.
- * `ReviewAccess.admit` runs first on every request (403), then the method is checked (405), then the cookie; a body is read only after all three. The
- * one exception is `POST /review/proposal`, where `ReviewAccess.admitTool` takes the place of all three.
+ * `GET /review/proposal` tells the page, signed in to DSH, what waits, newest first, so its notice appears without a reload.
+ * `ReviewAccess.admit` runs first on every request (403), then DSH's sign-in (`ReviewSignIn`: 401, 403, or 503 without DSH's connection service),
+ * then the method is checked (405); a body is read only after all three. The one exception is `POST /review/proposal`, where `ReviewAccess.admitTool`
+ * takes the place of all three.
  * It refuses a web server that is not bound to 127.0.0.1. The token is never logged and never put in a page.
  */
 export class ReviewRoute {
   static readonly PATH = '/review'
-  static readonly LOGIN_PATH = '/review/login'
   static readonly COMMENT_PATH = '/review/comment'
   static readonly TALK_PATH = '/review/talk'
   static readonly PROPOSAL_PATH = '/review/proposal'
   static readonly MAX_BODY_BYTES = 64 * 1024
   private readonly projects: readonly string[]
   private readonly access: ReviewAccess
+  /** DSH's own sign-in, which lets the owner's browser in; the plugin hands it DSH's connection service (`ReviewSignIn.use`). */
+  readonly signIn = new ReviewSignIn()
   private readonly writer: ReviewWriter
   private readonly talks: ReviewTalks
   /** The proposals waiting for the owner's answer: in memory only, so a DSH restart forgets them, and nothing of them is saved. */
@@ -794,12 +796,12 @@ export class ReviewRoute {
     this.talks = talks ?? new ReviewTalks({ records, tokenFile: tokens instanceof SharedTokenFile ? tokens.path : SharedTokenFile.DEFAULT_PATH, words: ReviewPage, now })
   }
 
-  /** Adds the page's five addresses to the web server and returns the function that removes them. */
+  /** Adds the page's four addresses to the web server and returns the function that removes them. */
   register(ctx: Context): () => void {
     if (ctx.webServer.host !== '127.0.0.1') throw new Error('The factory /review page requires a loopback Web server')
-    const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.LOGIN_PATH, 'login'], [ReviewRoute.COMMENT_PATH, 'comment'],
+    const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.COMMENT_PATH, 'comment'],
       [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal']]
-    // Anonymous to DSH: the page has its own sign-in, with the token the factory and this side already share.
+    // Anonymous to DSH's web server, so the page answers a browser that is not signed in with its own line; DSH's sign-in is asked in `handle`.
     const disposers = targets.map(([path, target]) => {
       const route: AnonymousRoute = { kind: 'exact', path, auth: 'anonymous', handler: (req, res) => this.handle(req, res, ctx.webServer.port, target) }
       return ctx.webServer.register(route)
@@ -818,12 +820,11 @@ export class ReviewRoute {
       // The talk's tool: a program with the shared token, not the owner's browser.
       if (target === 'proposal' && req.method === 'POST') { await this.propose(req, res, port, state); return }
       this.access.admit(req, port)
+      this.signIn.check(req)
       const method = target === 'page' || target === 'proposal' ? 'GET' : 'POST'
       const allow = target === 'proposal' ? 'GET, POST' : method
       if (req.method !== method) throw Object.assign(new ReviewRefusal(405, `Only ${allow} is allowed`), { allow })
-      if (target === 'login') await this.login(req, res, state)
-      else if (!this.access.signedIn(req)) throw new ReviewRefusal(401, 'Sign in with the shared token first')
-      else if (target === 'comment') await this.comment(req, res, state)
+      if (target === 'comment') await this.comment(req, res, state)
       else if (target === 'talk') await this.talk(req, res, port, state)
       else if (target === 'proposal') ReviewRoute.sendJson(res, 200, { waiting: this.waiting() })
       else await this.show(req, res, page)
@@ -837,8 +838,8 @@ export class ReviewRoute {
       const status = refusal?.status ?? 500, message = refusal?.message ?? 'The review page failed'
       const headers: Record<string, string> = status === 405 ? { allow: (error as { allow?: string }).allow ?? 'GET' } : {}
       if (target === 'comment' || target === 'talk' || target === 'proposal') ReviewRoute.sendJson(res, status, { error: message }, headers)
-      // Without the cookie the page is the sign-in form, and nothing else: no record content.
-      else if (status === 401 || (target === 'login' && status === 503)) ReviewRoute.sendPage(res, status, page.signIn(target === 'login' ? message : undefined), page, headers)
+      // Not signed in to DSH, the page is the one line `ReviewSignIn.SIGNED_OUT`, and nothing else: no record content, no token form.
+      else if (status === 401) ReviewRoute.sendPage(res, status, page.signedOut(), page, headers)
       else ReviewRoute.sendPage(res, status, page.notice(message), page, headers)
     }
   }
@@ -958,16 +959,6 @@ export class ReviewRoute {
     }
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new ReviewRefusal(400, 'The request body must be an object')
     return body as Record<string, unknown>
-  }
-
-  /** `POST /review/login`: the token comes in the form's body, never in the address. */
-  private async login(req: IncomingMessage, res: ServerResponse, state: { bodyRead: boolean }): Promise<void> {
-    state.bodyRead = true
-    // Trimmed: a token pasted from a terminal often brings a line break along, and no token holds a space.
-    const typed = (new URLSearchParams(await ReviewRoute.readBody(req)).get('token') ?? '').trim()
-    const cookie = this.access.signIn(typed)
-    res.writeHead(303, { location: ReviewRoute.PATH, 'set-cookie': cookie, 'cache-control': 'no-store' })
-    res.end()
   }
 
   /** `POST /review/comment` for a signed-in owner. */

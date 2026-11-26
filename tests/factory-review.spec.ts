@@ -10,7 +10,7 @@ import { JSDOM } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
 import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
-import { ReviewAccess, ReviewPage, ReviewRoute } from '../src/factory/review.ts'
+import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn } from '../src/factory/review.ts'
 import { ReviewTalks, TalkFolder } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
@@ -45,6 +45,34 @@ const proposeServer = () => join(root, 'proposeServer.js')
 const talksFor = (records: FactoryRecordsModule, serverFile: string = proposeServer()) =>
   new ReviewTalks({ records, tokenFile: tokenPath(), words: ReviewPage, root: talkRoot(), serverFile, now: () => new Date(NOW) })
 let reviewRoute: ReviewRoute | undefined
+/**
+ * The `Cookie` header of a browser signed in to DSH at 127.0.0.1: DSH names its cookie after the address, `dsh-auth-<hash>`, and signs its value
+ * for that address, so the one for `localhost` is another cookie.
+ */
+const DSH_COOKIE = 'dsh-auth-c2lnbmVkLWluLWJ5LWRzaA=v1.signed-by-dsh'
+const DSH_LOCALHOST_COOKIE = 'dsh-auth-bG9jYWxob3N0LWJ5LWRzaA=v1.signed-by-dsh'
+/**
+ * A stand-in for DSH's connection service (`ctx.connection`), doing what DSH 0.2.1's `admit` does with a request (`dsh-client-connection`
+ * `lib/index.js`, `isTrustedApiRequest` and `requestRejection`): 403 for a Host that is not loopback, a cross-site fetch or another Origin, then 401
+ * without DSH's sign-in cookie for that address. `refuse` makes it answer one status whatever comes, as a later DSH may answer 503.
+ */
+class DshConnection {
+  readonly asked: IncomingMessage['headers'][] = []
+  refuse: 401 | 403 | 503 | undefined
+  admit(request: { headers: IncomingMessage['headers'] }): { peer: never } | { rejection: 401 | 403 } {
+    this.asked.push(request.headers)
+    if (this.refuse !== undefined) return { rejection: this.refuse as 401 }
+    const { host, origin, cookie } = request.headers
+    const hostname = host === undefined ? undefined : new URL(`http://${host}`).hostname
+    if (hostname !== '127.0.0.1' && hostname !== 'localhost') return { rejection: 403 }
+    if (request.headers['sec-fetch-site'] === 'cross-site') return { rejection: 403 }
+    if (origin !== undefined && origin !== `http://${host}`) return { rejection: 403 }
+    const wanted = hostname === 'localhost' ? DSH_LOCALHOST_COOKIE : DSH_COOKIE
+    const signed = (cookie ?? '').split(';').some(part => part.trim() === wanted)
+    return signed ? { peer: {} as never } : { rejection: 401 }
+  }
+}
+let dsh = new DshConnection()
 /** Serves the page of a fake DSH web server over real HTTP, reading the token file and the stand-in records module of the test. */
 async function serve(projects: string[] = [project], records: FactoryRecordsModule = new FactoryRecordsModule(recordsModule(root)), talks: ReviewTalks = talksFor(records)): Promise<Route[]> {
   routes = []
@@ -55,6 +83,7 @@ async function serve(projects: string[] = [project], records: FactoryRecordsModu
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { routes.push(registered); return () => {} } } }
   reviewRoute = new ReviewRoute(projects, new SharedTokenFile(tokenPath()), records, () => new Date(NOW), talks)
   reviewRoute.register(ctx as never)
+  reviewRoute.signIn.use(dsh)
   return routes
 }
 /** Sends one request. A header given as `undefined` is left out. */
@@ -72,15 +101,8 @@ function call(method: string, path: string, headers: Record<string, string | und
     req.end(sent)
   })
 }
-/** Posts the sign-in form as a browser does: from the page's own origin, the token in the body. */
-const login = (token: string, headers: Record<string, string | undefined> = {}) =>
-  call('POST', '/review/login', { origin: origin(), 'content-type': 'application/x-www-form-urlencoded', ...headers }, new URLSearchParams({ token }).toString())
-/** Signs in and returns the `Cookie` header a browser would send from then on. */
-async function signIn(): Promise<string> {
-  const answer = await login(TOKEN)
-  expect(answer.status).toBe(303)
-  return answer.headers['set-cookie']![0]!.split(';')[0]!
-}
+/** The `Cookie` header of a browser that opened DSH: DSH's own sign-in, which the review page shares. */
+async function signIn(): Promise<string> { return DSH_COOKIE }
 /** Posts a comment as the page's script does. */
 const comment = (cookie: string | undefined, body: unknown, headers: Record<string, string | undefined> = {}) =>
   call('POST', '/review/comment', { origin: origin(), cookie, 'content-type': 'application/json', ...headers }, typeof body === 'string' ? body : JSON.stringify(body))
@@ -93,6 +115,7 @@ beforeEach(() => {
   mkdirSync(join(project, FactoryRecordFile.FOLDER), { recursive: true })
   writeFileSync(proposeServer(), '// stand-in for the built propose server\n')
   writeToken()
+  dsh = new DshConnection()
 })
 afterEach(async () => {
   await new Promise<void>(resolve => { server ? server.close(() => { resolve() }) : resolve() })
@@ -100,87 +123,106 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-it('registers five exact, anonymous routes and refuses a web server that is not on loopback', async () => {
+it('registers four exact routes, anonymous to DSH\'s web server so the page answers its own line, and refuses a web server that is not on loopback', async () => {
   const registered = await serve()
-  expect(registered.map(route => [route.kind, route.path, route.auth])).toEqual([['exact', '/review', 'anonymous'], ['exact', '/review/login', 'anonymous'],
+  expect(registered.map(route => [route.kind, route.path, route.auth])).toEqual([['exact', '/review', 'anonymous'],
     ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous']])
   const disposed: string[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => () => { disposed.push(route.path) } } }
   new ReviewRoute([project]).register(ctx as never)()
-  expect(disposed).toEqual(['/review', '/review/login', '/review/comment', '/review/talk', '/review/proposal'])
+  expect(disposed).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal'])
   expect(() => new ReviewRoute([project]).register({ webServer: { host: '0.0.0.0', port: 3083, register: () => () => {} } } as never)).toThrow('loopback')
   expect(() => new ReviewRoute(['relative/project'])).toThrow('absolute')
 })
 
-it('answers 401 with the sign-in form and no record content to a request without the token\'s cookie', async () => {
+it('lets in a browser signed in to DSH, with no sign-in step of its own: DSH is asked with the request as it came', async () => {
+  await serve()
+  put('actions.jsonl', [action()])
+  const page = await call('GET', '/review', { cookie: DSH_COOKIE })
+  expect(page.status).toBe(200)
+  expect(page.text).toContain('The first job started.')
+  // The page shows no token field and sets no cookie of its own.
+  expect(dom(page.text).querySelector('input[type=password], form[action="/review/login"]')).toBeNull()
+  expect(page.headers['set-cookie']).toBeUndefined()
+  expect(dsh.asked.at(-1)!.cookie).toBe(DSH_COOKIE)
+  // A browser may send the page's own Origin with a GET; other cookies beside DSH's do not matter; reached as localhost, the origin is localhost.
+  expect((await call('GET', '/review', { cookie: `a=b; ${DSH_COOKIE}; c=d`, origin: origin() })).status).toBe(200)
+  expect((await call('GET', '/review', { cookie: DSH_LOCALHOST_COOKIE, host: `localhost:${port}`, origin: `http://localhost:${port}` })).status).toBe(200)
+  // DSH ties its cookie to the address: the one for 127.0.0.1 does not sign in at localhost.
+  expect((await call('GET', '/review', { cookie: DSH_COOKIE, host: `localhost:${port}` })).status).toBe(401)
+  const saved = await comment(DSH_COOKIE, { job_id: 'job-1', comment: 'Signed in through DSH.' })
+  expect(saved.status).toBe(200)
+  expect((await call('GET', '/review/proposal', { cookie: DSH_COOKIE })).status).toBe(200)
+  // The sign-in address of the page's old token form is gone.
+  expect(routes.some(route => route.path === '/review/login')).toBe(false)
+})
+
+it('shows only "Open dsh first" and no record content to a browser not signed in to DSH, and never asks for a token', async () => {
   await serve()
   put('actions.jsonl', [action()])
   put('reviews.jsonl', [review()])
-  const forged = `${ReviewAccess.COOKIE}=${'0'.repeat(64)}`
-  for (const cookie of [undefined, forged, `${ReviewAccess.COOKIE}=${TOKEN}`, `${ReviewAccess.COOKIE}=`, 'other=1']) {
+  // The page's old cookie, with any value, is no sign-in either.
+  for (const cookie of [undefined, 'dsh-auth-c2lnbmVkLWluLWJ5LWRzaA=forged', 'factory_review=' + '0'.repeat(64), 'other=1']) {
     const answer = await call('GET', '/review', { cookie })
     expect([cookie, answer.status]).toEqual([cookie, 401])
-    // Nothing of the job or the comment is in the body, and nothing was signed in.
-    for (const content of ['The first job started.', 'Keep it small.', 'job-1', project]) expect(answer.text).not.toContain(content)
+    const shown = dom(answer.text)
+    expect([...shown.body.children].map(each => [each.tagName, each.textContent])).toEqual([['P', ReviewSignIn.SIGNED_OUT]])
+    for (const content of ['The first job started.', 'Keep it small.', 'job-1', project, TOKEN]) expect(answer.text).not.toContain(content)
+    expect(shown.querySelector('form, input, textarea')).toBeNull()
     expect(answer.headers['set-cookie']).toBeUndefined()
-    const form = dom(answer.text).querySelector('form')!
-    expect([form.getAttribute('method'), form.getAttribute('action')]).toEqual(['post', '/review/login'])
-    // One token field, and the token goes in the body of a POST, never in the address.
-    expect([...form.querySelectorAll('input')].map(input => [input.name, input.type])).toEqual([['token', 'password']])
-    expect(dom(answer.text).querySelector('textarea')).toBeNull()
   }
+  expect(ReviewSignIn.SIGNED_OUT).toBe('Open dsh first, then use its Review link.')
+  // The addresses the page's script calls answer the same line as `{ error }`, and nothing is written.
+  const saved = await comment(undefined, { job_id: 'job-1', comment: 'Should not be saved.' })
+  expect([saved.status, JSON.parse(saved.text)]).toEqual([401, { error: ReviewSignIn.SIGNED_OUT }])
+  const talk = await call('POST', '/review/talk', { origin: origin(), 'content-type': 'application/json' }, JSON.stringify({ job_id: 'job-1' }))
+  expect([talk.status, JSON.parse(talk.text)]).toEqual([401, { error: ReviewSignIn.SIGNED_OUT }])
+  expect((await call('GET', '/review/proposal', {})).status).toBe(401)
+  expect(lines('reviews.jsonl')).toHaveLength(1)
+  expect(existsSync(talkRoot())).toBe(false)
 })
 
-it('signs in with the right token: 303 to /review with a strict, script-proof cookie that is not the token', async () => {
+it('refuses every browser address with a plain 503 when DSH has no connection service, and has no fallback', async () => {
   await serve()
   put('actions.jsonl', [action()])
-  const answer = await login(TOKEN)
-  expect([answer.status, answer.headers.location, answer.text]).toEqual([303, '/review', ''])
-  const [cookie] = answer.headers['set-cookie']!
-  expect(cookie).toMatch(new RegExp(`^${ReviewAccess.COOKIE}=[0-9a-f]{64}; Path=/review; HttpOnly; SameSite=Strict$`))
-  expect(cookie).not.toContain(TOKEN)
-  const page = await call('GET', '/review', { cookie: cookie!.split(';')[0] })
-  expect(page.status).toBe(200)
-  expect(page.text).toContain('The first job started.')
-  // A browser may send the page's own Origin with a GET; other cookies beside this one do not matter.
-  expect((await call('GET', '/review', { cookie: `a=b; ${cookie!.split(';')[0]}; c=d`, origin: origin() })).status).toBe(200)
-  // A token pasted with the line break that ends the token file still signs in.
-  expect((await login(`${TOKEN}\n`)).status).toBe(303)
-  // Reached as localhost, the page's own origin is localhost.
-  expect((await login(TOKEN, { host: `localhost:${port}`, origin: `http://localhost:${port}` })).status).toBe(303)
-})
-
-it('refuses a wrong or empty token with 401, and answers 503 without a usable token file; neither sets a cookie', async () => {
-  await serve()
-  for (const typed of [OTHER_TOKEN, `${TOKEN}0`, '', ' ']) {
-    const answer = await login(typed)
-    expect([typed, answer.status, answer.headers['set-cookie']]).toEqual([typed, 401, undefined])
-    expect(dom(answer.text).querySelector('[role=alert]')!.textContent).toBe('The token is missing or wrong')
-    expect(answer.text).not.toContain(TOKEN)
-  }
-  // A form without the field at all.
-  expect((await call('POST', '/review/login', { origin: origin() }, 'other=1')).status).toBe(401)
-  writeToken(TOKEN, 0o644)
-  expect([(await login(TOKEN)).status, (await login(TOKEN)).headers['set-cookie']]).toEqual([503, undefined])
-  rmSync(tokenPath())
-  const answer = await login(TOKEN)
-  expect([answer.status, answer.headers['set-cookie']]).toEqual([503, undefined])
-  expect(dom(answer.text).querySelector('[role=alert]')!.textContent).toBe('The review page has no usable token file, so nobody can sign in')
-  // With no token file nobody is signed in, whatever cookie is sent.
-  expect((await call('GET', '/review', { cookie: `${ReviewAccess.COOKIE}=${'0'.repeat(64)}` })).status).toBe(401)
-})
-
-it('stops accepting a cookie when the token file is replaced, and accepts it again after a restart with the same token', async () => {
-  await serve()
-  const cookie = await signIn()
-  expect((await call('GET', '/review', { cookie })).status).toBe(200)
-  writeToken(OTHER_TOKEN)
-  expect((await call('GET', '/review', { cookie })).status).toBe(401)
-  writeToken(TOKEN)
-  // Another route object, as after a restart of DSH: the cookie needs no stored state.
-  await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
-  await serve()
-  expect((await call('GET', '/review', { cookie })).status).toBe(200)
+  // As when DSH takes its connection service away: the plugin's hold ends.
+  const route = new ReviewRoute([project], new SharedTokenFile(tokenPath()), new FactoryRecordsModule(recordsModule(root)), () => new Date(NOW), talksFor(new FactoryRecordsModule(recordsModule(root))))
+  const release = route.signIn.use(dsh)
+  release()
+  const page = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await route.handle(page.req, page.res, 3083, 'page')
+  expect(page.answer.status).toBe(503)
+  expect(dom(page.answer.text).querySelector('p')!.textContent).toBe(ReviewSignIn.NO_SERVICE)
+  expect(page.answer.text).not.toContain('The first job started.')
+  const saved = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ job_id: 'job-1', comment: 'No.' }))
+  await route.handle(saved.req, saved.res, 3083, 'comment')
+  expect([saved.answer.status, JSON.parse(saved.answer.text)]).toEqual([503, { error: ReviewSignIn.NO_SERVICE }])
+  const talk = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ job_id: 'job-1' }))
+  await route.handle(talk.req, talk.res, 3083, 'talk')
+  expect([talk.answer.status, JSON.parse(talk.answer.text)]).toEqual([503, { error: ReviewSignIn.NO_SERVICE }])
+  const waiting = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await route.handle(waiting.req, waiting.res, 3083, 'proposal')
+  expect([waiting.answer.status, JSON.parse(waiting.answer.text)]).toEqual([503, { error: ReviewSignIn.NO_SERVICE }])
+  expect(existsSync(file('reviews.jsonl'))).toBe(false)
+  expect(existsSync(talkRoot())).toBe(false)
+  // A connection service that throws is one that cannot answer: 503, not a failure of the page.
+  const broken = route.signIn.use({ admit: () => { throw new Error('secret unreadable') } })
+  const thrown = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await route.handle(thrown.req, thrown.res, 3083, 'page')
+  expect([thrown.answer.status, dom(thrown.answer.text).querySelector('p')!.textContent]).toEqual([503, ReviewSignIn.NO_SERVICE])
+  broken()
+  // A connection service that cannot answer is the same: 503, never let in.
+  dsh.refuse = 503
+  const refused = await call('GET', '/review', { cookie: DSH_COOKIE })
+  expect([refused.status, dom(refused.text).querySelector('p')!.textContent]).toEqual([503, ReviewSignIn.NO_SERVICE])
+  // An older release does not end a newer hold.
+  const other = new DshConnection()
+  const first = route.signIn.use(dsh)
+  route.signIn.use(other)
+  first()
+  const again = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await route.handle(again.req, again.res, 3083, 'page')
+  expect(again.answer.status).toBe(200)
 })
 
 it('refuses a wrong Host and a foreign Origin with 403 on every address, before anything is read or written', async () => {
@@ -188,7 +230,6 @@ it('refuses a wrong Host and a foreign Origin with 403 on every address, before 
   put('actions.jsonl', [action()])
   const cookie = await signIn()
   const body = JSON.stringify({ job_id: 'job-1', comment: 'Should not be saved.' })
-  const form = new URLSearchParams({ token: TOKEN }).toString()
   const refusals: Record<string, string | undefined>[] = [
     { host: `evil.example:${port}` }, { host: '127.0.0.1' }, { host: `127.0.0.1:${port + 1}` }, { host: `192.168.1.5:${port}` },
     { origin: 'http://evil.example' }, { origin: `https://127.0.0.1:${port}` }, { origin: `http://localhost:${port}` }, { origin: 'null' },
@@ -197,15 +238,28 @@ it('refuses a wrong Host and a foreign Origin with 403 on every address, before 
     const page = await call('GET', '/review', { cookie, ...headers })
     expect([headers, page.status]).toEqual([headers, 403])
     expect(page.text).not.toContain('The first job started.')
-    const signed = await call('POST', '/review/login', { origin: origin(), ...headers }, form)
-    expect([headers, signed.status, signed.headers['set-cookie']]).toEqual([headers, 403, undefined])
     const saved = await call('POST', '/review/comment', { origin: origin(), cookie, ...headers }, body)
     expect([headers, saved.status]).toEqual([headers, 403])
   }
-  // A POST must say where it comes from: a browser always does, so one without an Origin is not the page.
-  expect((await call('POST', '/review/login', {}, form)).status).toBe(403)
-  expect((await call('POST', '/review/comment', { cookie }, body)).status).toBe(403)
+  // The page's own checks refuse these before DSH is asked; DSH refuses what they let through, such as a fetch the browser marks cross-site.
+  expect(dsh.asked).toHaveLength(0)
+  // A page opened from a link on another site is refused by DSH and shown the signed-out line, never the job; a post from another site is a plain 403.
+  const crossSite = await call('GET', '/review', { cookie, 'sec-fetch-site': 'cross-site' })
+  expect(crossSite.text).not.toContain('The first job started.')
+  expect([crossSite.status, dom(crossSite.text).querySelector('p')!.textContent]).toEqual([401, ReviewSignIn.SIGNED_OUT])
+  const crossPost = await call('POST', '/review/comment', { origin: origin(), cookie, 'sec-fetch-site': 'cross-site' }, body)
+  expect(crossPost.status).toBe(403)
+  dsh.refuse = 403
+  expect((await call('GET', '/review', { cookie })).status).toBe(401)
+  expect((await call('POST', '/review/talk', { origin: origin(), cookie, 'content-type': 'application/json' }, body)).status).toBe(403)
+  dsh.refuse = undefined
+  // A request that changes something must say where it comes from: a browser always does, so one without an Origin is not the page, signed in or not.
+  for (const path of ['/review/comment', '/review/talk']) {
+    const answer = await call('POST', path, { cookie, 'content-type': 'application/json' }, body)
+    expect([path, answer.status, JSON.parse(answer.text)]).toEqual([path, 403, { error: 'A request that changes something must come from the review page itself' }])
+  }
   expect(existsSync(file('reviews.jsonl'))).toBe(false)
+  expect(existsSync(talkRoot())).toBe(false)
 })
 
 /** A request handed straight to the route, so the test can say which address the caller connects from. */
@@ -217,23 +271,18 @@ function direct(remoteAddress: string | undefined, method: string, headers: Reco
   return { req: req as unknown as IncomingMessage, res: res as unknown as ServerResponse, answer, resume }
 }
 
-it('refuses a caller whose address is not loopback, whatever its Host header and cookie say', async () => {
+it('refuses a caller whose address is not loopback, whatever its Host header and DSH cookie say', async () => {
   put('actions.jsonl', [action()])
   const route = new ReviewRoute([project], new SharedTokenFile(tokenPath()), new FactoryRecordsModule(recordsModule(root)), () => new Date(NOW))
-  // A real cookie, taken from a sign-in over loopback.
-  const signing = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
-  await route.handle(signing.req, signing.res, 3083, 'login')
-  expect(signing.answer.status).toBe(303)
-  const cookie = signing.answer.headers['set-cookie']!.split(';')[0]!
+  route.signIn.use(dsh)
+  // DSH's own cookie, which DSH lets in.
+  const cookie = DSH_COOKIE
   const body = JSON.stringify({ job_id: 'job-1', comment: 'Should not be saved.' })
   for (const address of ['192.168.1.9', '10.0.0.1', '::ffff:192.168.1.9', 'fe80::1', '127.0.0.2', '', undefined]) {
     const page = direct(address, 'GET', { cookie })
     await route.handle(page.req, page.res, 3083, 'page')
     expect([address, page.answer.status]).toEqual([address, 403])
     expect(page.answer.text).not.toContain('The first job started.')
-    const signed = direct(address, 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
-    await route.handle(signed.req, signed.res, 3083, 'login')
-    expect([address, signed.answer.status, signed.answer.headers['set-cookie']]).toEqual([address, 403, undefined])
     const saved = direct(address, 'POST', { origin: 'http://127.0.0.1:3083', cookie }, body)
     await route.handle(saved.req, saved.res, 3083, 'comment')
     expect([address, saved.answer.status, JSON.parse(saved.answer.text)]).toEqual([address, 403, { error: 'Loopback request required' }])
@@ -311,7 +360,7 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   const nonce = /script-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(policy)![1]!
   expect(policy).toBe(`default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`)
   expect([answer.headers['cache-control'], answer.headers['x-content-type-options'], answer.headers['x-frame-options'], answer.headers['referrer-policy'], answer.headers['content-type']])
-    // same-origin, not no-referrer: under no-referrer a browser sends Origin: null with the sign-in form, which admit refuses (owner's check, story 3.1).
+    // same-origin, not no-referrer: under no-referrer a browser may send Origin: null with the page's own posts, which admit refuses (owner's check, story 3.1).
     .toEqual(['no-store', 'nosniff', 'DENY', 'same-origin', 'text/html; charset=utf-8'])
   const page = dom(answer.text)
   expect([page.querySelectorAll('script').length, page.querySelector('script')!.getAttribute('nonce'), page.querySelector('style')!.getAttribute('nonce')]).toEqual([1, nonce, nonce])
@@ -382,12 +431,12 @@ it('saves a comment on the shown project\'s job when another listed project hold
   expect(existsSync(file('reviews.jsonl', other))).toBe(false)
 })
 
-it('saves nothing without access: no cookie or a wrong one is 401', async () => {
+it('saves nothing without DSH\'s sign-in: no DSH cookie or one DSH refuses is 401', async () => {
   await serve()
   put('actions.jsonl', [action()])
-  for (const cookie of [undefined, `${ReviewAccess.COOKIE}=${'0'.repeat(64)}`]) {
+  for (const cookie of [undefined, 'dsh-auth-c2lnbmVkLWluLWJ5LWRzaA=forged']) {
     const answer = await comment(cookie, { job_id: 'job-1', comment: 'Should not be saved.' })
-    expect([answer.status, JSON.parse(answer.text)]).toEqual([401, { error: 'Sign in with the shared token first' }])
+    expect([answer.status, JSON.parse(answer.text)]).toEqual([401, { error: ReviewSignIn.SIGNED_OUT }])
   }
   expect(existsSync(file('reviews.jsonl'))).toBe(false)
 })
@@ -425,11 +474,11 @@ it('refuses a bad comment and writes nothing: empty text 400, an unknown job 404
 it('answers 405 to the wrong method on each address', async () => {
   await serve()
   const cookie = await signIn()
-  for (const [method, path, allow] of [['POST', '/review', 'GET'], ['PUT', '/review', 'GET'], ['DELETE', '/review/comment', 'POST'], ['PUT', '/review/login', 'POST']] as const) {
+  for (const [method, path, allow] of [['POST', '/review', 'GET'], ['PUT', '/review', 'GET'], ['DELETE', '/review/comment', 'POST'], ['PUT', '/review/talk', 'POST']] as const) {
     const answer = await call(method, path, { origin: origin(), cookie }, '{}')
     expect([method, path, answer.status, answer.headers.allow]).toEqual([method, path, 405, allow])
   }
-  for (const path of ['/review/login', '/review/comment']) expect([path, (await call('GET', path, { cookie })).status]).toEqual([path, 405])
+  for (const path of ['/review/talk', '/review/comment']) expect([path, (await call('GET', path, { cookie })).status]).toEqual([path, 405])
 })
 
 it('answers 503 and writes nothing without a working records module, and 409 when the project lost its .factory folder', async () => {
@@ -503,11 +552,12 @@ export class JobsReader { read() { throw new Error(${JSON.stringify(PLANTED)}) }
 
 it('cuts the connection, and does not throw, when something fails after the answer was begun', async () => {
   const route = new ReviewRoute([project], new SharedTokenFile(tokenPath()), new FactoryRecordsModule(recordsModule(root)), () => new Date(NOW))
-  const { req } = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
+  route.signIn.use(dsh)
+  const { req } = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
   const writeHead = vi.fn(), destroy = vi.fn()
   // The headers went out, then ending the answer fails.
   const res = { headersSent: false, writeHead: (...sent: unknown[]) => { writeHead(...sent); res.headersSent = true }, end: () => { throw new Error('broken pipe') }, destroy }
-  await expect(route.handle(req, res as unknown as ServerResponse, 3083, 'login')).resolves.toBeUndefined()
+  await expect(route.handle(req, res as unknown as ServerResponse, 3083, 'page')).resolves.toBeUndefined()
   expect([writeHead.mock.calls.length, destroy.mock.calls.length]).toEqual([1, 1])
 })
 
@@ -640,27 +690,63 @@ it('saves after a pause in typing, once, with the text as it is then', async () 
   } finally { vi.useRealTimers() }
 })
 
-it('is wired into the plugin: the page reads the configured token file and the configured records module', async () => {
+/**
+ * A fake of the plugin's context. `connection` is DSH's connection service, or `undefined` when DSH has none: then the plugin's `ctx.inject` callback
+ * never runs, as cordis runs it only while the service is there. `withdraw` takes the service away again, running what the callback left.
+ */
+function pluginContext(registered: Route[], connection: DshConnection | undefined, logger = { info: vi.fn(), warn: vi.fn() }) {
+  const left: (() => unknown)[] = []
+  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+    effect: (effect: () => () => void) => effect(), logger, on: () => () => {},
+    inject: (names: string[], callback: (child: unknown) => void) => {
+      expect(names).toEqual(['connection'])
+      if (connection !== undefined) callback({ connection, effect: (effect: () => () => unknown) => { left.push(effect()) } })
+      return () => {}
+    } }
+  return { ctx, withdraw: () => { for (const each of left.splice(0)) each() } }
+}
+
+it('is wired into the plugin: the page reads the configured token file and records module, and DSH\'s connection service signs the browser in', async () => {
   put('actions.jsonl', [action()])
   const registered: Route[] = []
   const info = vi.fn(), warn = vi.fn()
-  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info, warn }, on: () => () => {} }
+  const { ctx, withdraw } = pluginContext(registered, dsh, { info, warn })
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: recordsModule(root) }))
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
-  const signing = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
-  await handler('/review/login')(signing.req, signing.res)
-  expect(signing.answer.status).toBe(303)
-  const page = direct('127.0.0.1', 'GET', { cookie: signing.answer.headers['set-cookie']!.split(';')[0]! })
+  expect(registered.map(route => route.path)).not.toContain('/review/login')
+  const page = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
   await handler('/review')(page.req, page.res)
   expect([page.answer.status, page.answer.text.includes('The first job started.')]).toEqual([200, true])
   const unsigned = direct('127.0.0.1', 'GET', {})
   await handler('/review')(unsigned.req, unsigned.res)
-  expect(unsigned.answer.status).toBe(401)
+  expect([unsigned.answer.status, dom(unsigned.answer.text).querySelector('p')!.textContent]).toEqual([401, ReviewSignIn.SIGNED_OUT])
+  // When DSH takes its connection service away, the page answers nobody.
+  withdraw()
+  const after = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await handler('/review')(after.req, after.res)
+  expect(after.answer.status).toBe(503)
   // The token reaches no log line.
   expect(info).toHaveBeenCalled()
   expect(JSON.stringify([info.mock.calls, warn.mock.calls])).not.toContain(TOKEN)
-  expect([plugin.ReviewRoute, plugin.ReviewPage, plugin.ReviewAccess]).toEqual([ReviewRoute, ReviewPage, ReviewAccess])
+  expect([plugin.ReviewRoute, plugin.ReviewPage, plugin.ReviewAccess, plugin.ReviewSignIn]).toEqual([ReviewRoute, ReviewPage, ReviewAccess, ReviewSignIn])
+})
+
+it('is wired into the plugin without DSH\'s connection service: the page refuses with a plain 503, and the proposal address still takes the token', async () => {
+  put('actions.jsonl', [action()])
+  const registered: Route[] = []
+  const { ctx } = pluginContext(registered, undefined)
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: recordsModule(root) }))
+  const handler = (path: string) => registered.find(route => route.path === path)!.handler
+  const page = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await handler('/review')(page.req, page.res)
+  expect([page.answer.status, dom(page.answer.text).querySelector('p')!.textContent]).toEqual([503, ReviewSignIn.NO_SERVICE])
+  expect(page.answer.text).not.toContain('The first job started.')
+  // `/assess` is mounted whatever DSH's connection service does.
+  expect(registered.map(route => route.path)).toContain('/assess')
+  const proposed = direct('127.0.0.1', 'POST', { [SharedTokenFile.HEADER]: TOKEN, 'content-type': 'application/json' }, JSON.stringify({ job_id: 'job-1', text: 'x' }))
+  await handler('/review/proposal')(proposed.req, proposed.res)
+  // Past the token: refused only because job-1 has no talk.
+  expect(proposed.answer.status).toBe(409)
 })
 
 it('is wired into the plugin for the review talk: a start writes .mcp.json with the propose server beside the configured records module and the configured token file', async () => {
@@ -671,16 +757,13 @@ it('is wired into the plugin for the review talk: a start writes .mcp.json with 
   const records = recordsModule(dist)
   writeFileSync(join(dist, 'proposeServer.js'), '// stand-in for the built propose server\n')
   const registered: Route[] = []
-  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: () => () => {} }
+  const { ctx } = pluginContext(registered, dsh)
   // The plugin's talks go under `TalkFolder.ROOT`, read when it is applied: pointed at the test's folder here, so nothing lands in the owner's home.
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
   try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
-  const signing = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083' }, new URLSearchParams({ token: TOKEN }).toString())
-  await handler('/review/login')(signing.req, signing.res)
-  const cookie = signing.answer.headers['set-cookie']!.split(';')[0]!
+  const cookie = DSH_COOKIE
   const started = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie }, JSON.stringify({ project, job_id: 'job-1' }))
   await handler('/review/talk')(started.req, started.res)
   expect([started.answer.status, (JSON.parse(started.answer.text) as { opened: boolean }).opened]).toEqual([200, true])
@@ -1047,9 +1130,9 @@ describe('the Guideline tab', () => {
     expect([...page.querySelectorAll('main p')].map(line => line.textContent)).toEqual([ReviewPage.NO_GUIDELINE_FOLDER, 'No zees-software-factory folder entry.'])
   })
 
-  it('is reached from the Jobs tab, has no control, keeps the five routes, and needs the cookie', async () => {
+  it('is reached from the Jobs tab, has no control, keeps the four routes, and needs DSH\'s sign-in', async () => {
     const registered = await serve([project], new GuidelineRecords(twoVersions()))
-    expect(registered.map(route => route.path)).toEqual(['/review', '/review/login', '/review/comment', '/review/talk', '/review/proposal'])
+    expect(registered.map(route => route.path)).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal'])
     expect((await call('GET', ReviewRoute.guidelineAddress())).status).toBe(401)
     const cookie = await signIn()
     const jobs = dom((await call('GET', ReviewRoute.PATH, { cookie })).text)
@@ -1135,7 +1218,7 @@ describe('the review talk and its proposals', () => {
     expect(unknown.status).toBe(404)
   })
 
-  it('refuses a start without the cookie, from another site or with the wrong method, and writes nothing', async () => {
+  it('refuses a start without DSH\'s sign-in, from another site or with the wrong method, and writes nothing', async () => {
     await serve()
     sample()
     const cookie = await signIn()
@@ -1190,6 +1273,10 @@ describe('the review talk and its proposals', () => {
     const body = { job_id: 'job-1', text: 'New text.' }
     expect((await propose(body, { [SharedTokenFile.HEADER]: undefined })).status).toBe(401)
     expect((await propose(body, { [SharedTokenFile.HEADER]: OTHER_TOKEN })).status).toBe(401)
+    // DSH's sign-in cookie alone does not stand in for the token here, and DSH is not asked: the caller is a program, not a browser.
+    const asked = dsh.asked.length
+    expect((await propose(body, { [SharedTokenFile.HEADER]: undefined, cookie })).status).toBe(401)
+    expect(dsh.asked).toHaveLength(asked)
     expect((await propose(body, { origin: origin() })).status).toBe(403)
     expect((await propose(body, { origin: origin(), cookie })).status).toBe(403)
     expect((await propose(body, { host: `evil.example:${port}` })).status).toBe(403)

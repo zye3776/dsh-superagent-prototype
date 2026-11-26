@@ -2,7 +2,8 @@
  * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
  * Each run of the plugin is one job in the job log: its start, each permission answer, each message into or out of the main session, and its stop
  * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`, whose "Start review talk" prepares a job's review talk in Claude
- * Desktop (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back.
+ * Desktop (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back. The page has no sign-in of its own: DSH's connection
+ * service lets the owner's browser in with DSH's own sign-in, and while DSH has no connection service the page refuses every browser request.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`).
  * It runs on its own, without the main plugin.
@@ -10,6 +11,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
+import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -67,6 +69,8 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage })
   const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks)
   ctx.effect(() => review.register(ctx), 'factory: review page')
+  // Optional, so `/assess` and the job log work without it: the review page asks DSH's connection service while DSH has it.
+  ctx.inject(['connection'], child => { child.effect(() => review.signIn.use(child.connection), 'factory: review page sign-in') })
 }
 export { AssessRoute, StubJudge, TempFactsShape, type AnswerLog, type AssessRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
@@ -80,7 +84,7 @@ export {
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
 export { TextDiff, type DiffLine, type DiffMark, type DiffSides } from './diff.ts'
-export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
+export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, ReviewSignIn, type ReviewConnection, type ReviewTokenSource, type ReviewView } from './review.ts'
 export {
   GuidelineProposals, ReviewTalks, TalkComments, TalkFolder, TalkLink, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type ReviewTalksOptions, type StepWords,
   type TalkServer, type TalkStart, type TalkState,

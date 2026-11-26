@@ -122,9 +122,10 @@ describe('TalkOpening', () => {
     for (const part of [TalkOpening.LOOKUP_RULE, 'propose_guideline_change with job_id "job-1"', 'Good pace.', 'The job.', 'Keep it small.', 'version 2']) expect(message).toContain(part)
     // The folder check comes right after the title line, before anything about the job, and names this talk's own folder.
     expect(message.split('\n').slice(0, 3)).toEqual(['Review talk · shop job 3', '', 'Before anything else, check your working folder, as your environment states it. '
-      + 'It must be the talk folder shop-job-3-0123abcd, under ~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "This review talk '
-      + 'opened in the wrong folder, so it is stopping here. Close this session, and in Claude Desktop\'s Code tab choose no project and switch Worktree off, '
-      + 'then start the talk again from the review page.", then add your working folder\'s path, and do nothing else: read no file, call no tool and do not '
+      + 'It must be the talk folder shop-job-3-0123abcd, under ~/.config/zees-factory/review-talks/, or a git worktree of it inside that folder\'s own '
+      + '.claude/worktrees/. If it is any other folder, reply only: "This review talk opened in the wrong folder, so it is stopping here. Close this session, '
+      + 'choose no project in Claude Desktop\'s Code tab, then start the talk again from the review page.", then add your working folder\'s path, and do '
+      + 'nothing else: read no file, call no tool and do not '
       + 'discuss the job.'])
   })
 

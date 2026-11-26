@@ -164,15 +164,20 @@ export class TalkOpening {
     + 'never job text, comments, project code or a file path.'
   static readonly CUT = '… (the rest is in comments.md)'
 
-  /** The folder check for the talk folder named `folder`: Claude reads its working folder from its own environment, so the check needs no tool. */
+  /**
+   * The folder check for the talk folder named `folder`: Claude reads its working folder from its own environment, so the check needs no tool. A
+   * worktree Claude Desktop makes of the talk folder's own repository (its Worktree switch) passes: it sits in the folder's `.claude/worktrees/` and holds
+   * the same committed files, deny rules and propose server.
+   */
   static folderCheck(folder: string): string {
     return `Before anything else, check your working folder, as your environment states it. It must be the talk folder ${folder}, under `
-      + `~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "${TalkOpening.WRONG_FOLDER}", then add your working folder's path, `
+      + `~/.config/zees-factory/review-talks/, or a git worktree of it inside that folder's own .claude/worktrees/. If it is any other folder, reply only: `
+      + `"${TalkOpening.WRONG_FOLDER}", then add your working folder's path, `
       + 'and do nothing else: read no file, call no tool and do not discuss the job.'
   }
 
-  static readonly WRONG_FOLDER = 'This review talk opened in the wrong folder, so it is stopping here. Close this session, and in Claude Desktop\'s Code tab '
-    + 'choose no project and switch Worktree off, then start the talk again from the review page.'
+  static readonly WRONG_FOLDER = 'This review talk opened in the wrong folder, so it is stopping here. Close this session, choose no project in Claude '
+    + 'Desktop\'s Code tab, then start the talk again from the review page.'
 
   /** The message for a job whose files hold `texts`, each already masked, written to the talk folder named `folder`. */
   static build(job: RecordedJob, folder: string, texts: { title: string; job: string; comments: string; guideline: string }, read: GuidelineRead): string {

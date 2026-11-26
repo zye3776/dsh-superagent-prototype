@@ -9,8 +9,14 @@ type GuardFunction = (execution: FakeExecution) => string | undefined
  * What a fake judge answers to one message. `run` makes a tool call as the judge would: it passes the call through the agent's guards, as DSH does before a
  * tool runs, and returns the refusal, or `undefined` when the call may run. A promise makes the judge slow.
  */
-export type FakeReply = (text: string, run: GuardFunction) => string | Promise<string>
-interface FakeEvent { type: string; data: { message: { content: { type: string; text: string }[] } } }
+export type FakeReply = (text: string, run: GuardFunction) => string | FakeAnswer | Promise<string | FakeAnswer>
+/**
+ * An answer that also says what the judge Session records for it, so a fake judge can report token usage. `events` are appended before the answer's
+ * `assistant/message`, as the steps and attempts before the last one. `usage` and `stream` are put on that message, and `step` is its step in the turn (1 if left out).
+ */
+export interface FakeAnswer { text: string; events?: FakeEvent[]; usage?: Record<string, number>; stream?: unknown[]; step?: number }
+/** A Session event as the stand-in keeps it: any type with its data. */
+export interface FakeEvent { type: string; data: Record<string, unknown> }
 /** A judge Session's agent as the stand-in keeps it. */
 export interface FakeAgent {
   id: string
@@ -49,10 +55,16 @@ export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`) {
       followup: vi.fn((message: { content: { type: string; text: string }[] }) => {
         const text = message.content.map(block => block.text).join('')
         agent.asked.push(text)
+        // The turn is the number of the question, as a real Session starts a turn for each message it is sent.
+        const turn = agent.asked.length
         events.push({ type: 'user/message', data: { message } })
         idle = idle.then(async () => {
           await new Promise(resolve => { setTimeout(resolve, 1) })
-          events.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: await reply(text, execution => guarded(agent, execution)) }] } } })
+          const replied = await reply(text, execution => guarded(agent, execution))
+          const answer: FakeAnswer = typeof replied === 'string' ? { text: replied } : replied
+          events.push(...answer.events ?? [])
+          events.push({ type: 'assistant/message', data: { turn, step: answer.step ?? 1, message: { content: [{ type: 'text', text: answer.text }] },
+            stream: answer.stream ?? [], ...answer.usage === undefined ? {} : { usage: answer.usage } } })
         })
       }),
       whenIdle: () => idle }

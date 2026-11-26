@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AssessRefusal } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger } from '../src/factory/judge.ts'
+import { JudgeEvents } from './fixtures/judge-events.ts'
 import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
 
 let root = '', project = ''
@@ -293,9 +294,9 @@ describe('JudgeSession.ask', () => {
     const signal = new AbortController().signal
     let built = 0
     const [first, second] = await Promise.all([judge.consult('one', signal), judge.consult(() => `two after ${++built && turn} turn`, signal)])
-    expect(first).toEqual({ text: 'answer to: one', reads: [join(project, 'src', 'a.ts'), join(project, 'src', 'b.ts')] })
+    expect(first).toEqual({ text: 'answer to: one', reads: [join(project, 'src', 'a.ts'), join(project, 'src', 'b.ts')], tokens: 0 })
     // The second text was built only after the first question was answered.
-    expect(second).toEqual({ text: 'answer to: two after 1 turn', reads: [join(project, 'src', 'b.ts')] })
+    expect(second).toEqual({ text: 'answer to: two after 1 turn', reads: [join(project, 'src', 'b.ts')], tokens: 0 })
     expect([judge.readPath('src/a.ts'), judge.readPath(join(project, 'src', 'b.ts')), judge.readPath('src/c.ts')]).toEqual([join(project, 'src', 'a.ts'), join(project, 'src', 'b.ts'), undefined])
     expect([judge.ledger.has(join(project, 'src', 'a.ts')), judge.ledger.has('src/a.ts')]).toEqual([true, false])
     // A question given up before it was sent never builds its text.
@@ -303,6 +304,26 @@ describe('JudgeSession.ask', () => {
     stopped.abort(new Error('stopped'))
     await expect(judge.consult(() => `${++built}`, stopped.signal)).rejects.toThrow('stopped')
     expect(built).toBe(1)
+  })
+
+  it('returns with each answer the tokens of its own events only: its steps and attempts, not those of the question before', async () => {
+    let turn = 0
+    const dsh = fakeDsh(text => {
+      turn++
+      // The first answer takes a tool-call step and then the answer step; the second has a failed attempt that DSH retried; the third reports no usage.
+      return turn === 1
+        ? { text: `answer to: ${text}`, events: [JudgeEvents.message(1, 1, { message: { inputTokens: 500, outputTokens: 20 } })], usage: { inputTokens: 700, outputTokens: 30 }, step: 2 }
+        : turn === 2
+          ? { text: `answer to: ${text}`, events: [JudgeEvents.attempt(2, 1, { inputTokens: 400, outputTokens: 0 }), JudgeEvents.retryStarted(2, 1)], usage: { inputTokens: 450, outputTokens: 15 } }
+          : `answer to: ${text}`
+    })
+    const judge = await new JudgeSessions(dsh.ctx, fakeGuard().source).open(project, 's1')
+    const signal = new AbortController().signal
+    const [first, second] = await Promise.all([judge.consult('one', signal), judge.consult('two', signal)])
+    expect([first.text, first.tokens]).toEqual(['answer to: one', 1250])
+    expect([second.text, second.tokens]).toEqual(['answer to: two', 865])
+    // A judge that reports no usage costs 0.
+    expect((await judge.consult('three', signal)).tokens).toBe(0)
   })
 
   it('sends nothing once its signal is aborted, and still answers the next question', async () => {

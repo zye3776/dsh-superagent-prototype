@@ -14,6 +14,7 @@ import { FactoryGuardModule, JudgeSessions, type AskedJudge } from '../src/facto
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from '../src/factory/verdict.ts'
 import { RecordedRequests } from './fixtures/factory-requests.ts'
+import { JudgeEvents } from './fixtures/judge-events.ts'
 import { fakeDsh, fakeGuard, type FakeExecution, type FakeReply } from './fixtures/judge.ts'
 
 const TOKEN = 'test-token_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -263,6 +264,31 @@ describe('ModelJudge', () => {
     expect(asked()[1]).toMatch(/^Your answer could not be used: it holds no JSON object with a `decision`\./)
   })
 
+  it('writes as tokens the sum of the first answer and the repair answer', async () => {
+    let turn = 0
+    const { judge, asked } = modelJudge(() => ++turn === 1
+      ? { text: 'I would approve this.', usage: { inputTokens: 300, outputTokens: 10 } }
+      : { text: JSON.stringify(answer()), usage: { inputTokens: 320, outputTokens: 20 } })
+    const verdict = await judge.decide(requests.plain())
+    expect(asked()).toHaveLength(2)
+    expect([verdict.decision, verdict.tokens]).toEqual(['approve', 650])
+  })
+
+  it('counts for a request only the events of its own questions, not those of earlier requests in the same judge Session', async () => {
+    const usages = [{ inputTokens: 9000, outputTokens: 500 }, { inputTokens: 100, outputTokens: 20 }]
+    let turn = 0
+    const { judge, dsh } = modelJudge(() => ({ text: JSON.stringify(answer()), usage: usages[turn++] }))
+    expect((await judge.decide(requests.plain())).tokens).toBe(9500)
+    expect((await judge.decide(requests.plain())).tokens).toBe(120)
+    // Both requests went to one judge Session, which holds the events of both.
+    expect([...dsh.agents.values()]).toHaveLength(1)
+    expect([...dsh.agents.values()][0]!.session.snapshotEvents().filter(event => event.type === 'assistant/message')).toHaveLength(2)
+  })
+
+  it('writes 0 tokens when the judge Session reports no usage', async () => {
+    expect((await modelJudge(judgeThat(answer()).reply).judge.decide(requests.plain())).tokens).toBe(0)
+  })
+
   it('refuses with 503 after a second unusable answer, and asks no third time', async () => {
     const { judge, asked } = modelJudge(judgeThat(JSON.stringify(answer({ undo: 'unknown' }))).reply)
     expect(await refusalOf(judge.decide(requests.plain()))).toEqual({ status: 503, message: ModelJudge.UNUSABLE })
@@ -345,6 +371,22 @@ describe('the /assess route with the model judge, over real HTTP', () => {
     expect(got.body.seconds).toBeGreaterThanOrEqual(0.08)
     expect(written().map(line => line.seconds)).toEqual([got.body.seconds])
     expect(written()[0]!.seconds).toBeGreaterThanOrEqual(0.08)
+  })
+
+  it('counts the tokens the judge Session recorded for the answer, in the reply and in the written line, with the time and the reads', async () => {
+    const text = JSON.stringify(answer({ reads: [{ path: RecordedRequests.SCRIPT, used: true }] }))
+    const recorded = JudgeEvents.recordedAnswer(text)
+    const line = await judged(async (_question, run) => {
+      run(readOf(RecordedRequests.SCRIPT))
+      run(readOf(RecordedRequests.SOURCE))
+      await new Promise(resolve => { setTimeout(resolve, 30) })
+      // The answer is the recorded `assistant/message`: its usage on the event and the same usage as the last usage chunk of its stream.
+      return { text, usage: recorded.data.usage as Record<string, number>, stream: recorded.data.stream as unknown[] }
+    }, requests.editedScript())
+    expect(line.tokens).toBe(JudgeEvents.RECORDED_TOKENS)
+    expect(line.tokens).toBe(13160)
+    expect(line.seconds).toBeGreaterThan(0)
+    expect(line.reads).toEqual([{ path: inProject(RecordedRequests.SCRIPT), used: true }, { path: inProject(RecordedRequests.SOURCE), used: false }])
   })
 
   it('lets no read of a secret file through and does not list it in the decision', async () => {

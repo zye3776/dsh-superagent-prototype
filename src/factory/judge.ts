@@ -19,6 +19,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { AssessRefusal } from './decisions.ts'
+import { TokenTally } from './usage.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -32,8 +33,11 @@ export interface JudgeToolCall { name: string; arguments: unknown }
 export interface JudgeGuard { check(call: JudgeToolCall, cwd: string): string | undefined }
 /** Gives the guard every judge Session is checked with. It rejects with `AssessRefusal(503)` when there is none. */
 export interface GuardSource { guard(): Promise<JudgeGuard> }
-/** A judge's answer to one question: its text, and the full paths of the files it read with the `read` tool while it answered, in the order it first read them. */
-export interface JudgeReply { text: string; reads: string[] }
+/**
+ * A judge's answer to one question: its text, the full paths of the files it read with the `read` tool while it answered, in the order it first read them, and the
+ * tokens the answer used, counted by `TokenTally` from the events the judge Session recorded between the question and the end of its turn.
+ */
+export interface JudgeReply { text: string; reads: string[]; tokens: number }
 /** A judge as the one who asks it sees it: the brief, one question at a time, and whether it ever read a file. */
 export type AskedJudge = Pick<JudgeSession, 'brief' | 'consult' | 'readPath'>
 /** Opens the judge Session of one worker session. `ModelJudge` (`verdict.ts`) knows only this much of `JudgeSessions`. */
@@ -179,7 +183,7 @@ export class JudgeSession {
   }
 
   /**
-   * Like `ask`, and also returns the files the judge read with the `read` tool between this question and its answer.
+   * Like `ask`, and also returns the files the judge read with the `read` tool between this question and its answer, and the tokens that answer used.
    * @param text - the message, or a function that gives it. The function is called when the message is sent, after the questions before it were answered, so a
    * message built from `brief()` there names the files as they are then; it is not called for a question given up before it was sent.
    * @param signal - gives up waiting when aborted; the judge's turn is not stopped.
@@ -205,9 +209,11 @@ export class JudgeSession {
     const abort = () => { aborted.reject(signal.reason) }
     signal.addEventListener('abort', abort, { once: true })
     try { await Promise.race([agent.whenIdle(), aborted.promise]) } finally { signal.removeEventListener('abort', abort) }
-    const last = agent.session.snapshotEvents().slice(before).filter(event => event.type === 'assistant/message').at(-1)
+    // Only the events of this question: the Session also holds the events of every question before it.
+    const events = agent.session.snapshotEvents().slice(before)
+    const last = events.filter(event => event.type === 'assistant/message').at(-1)
     return { text: last?.type === 'assistant/message' ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : '',
-      reads: [...reads] }
+      reads: [...reads], tokens: TokenTally.of(events) }
   }
 }
 

@@ -40,4 +40,5 @@ export { AssessRoute, StubJudge, type AssessRequest, type Judge, type TokenSourc
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export { SharedTokenFile } from './token.ts'
+export { TokenTally, type TalliedEvent } from './usage.ts'
 export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

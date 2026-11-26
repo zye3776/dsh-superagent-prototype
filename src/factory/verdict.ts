@@ -114,8 +114,9 @@ export class JudgeAnswer {
    * The decision for `request`, held to the rules.
    * @param judge - says which files the judge ever read.
    * @param reads - the full paths of the files the judge read with the `read` tool while it answered this request.
+   * @param tokens - the tokens of every answer the judge gave for this request, added up.
    */
-  verdict(request: AssessRequest, judge: Pick<AskedJudge, 'readPath'>, reads: readonly string[]): Verdict {
+  verdict(request: AssessRequest, judge: Pick<AskedJudge, 'readPath'>, reads: readonly string[], tokens = 0): Verdict {
     // Only an action that is hard to undo may go to the owner; `risk` does not count here, because a risky action can still be easy to take back.
     const refused = this.decision === 'ask_owner' && this.undo !== 'hard'
     const decision = refused ? 'deny' : this.decision
@@ -125,7 +126,7 @@ export class JudgeAnswer {
       // Only a deny says what to do instead; an alternative the judge wrote for another decision is left out.
       alternative: decision !== 'deny' ? '' : this.alternative === '' ? JudgeAnswer.ALTERNATIVE : this.alternative,
       cites: this.cites === '' ? JudgeAnswer.CITES : this.cites,
-      reads: this.readsOf(judge, reads), tokens: 0,
+      reads: this.readsOf(judge, reads), tokens,
     }
   }
 
@@ -215,12 +216,15 @@ export class ModelJudge implements Judge {
     const judge = await ModelJudge.opened(this.judges.open(request.project, request.session_id), signal)
     const question = new JudgeQuestion(request)
     const reads: string[] = []
+    // The cost of the decision is every question asked for it: the first one and the repair question.
+    let tokens = 0
     // The brief is taken when the question is sent, so a question that waits behind another one names the files as they are then.
     let text: string | (() => string) = () => question.text(judge.brief())
     for (let attempt = 1; ; attempt++) {
       const reply = await ModelJudge.asked(judge, text, signal)
       for (const path of reply.reads) if (!reads.includes(path)) reads.push(path)
-      try { return JudgeAnswer.parse(reply.text).verdict(request, judge, reads) }
+      tokens += reply.tokens
+      try { return JudgeAnswer.parse(reply.text).verdict(request, judge, reads, tokens) }
       catch (error) {
         if (!(error instanceof UnusableAnswer)) throw error
         if (attempt === 2) throw new AssessRefusal(503, ModelJudge.UNUSABLE)

@@ -1,6 +1,6 @@
 # Example profile that runs only the factory's /assess route ($DSH_HOME/profiles/factory/cordis.patch.yml).
 # The owner's software factory posts a permission request to http://127.0.0.1:3083/assess and gets a decision back.
-# Replace both <placeholders> before first start.
+# Replace the three <placeholders> before first start.
 - id: webserver
   config:
     host: 127.0.0.1
@@ -13,6 +13,9 @@
   disabled: true
 - id: dsh-superagent-feishu
   disabled: true
+# The agent preset the route's judge Sessions are created with. A judge reads a project and changes nothing.
+- id: dsh-superagent-judge-preset
+  disabled: false
 - id: dsh-superagent-factory
   disabled: false
   config:
@@ -25,5 +28,9 @@
     # The file is loaded once: after the factory rebuilds it, restart DSH so the new one is used.
     # The factory's setup (its story 7) will write this line; until then, set it by hand.
     maskModule: <absolute path of lib/dist/decisionMask.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/decisionMask.js>
+    # The factory's built judge guard file. Every tool call of a judge Session is checked with it: only read, grep, glob and
+    # read-only shell commands run, and no secret file is read. There is no default: without it no judge Session is opened and
+    # the route answers 503 and writes nothing. Like the mask file it is loaded once: restart DSH after the factory rebuilds it.
+    guardModule: <absolute path of lib/dist/judgeGuard.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/judgeGuard.js>
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

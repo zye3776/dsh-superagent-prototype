@@ -2,7 +2,8 @@
  * The factory's `POST /assess` route: a factory hook posts one masked permission request, and the route answers with one
  * decision and appends that same decision as one line to `<project>/.factory/decisions.jsonl`.
  * The decision is masked with the factory's own mask before it is written and answered (`decisions.ts`); with no mask the route answers 503.
- * This first version asks no model: `StubJudge` gives the same fixed, safe answer to every request.
+ * This version asks no model: `StubJudge` gives the same fixed, safe answer to every request. Each request still opens the judge Session of its worker
+ * session (`judge.ts`), one for each `session_id` of a project, which is asked nothing yet; when that Session cannot be opened the route answers 503.
  * Only the factory is answered: a caller must be on this machine and send the shared token (`token.ts`), and the route sends
  * the token back with each decision, so the factory can tell this route's reply from another service's.
  */
@@ -12,12 +13,16 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
 import { AssessRefusal, DecisionWriter, type Decision } from './decisions.ts'
+import type { JudgeOpener } from './judge.ts'
 import { SharedTokenFile } from './token.ts'
 
 export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
 
-/** What the factory posts: its masked request record. Only these two fields are read here; `project` is the raw absolute path. */
-export interface AssessRequest { request_id: string; project: string; [field: string]: unknown }
+/**
+ * What the factory posts: its masked request record. Only these three fields are read here; `project` is the raw absolute path, and `session_id` names the
+ * worker session that asks, which gets a judge Session of its own.
+ */
+export interface AssessRequest { request_id: string; project: string; session_id: string; [field: string]: unknown }
 
 /**
  * Stands in for the judge until a model is asked: every request gets the same decision, `ask_owner`.
@@ -49,7 +54,8 @@ export interface TokenSource { read(): string | undefined }
  * Serves `POST /assess` on DSH's web server, for the factory on this machine only.
  * It refuses a web server that is not bound to 127.0.0.1, a Host header that is not loopback, a request with an Origin header (a browser), a caller whose address is
  * not loopback, any method but POST, a caller that does not send the shared token, a body over 128 KiB or not JSON, and a project that its configuration does not list.
- * A decision that cannot be masked (no mask module, or one that fails) is refused with 503 and not written.
+ * A decision that cannot be masked (no mask module, or one that fails) is refused with 503 and not written, and so is a request whose judge Session cannot be
+ * opened (no guard module, or DSH fails to make the Session).
  * Everything up to and including the token is checked before the body is read. The token is written to no file, log line or error message: only the 200 reply
  * carries it, in the `x-factory-token` header.
  */
@@ -60,7 +66,9 @@ export class AssessRoute {
   static readonly LOOPBACK_ADDRESSES: ReadonlySet<string> = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
   private readonly projects: ReadonlySet<string>
   constructor(projects: readonly string[], private readonly tokens: TokenSource = new SharedTokenFile(), private readonly judge: StubJudge = new StubJudge(),
-    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter()) {
+    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter(),
+    /** Opens the judge Session of a request's worker session. Left out, no Session is opened: the route then only answers with the stub. */
+    private readonly judges?: JudgeOpener) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     // Normalised, so an entry written with a trailing slash or `..` still matches the absolute path a caller sends.
@@ -111,9 +119,13 @@ export class AssessRoute {
     return token
   }
 
-  /** Decides one request, and has the decision masked and appended to its project's file. Returns the line as written, which is the masked one. */
+  /**
+   * Decides one request, and has the decision masked and appended to its project's file. Returns the line as written, which is the masked one.
+   * The judge Session of the request's worker session is opened first and asked nothing: the stub still decides.
+   */
   async assess(request: AssessRequest): Promise<string> {
     if (!this.projects.has(request.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
+    await this.judges?.open(request.project, request.session_id)
     const started = performance.now()
     const verdict = this.judge.decide(request)
     const seconds = Math.round(performance.now() - started) / 1000
@@ -122,9 +134,10 @@ export class AssessRoute {
 
   private static requestOf(body: unknown): AssessRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
-    const { request_id: id, project } = body as Record<string, unknown>
+    const { request_id: id, project, session_id: session } = body as Record<string, unknown>
     if (typeof id !== 'string' || id === '') throw new AssessRefusal(400, 'The request has no request_id')
     if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
+    if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
     return body as AssessRequest
   }
 

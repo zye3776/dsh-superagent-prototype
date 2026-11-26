@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
+import { JudgeSessions } from '../src/factory/judge.ts'
 
 interface Row { id?: string; name: string; disabled?: unknown; config?: Record<string, unknown> & { plugins?: Row[] } | Row[] }
 /** The patch as DSH reads it: Cordis's include plugin parses `!!js` scalars, and applies the inserts to an entry list. */
@@ -29,7 +30,7 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
   expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-factory',
-    'dsh-superagent-worker-preset', 'dsh-superagent-router-preset'])
+    'dsh-superagent-worker-preset', 'dsh-superagent-router-preset', 'dsh-superagent-judge-preset'])
   // The factory route is off unless a profile turns it on, so the prototype's own profiles do not change.
   expect(rows.find(row => row.id === 'dsh-superagent-factory')).toEqual({ id: 'dsh-superagent-factory', name: 'dsh-superagent/factory', disabled: true })
   const preset = presetOf(rows, WORKER_PRESET)
@@ -72,4 +73,35 @@ it('defines the router preset the main Session runs under: the worker\'s 5-secon
     '@deepseek-ai/dsh-tool-todo', '@deepseek-ai/dsh-tool-ask-user', '@deepseek-ai/dsh-tool-present', '@deepseek-ai/dsh-plan-mode',
     '@deepseek-ai/dsh-plugin-manager/tools', '@deepseek-ai/dsh-plugin-market/tools', '@deepseek-ai/dsh-tool-schedule', '@deepseek-ai/dsh-tool-goal',
     '@deepseek-ai/dsh-command-goal', '@deepseek-ai/dsh-tool-workflow', '@deepseek-ai/dsh-workflow-ptc']) expect(names, name).not.toContain(name)
+})
+
+it('defines the factory\'s judge preset, off unless a profile turns it on: a shell, file tools that only read, and file search', async () => {
+  const rows = await patched()
+  const row = rows.find(item => item.id === 'dsh-superagent-judge-preset')!
+  // Off like the factory route, so the prototype's own profiles do not change.
+  expect(row.disabled).toBe(true)
+  expect(rows.filter(item => item.disabled === true).map(item => item.id)).toEqual(['dsh-superagent-feishu', 'dsh-superagent-factory', 'dsh-superagent-judge-preset'])
+  const judge = presetOf(rows, JudgeSessions.PRESET)
+  expect({ id: judge.id, order: judge.order }).toEqual({ id: 'dsh-superagent-judge', order: 92 })
+  const plugins = flat(judge.plugins)
+  const named = (name: string) => plugins.filter(item => item.name === name).map(item => item.config)
+  expect(named('@deepseek-ai/dsh-tool-fs')).toEqual([{ write: false, edit: false }])
+  expect(named('@deepseek-ai/dsh-tool-fs-search')).toEqual([{ sampleOverCapGlobResults: false }])
+  // No background jobs: a command that reaches its timeout is killed.
+  expect(named('@deepseek-ai/dsh-tool-bash')).toEqual([{ enableRunInBackground: false, promoteOnTimeout: false }])
+  expect(named('@deepseek-ai/dsh-bash-sandbox').length).toBe(1)
+  const names = plugins.map(item => item.name)
+  for (const name of ['@deepseek-ai/dsh-tool-jobs', '@deepseek-ai/dsh-tool-skill', '@deepseek-ai/dsh-skill-filesystem', '@deepseek-ai/dsh-compaction-basic',
+    '@deepseek-ai/dsh-compaction-tool-result-pruner', '@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-web', '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-tool-ask-user', '@deepseek-ai/dsh-persona',
+    // The project's AGENTS.md and CLAUDE.md, which the judged worker can write, do not become the judge's instructions.
+    '@deepseek-ai/dsh-agent-instructions']) expect(names, name).not.toContain(name)
+})
+
+it('turns the judge preset and the factory route on in the factory\'s example profile, and names the guard file', () => {
+  const example = readFileSync(join(import.meta.dirname, '..', 'examples', 'factory-profile.cordis.patch.yml'), 'utf8')
+  expect(example).toMatch(/^- id: dsh-superagent-judge-preset\n  disabled: false$/m)
+  expect(example).toMatch(/^- id: dsh-superagent-factory\n  disabled: false$/m)
+  expect(example).toMatch(/^    guardModule: <absolute path of lib\/dist\/judgeGuard\.js /m)
+  expect(example).toMatch(/^    maskModule: <absolute path of lib\/dist\/decisionMask\.js /m)
 })

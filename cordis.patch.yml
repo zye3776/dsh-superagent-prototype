@@ -196,3 +196,52 @@
                   thresholdChars: 8192
                   headChars: 4096
                   tailChars: 1024
+    # The agent preset of every judge Session of the factory plugin (JudgeSessions.PRESET in src/factory/judge.ts): the Session that
+    # reads a project for the owner's software factory and changes nothing. Off unless a profile turns it on, as the factory route
+    # is (examples/factory-profile.cordis.patch.yml), so the prototype's own profiles do not change. Only what a judge uses: a shell,
+    # the file tools without write and edit, and file search. No background jobs, compaction, skills, subagents or web, and no
+    # agent-instructions plugin: the project's AGENTS.md and CLAUDE.md, which the judged worker can write, must not become the
+    # judge's own instructions; the judge reads them as project files. A preset row cannot set the sandbox, so the plugin sets DSH's `read-only` permission preset on each judge Session, allows only the
+    # tools read, grep, glob and bash, and checks every call with the factory's guard.
+    - id: dsh-superagent-judge-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      disabled: true
+      config:
+        id: dsh-superagent-judge
+        name: Factory judge (dsh-superagent)
+        description: For the judge Sessions of the factory's /assess route only, not for manual selection. Read-only tools; the factory plugin sets the read-only sandbox and its guard.
+        order: 92
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: shell
+            name: cordis:group
+            group: true
+            isolate:
+              shell: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                disabled: !!js process.platform === 'win32'
+              - id: pwsh-sandbox
+                name: '@deepseek-ai/dsh-pwsh-sandbox'
+                disabled: !!js process.platform !== 'win32'
+              # No background jobs: a command that reaches its timeout is killed.
+              - id: tool-bash
+                name: '@deepseek-ai/dsh-tool-bash'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  enableRunInBackground: false
+                  promoteOnTimeout: false
+              - id: tool-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh'
+                disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false

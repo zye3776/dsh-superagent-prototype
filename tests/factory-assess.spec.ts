@@ -8,8 +8,10 @@ import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { AssessRoute, DecisionsFile, StubJudge } from '../src/factory/assess.ts'
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
+import { FactoryGuardModule, JudgeSessions, type JudgeOpener } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
+import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
 interface Route { kind: string; path: string; auth?: string; handler: Handler }
@@ -42,13 +44,13 @@ const sample = (fields: Record<string, unknown> = {}) => ({ request_id: 'req-1',
   tool_input: { command: 'ls' }, reason: 'List files', project, ...fields })
 
 /** Serves the route of a fake DSH web server over real HTTP, reading the token file and the fake mask of the test, and returns the route as it was registered. */
-async function serve(projects: string[] = [project], mask: DecisionWriter = writer()): Promise<Route> {
+async function serve(projects: string[] = [project], mask: DecisionWriter = writer(), judges?: JudgeOpener): Promise<Route> {
   let route: Route | undefined
   server = createServer((req, res) => { void route!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { route = registered; return () => {} } } }
-  new AssessRoute(projects, new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW), mask).register(ctx as never)
+  new AssessRoute(projects, new SharedTokenFile(tokenPath()), new StubJudge(), () => new Date(NOW), mask, judges).register(ctx as never)
   return route!
 }
 /** Sends one request with the valid token, unless `headers` gives another one or `undefined` for none. */
@@ -170,6 +172,10 @@ it('refuses a body that is not JSON, too large, or without request_id or project
   expect((await call('POST', sample({ request_id: undefined }))).body).toEqual({ error: 'The request has no request_id' })
   expect((await call('POST', sample({ request_id: 7 }))).status).toBe(400)
   expect((await call('POST', sample({ project: undefined }))).body).toEqual({ error: 'The request has no project' })
+  const nameless = await call('POST', sample({ session_id: undefined }))
+  expect([nameless.status, nameless.body]).toEqual([400, { error: 'The request has no session_id' }])
+  expect((await call('POST', sample({ session_id: '' }))).status).toBe(400)
+  expect((await call('POST', sample({ session_id: 7 }))).status).toBe(400)
   const large = sample({ reason: 'x'.repeat(AssessRoute.MAX_BODY_BYTES) })
   expect((await call('POST', large)).status).toBe(413)
   // The same upload sent in pieces, without a length the route could refuse up front.
@@ -188,8 +194,10 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
   expect(existsSync(file())).toBe(false)
 })
 
-it('is a plugin that needs only the web server and mounts the route for the configured projects', () => {
-  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer']])
+it('is a plugin that needs the web server and DSH\'s Session services, and mounts the route for the configured projects', () => {
+  expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']])
+  expect(plugin.Config({ guardModule: '/factory/lib/dist/judgeGuard.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, guardModule: '/factory/lib/dist/judgeGuard.js' })
+  expect(() => plugin.Config({ guardModule: 'relative/judgeGuard.js' })).toThrow()
   expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath() })
   expect(plugin.Config({ maskModule: maskPath() })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, maskModule: maskPath() })
   expect(() => plugin.Config({ maskModule: 'relative/decisionMask.js' })).toThrow()
@@ -205,18 +213,32 @@ it('is a plugin that needs only the web server and mounts the route for the conf
   expect(registered.map(route => route.path)).toEqual(['/assess'])
 })
 
-it('is a plugin that reads the shared token from the configured token file and masks with the configured mask module', async () => {
+it('is a plugin that reads the shared token from the configured token file, masks with the configured mask module and guards its judges with the configured guard module', async () => {
   // Not the file the other tests use, so only `tokenFile` can have led the route to it.
   const configured = join(root, 'configured-token')
   writeFileSync(configured, `${OTHER_TOKEN}\n`)
   chmodSync(configured, 0o600)
   const registered: Route[] = []
-  const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+  const dsh = fakeDsh()
+  const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
     effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+  // Without a guard module the plugin's route opens no judge Session and writes nothing.
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath() }))
+  const unguarded = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
+  await registered[0]!.handler(unguarded.req, unguarded.res)
+  expect([unguarded.answer.status, JSON.parse(unguarded.answer.text)]).toEqual([503, { error: 'No guardModule is configured, so no judge session is opened and no decision is written' }])
+  expect([existsSync(file()), dsh.agents.size]).toEqual([false, 0])
+  registered.length = 0
+  const guardPath = join(root, 'fake-guard.mjs')
+  writeFileSync(guardPath, 'export const JudgeToolGuard = { forHome: () => ({ check: call => call.name === "write" ? "Refused: write" : undefined }) }\n')
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath(), guardModule: guardPath }))
   const accepted = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
   await registered[0]!.handler(accepted.req, accepted.res)
   expect([accepted.answer.status, accepted.answer.headers[SharedTokenFile.HEADER]]).toEqual([200, OTHER_TOKEN])
+  // The request opened the judge Session of its worker session, guarded by the configured module.
+  const judgeId = JudgeSessions.idOf(project, 's1')
+  expect([...dsh.agents.keys()]).toEqual([judgeId])
+  expect(dsh.run(judgeId, { name: 'write', arguments: {} })).toBe('Refused: write')
   expect((JSON.parse(accepted.answer.text) as { reason: string }).reason).toBe(`${StubJudge.REASON}${MASKED}`)
   // The token of the default test file is not the configured one.
   const refused = direct('127.0.0.1')
@@ -340,4 +362,43 @@ it('throws away the upload of a caller it refuses before the body, so the caller
   expect((await call('POST', upload, { [SharedTokenFile.HEADER]: undefined, 'transfer-encoding': 'chunked' })).status).toBe(401)
   expect((await call('PUT', upload, { 'transfer-encoding': 'chunked' })).status).toBe(405)
   expect(existsSync(file())).toBe(false)
+})
+
+it('sends two requests of one session_id to one judge Session and gives another session_id its own, and asks the judge nothing', async () => {
+  const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, fakeGuard().source)
+  await serve([project], writer(), judges)
+  const [first, together] = await Promise.all([call('POST', sample()), call('POST', sample({ request_id: 'req-2' }))])
+  expect([first.status, together.status]).toEqual([200, 200])
+  expect((await call('POST', sample({ request_id: 'req-3' }))).status).toBe(200)
+  const own = JudgeSessions.idOf(project, 's1')
+  expect([...dsh.agents.keys()]).toEqual([own])
+  expect(dsh.controller.create).toHaveBeenCalledTimes(1)
+  expect((await call('POST', sample({ request_id: 'req-4', session_id: 's2' }))).status).toBe(200)
+  expect([...dsh.agents.keys()]).toEqual([own, JudgeSessions.idOf(project, 's2')])
+  expect(judges.count).toBe(2)
+  // The stub still decides, and the judge is sent no message.
+  expect(lines().map(line => (JSON.parse(line) as { decision: string }).decision)).toEqual(['ask_owner', 'ask_owner', 'ask_owner', 'ask_owner'])
+  expect([...dsh.agents.values()].flatMap(agent => agent.asked)).toEqual([])
+})
+
+it('opens no judge Session for a project that is not listed, and answers 503 and writes nothing when the Session cannot be opened', async () => {
+  const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, fakeGuard().source)
+  await serve([project], writer(), judges)
+  expect((await call('POST', sample({ project: join(root, 'unlisted') }))).status).toBe(403)
+  expect(dsh.controller.resolveAgent).not.toHaveBeenCalled()
+  dsh.controller.create.mockRejectedValueOnce(new Error('planted-detail'))
+  const failed = await call('POST', sample())
+  expect([failed.status, failed.body]).toEqual([503, { error: 'The judge session could not be opened, so no decision is written' }])
+  expect(existsSync(file())).toBe(false)
+  // The next request tries again.
+  expect((await call('POST', sample())).status).toBe(200)
+  expect(lines()).toHaveLength(1)
+})
+
+it('answers 503 and writes nothing when no guard module is configured', async () => {
+  const dsh = fakeDsh()
+  await serve([project], writer(), new JudgeSessions(dsh.ctx, new FactoryGuardModule()))
+  const answer = await call('POST', sample())
+  expect([answer.status, answer.body]).toEqual([503, { error: 'No guardModule is configured, so no judge session is opened and no decision is written' }])
+  expect([existsSync(file()), dsh.agents.size]).toEqual([false, 0])
 })

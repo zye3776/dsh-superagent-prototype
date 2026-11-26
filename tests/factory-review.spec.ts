@@ -287,7 +287,8 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   const nonce = /script-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(policy)![1]!
   expect(policy).toBe(`default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`)
   expect([answer.headers['cache-control'], answer.headers['x-content-type-options'], answer.headers['x-frame-options'], answer.headers['referrer-policy'], answer.headers['content-type']])
-    .toEqual(['no-store', 'nosniff', 'DENY', 'no-referrer', 'text/html; charset=utf-8'])
+    // same-origin, not no-referrer: under no-referrer a browser sends Origin: null with the sign-in form, which admit refuses (owner's check, story 3.1).
+    .toEqual(['no-store', 'nosniff', 'DENY', 'same-origin', 'text/html; charset=utf-8'])
   const page = dom(answer.text)
   expect([page.querySelectorAll('script').length, page.querySelector('script')!.getAttribute('nonce'), page.querySelector('style')!.getAttribute('nonce')]).toEqual([1, nonce, nonce])
   expect([page.querySelector('script[src]'), page.querySelector('link'), page.querySelector('img'), page.querySelector('[style]')]).toEqual([null, null, null, null])

@@ -366,9 +366,13 @@ export class ReviewRoute {
       req.on('end', () => { if (chunks) resolve(Buffer.concat(chunks).toString('utf8')) })
     })
   }
-  /** Sends a page. Its content security policy lets it load nothing but its own one style and one script, and talk to nothing but this web server. */
+  /**
+   * Sends a page. Its content security policy lets it load nothing but its own one style and one script, and talk to nothing but this web server.
+   * The referrer policy is `same-origin`, not `no-referrer`: under `no-referrer` a browser sends `Origin: null` with a form post, so `admit` would refuse
+   * the page's own sign-in. `same-origin` still sends no referrer to any other site.
+   */
   private static sendPage(res: ServerResponse, status: number, html: string, page: ReviewPage, headers: Record<string, string> = {}): void {
-    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin',
       'x-frame-options': 'DENY', 'content-security-policy': page.policy(), ...headers })
     res.end(html)
   }

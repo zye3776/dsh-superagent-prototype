@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
 import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn } from '../src/factory/review.ts'
-import { ReviewTalks, TalkFolder } from '../src/factory/talk.ts'
+import { ReviewTalks, TalkComments, TalkFolder } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -1351,8 +1351,8 @@ describe('the review talk and its proposals', () => {
   })
 
   /** The page of one job in a browser stand-in whose `fetch` is the test's, with the page's script running; links it opens are written down. */
-  function talkBrowser(talk: { started?: string }, answers: (url: string, init: { method?: string; body?: string }) => Promise<{ ok: boolean; json: () => Promise<unknown> }>) {
-    const reviews = [review({ comment: 'Good pace.' })]
+  function talkBrowser(talk: { started?: string; reviews?: ReviewLine[] }, answers: (url: string, init: { method?: string; body?: string }) => Promise<{ ok: boolean; status?: number; json: () => Promise<unknown> }>) {
+    const reviews = talk.reviews ?? [review({ comment: 'Good pace.' })]
     const shown: RecordedJob = { project, job_id: 'job-1', number: 1, started: NOW, stopped: null, last: NOW, steps: [{ automatic: false, ts: NOW, line: action() }], reviews }
     const entry: ProjectJobs = { project, jobs: [shown], outside: [] }
     const state = talk.started === undefined ? undefined : { project, job_id: 'job-1', number: 1, title: 'Review talk · project job 1', started: talk.started }
@@ -1426,6 +1426,85 @@ describe('the review talk and its proposals', () => {
     expect([button.disabled, page.notice().querySelector('a')!.textContent, page.opened]).toEqual([false, ReviewPage.OPEN_AGAIN, ['claude://code/new?folder=x&q=y']])
     button.click()
     expect(page.sent.length).toBe(2)
+    page.window.close()
+  })
+
+  it('a job with no comment shows the button disabled with the hint; a comment saved on the page enables it and removes the hint, without a reload', async () => {
+    const saves = [false, true]
+    const page = talkBrowser({ reviews: [] }, url => url === ReviewRoute.COMMENT_PATH ? json(saves.shift()!, {})
+      : json(true, { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
+    const document = page.window.document
+    const button = document.querySelector<HTMLButtonElement>('#start-talk')!
+    const hint = () => document.querySelector('#talk-hint')
+    expect([button.disabled, hint()?.textContent]).toEqual([true, TalkComments.NONE])
+    button.click()
+    expect(page.sent).toEqual([])
+    const field = document.querySelector<HTMLTextAreaElement>('#comment')!
+    // A save that fails leaves the button disabled: the job still has no comment.
+    field.value = 'Too slow.'
+    field.dispatchEvent(new page.window.FocusEvent('blur'))
+    await settle(); await settle()
+    expect([page.sent.map(each => each.url), button.disabled, hint()?.textContent]).toEqual([[ReviewRoute.COMMENT_PATH], true, TalkComments.NONE])
+    field.dispatchEvent(new page.window.FocusEvent('blur'))
+    await settle(); await settle()
+    expect([page.sent.map(each => each.url), button.disabled, hint()]).toEqual([[ReviewRoute.COMMENT_PATH, ReviewRoute.COMMENT_PATH], false, null])
+    button.click()
+    await settle(); await settle()
+    expect([page.sent[2]!.url, page.opened]).toEqual([ReviewRoute.TALK_PATH, ['claude://code/new?folder=x&q=y']])
+    page.window.close()
+  })
+
+  it('a job with a comment shows the button enabled and no hint; one with only a blank comment counts as none', () => {
+    const commented = talkBrowser({}, () => json(true, {}))
+    expect([commented.window.document.querySelector<HTMLButtonElement>('#start-talk')!.disabled, commented.window.document.querySelector('#talk-hint')]).toEqual([false, null])
+    commented.window.close()
+    const blank = talkBrowser({ reviews: [review({ comment: '   ' })] }, () => json(true, {}))
+    expect([blank.window.document.querySelector<HTMLButtonElement>('#start-talk')!.disabled, blank.window.document.querySelector('#talk-hint')?.textContent]).toEqual([true, TalkComments.NONE])
+    blank.window.close()
+  })
+
+  it('a start that ends does not re-enable a button that has to stay disabled, and a comment saved while it runs enables it once it ends', async () => {
+    let answer: () => void = () => {}
+    const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z', reviews: [] }, url => url === ReviewRoute.COMMENT_PATH ? json(true, {}) : new Promise(resolve => {
+      answer = () => { resolve({ ok: false, status: 409, json: () => Promise.resolve({ error: TalkComments.NONE }) }) }
+    }))
+    const button = page.window.document.querySelector<HTMLButtonElement>('#start-talk')!
+    page.press(page.notice().querySelector('#fresh-talk')!)
+    expect([page.sent.length, button.disabled]).toEqual([1, true])
+    answer()
+    await settle(); await settle()
+    expect([button.disabled, page.notice().textContent]).toEqual([true, TalkComments.NONE])
+    // Again, with a comment saved while the start runs: the button is pressable once the start is answered, not before.
+    const fresh = talkBrowser({ started: '2026-11-25T10:00:00.000Z', reviews: [] }, url => url === ReviewRoute.COMMENT_PATH ? json(true, {}) : new Promise(resolve => {
+      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }) }) }
+    }))
+    const again = fresh.window.document.querySelector<HTMLButtonElement>('#start-talk')!
+    fresh.press(fresh.notice().querySelector('#fresh-talk')!)
+    const field = fresh.window.document.querySelector<HTMLTextAreaElement>('#comment')!
+    field.value = 'Too slow.'
+    field.dispatchEvent(new fresh.window.FocusEvent('blur'))
+    await settle(); await settle()
+    expect(again.disabled).toBe(true)
+    answer()
+    await settle(); await settle()
+    expect(again.disabled).toBe(false)
+    page.window.close(); fresh.window.close()
+  })
+
+  it('shows the reason of any answer that is not OK in the notice, from a real 409 answer and from one with no JSON', async () => {
+    const answers = [
+      new Response(JSON.stringify({ error: TalkComments.NONE }), { status: 409, headers: { 'content-type': 'application/json; charset=utf-8' } }),
+      new Response('<html>Bad gateway</html>', { status: 502, headers: { 'content-type': 'text/html' } }),
+    ]
+    // A job with a comment, so the button is pressable; the server's 409 is what a stale page would get.
+    const page = talkBrowser({}, () => Promise.resolve(answers.shift()!))
+    const button = page.window.document.querySelector<HTMLButtonElement>('#start-talk')!
+    button.click()
+    await settle(); await settle()
+    expect([page.notice().hasAttribute('hidden'), page.notice().textContent, page.notice().classList.contains('refused'), button.disabled]).toEqual([false, TalkComments.NONE, true, false])
+    button.click()
+    await settle(); await settle()
+    expect(page.notice().textContent).toBe(`${ReviewPage.CANNOT_PREPARE}the review page answered HTTP 502`)
     page.window.close()
   })
 

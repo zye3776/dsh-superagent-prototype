@@ -27,7 +27,7 @@ import {
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
 import { TextDiff, type DiffLine } from './diff.ts'
-import { GuidelineProposals, ReviewTalks, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
+import { GuidelineProposals, ReviewTalks, TalkComments, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 
 /** Where the page gets the shared token from, on every request. `undefined` means there is no usable token. */
@@ -184,6 +184,8 @@ export class ReviewPage {
   static readonly OPEN_AGAIN = 'Open Claude Desktop again'
   static readonly FRESH_TALK = 'Start a fresh talk instead'
   static readonly CANNOT_PREPARE = 'The review talk could not be prepared: '
+  /** The event the comment field's script sends on the page once a comment is saved. */
+  static readonly COMMENT_SAVED = 'review-comment-saved'
   static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
   static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
   /** How often the page asks whether a proposal is waiting, in milliseconds; it also asks when its window gets focus. */
@@ -244,7 +246,11 @@ export class ReviewPage {
     '.head { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
     '.head .crumb { border-bottom: 0; }',
     'button.primary { padding: 4px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); cursor: pointer; }',
+    'button.primary:disabled { opacity: 0.45; cursor: not-allowed; }',
+    '.head .talk { display: flex; gap: 8px; align-items: center; }',
+    '.head .hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }',
     '.notice { margin: 8px 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font-size: 12px; }',
+    '.notice.refused { border-color: var(--dsw-alias-state-error-primary); }',
     '.notice .small { font-size: 11px; }',
     '.left a.proposal { border-left: 3px solid var(--dsw-alias-brand-primary); }',
     '.halves { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }',
@@ -284,6 +290,8 @@ export class ReviewPage {
       if (!answer.ok) throw new Error('not saved')
       saved = text
       status.textContent = ${JSON.stringify(ReviewPage.SAVED)}
+      // Tells the review talk's button that the job now has a comment, so it can be pressed.
+      document.dispatchEvent(new CustomEvent(${JSON.stringify(ReviewPage.COMMENT_SAVED)}))
     } catch { status.textContent = ${JSON.stringify(ReviewPage.NOT_SAVED)} }
     sending = false
     if (again) { again = false; void save() }
@@ -304,16 +312,26 @@ export class ReviewPage {
    * The review talk button's part of the script. A click posts the job to the talk address; the answer says what to show. When a talk was prepared it
    * shows the notice with "Open Claude Desktop again" and opens the answer's `claude://` link, which hands it to Claude Desktop: the page does not
    * navigate away. When the talk was started before, it shows the notice that names it, with "Start a fresh talk instead", which posts again with
-   * `fresh`. A refusal shows the page's own reason. Every text is set as text, never as markup. The button is disabled while a start runs, and a click
-   * then, on it or on the fresh link, is ignored.
+   * `fresh`. A refusal, or any other answer that is not OK, shows its reason (the answer's `error`, else the HTTP status) in the notice, marked as a
+   * refusal. Every text is set as text, never as markup. The button is disabled while a start runs, and a click then, on it or on the fresh link, is
+   * ignored. A job with no comment yet gets the button disabled, with the hint beside it; the first comment saved on the page enables it and removes the
+   * hint, and a start that ends never re-enables a button that has to stay disabled.
    */
   private static talkScript(): string {
     return `(() => {
   const button = document.getElementById('start-talk'), notice = document.getElementById('talk-notice')
   if (!button || !notice) return
+  // The button is pressable only when the job has a comment and no start runs.
+  let ready = !button.disabled, busy = false
+  const sync = () => { button.disabled = busy || !ready }
+  document.addEventListener(${JSON.stringify(ReviewPage.COMMENT_SAVED)}, () => {
+    ready = true; sync()
+    const hint = document.getElementById('talk-hint'); if (hint) hint.remove()
+  })
   const openLink = link => { const anchor = document.createElement('a'); anchor.href = link; anchor.click() }
-  const show = (text, again, fresh) => {
+  const show = (text, again, fresh, refused) => {
     notice.replaceChildren()
+    notice.classList.toggle('refused', refused === true)
     const words = document.createElement('span'); words.textContent = text; notice.append(words)
     if (again) { const link = document.createElement('a'); link.href = again.link; link.textContent = again.label; notice.append(' ', link) }
     if (fresh) {
@@ -325,9 +343,9 @@ export class ReviewPage {
   }
   // One start at a time: a second click while one runs is ignored, so two requests never prepare the same folder at once.
   const start = async fresh => {
-    if (button.disabled) return
-    button.disabled = true
-    try { await send(fresh) } finally { button.disabled = false }
+    if (busy) return
+    busy = true; sync()
+    try { await send(fresh) } finally { busy = false; sync() }
   }
   const send = async fresh => {
     let answer, body = {}
@@ -335,8 +353,11 @@ export class ReviewPage {
       answer = await fetch(${JSON.stringify(ReviewRoute.TALK_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ project: button.dataset.project, job_id: button.dataset.job, fresh }) })
       body = await answer.json().catch(() => ({}))
-    } catch { show(${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}); return }
-    if (!answer.ok) { show(typeof body.error === 'string' ? body.error : ${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}); return }
+    } catch { show(${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}, undefined, undefined, true); return }
+    if (!answer.ok) {
+      const reason = typeof body.error === 'string' && body.error !== '' ? body.error : ${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page answered HTTP `)} + answer.status
+      show(reason, undefined, undefined, true); return
+    }
     if (body.opened === true && typeof body.link === 'string') { show(body.notice, { link: body.link, label: body.again }); openLink(body.link) }
     else show(body.notice, undefined, body.fresh)
   }
@@ -440,7 +461,11 @@ ${panel}
    * hidden until a click fills it, unless the job's talk was started before: then it names the talk, with the link that starts a fresh one.
    */
   private static talkHead(job: RecordedJob, talk: TalkState | undefined): string {
-    const button = `<button type="button" id="start-talk" class="primary" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.START_TALK}</button></div>`
+    // The same rule the talk's start applies: a job with no comment has no talk, so its button starts disabled with the reason beside it.
+    const commented = new TalkComments(job).entries.length > 0
+    const hint = commented ? '' : `<span id="talk-hint" class="hint">${ReviewPage.escape(TalkComments.NONE)}</span>`
+    const button = `<span class="talk">${hint}<button type="button" id="start-talk" class="primary" data-project="${ReviewPage.escape(job.project)}" data-job="${
+      ReviewPage.escape(job.job_id)}"${commented ? '' : ' disabled'}>${ReviewPage.START_TALK}</button></span></div>`
     if (talk === undefined) return `${button}\n<div id="talk-notice" class="notice" role="status" hidden></div>`
     return `${button}\n<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>`
   }

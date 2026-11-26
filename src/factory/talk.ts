@@ -50,6 +50,8 @@ export interface TalkServer { node: string; server: string; url: string; tokenFi
 
 /** The owner's comments on one job, the newest per step and for the whole job, in timeline order: the whole job's first. */
 export class TalkComments {
+  /** Why a job with no comment has no talk: the start's refusal, and the hint beside the review page's disabled button. */
+  static readonly NONE = 'Comment on the job or a step first.'
   readonly entries: readonly { step?: TimelineStep; text: string }[]
   constructor(job: RecordedJob) {
     const newest = new Map<string, string>()
@@ -330,7 +332,7 @@ export class ReviewTalks {
    */
   async start(job: RecordedJob, address: string, fresh: boolean): Promise<TalkStart> {
     const comments = new TalkComments(job)
-    if (comments.entries.length === 0) throw new TalkRefusal(409, 'Comment on the job or a step first.')
+    if (comments.entries.length === 0) throw new TalkRefusal(409, TalkComments.NONE)
     const folder = TalkFolder.of(this.root, job)
     const existing = folder.state()
     if (existing !== undefined && !fresh) return { opened: false, state: existing }

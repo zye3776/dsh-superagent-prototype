@@ -36,6 +36,25 @@ export interface JobStep {
 }
 /** What the factory's reader gives for one project: its job log lines and its comment lines, each list in file order. */
 export interface ReadJobLog { actions: JobLogLine[]; reviews: ReviewLine[] }
+/**
+ * A request the fixed checks (the gate's static rules) answered on their own, read from the project's `requests.jsonl`: what was asked and the answer,
+ * `allow` ("automatic yes") or `refuse` ("automatic no"). The shape is the factory's (`lib/jobLog`, `AutomaticAnswer`); this type follows it.
+ */
+export interface AutomaticAnswer {
+  ts: string; request_id: string; session_id: string; tool_name: string; tool_input: unknown; reason: string; answer: 'allow' | 'refuse'
+}
+/** One row of a job's timeline: a job log line, or an automatic answer given while the job ran. */
+export type TimelineStep = { automatic: false; ts: string; line: JobLogLine } | { automatic: true; ts: string; answer: AutomaticAnswer }
+/**
+ * One job as the factory's `JobsReader` gives it: `number` counts the project's jobs from its oldest (1); `stopped` is null when the job ended without a
+ * `job_stop` line; `last` is its last line's time; `steps` are in time order; `reviews` are its comment lines in file order.
+ */
+export interface RecordedJob {
+  project: string; job_id: string; number: number; started: string; stopped: string | null; last: string; guideline_version?: string
+  steps: TimelineStep[]; reviews: ReviewLine[]
+}
+/** One target project as the factory's `JobsReader` gives it: its jobs, newest first, and the automatic answers that fell in no job, in time order. */
+export interface ProjectJobs { project: string; jobs: RecordedJob[]; outside: AutomaticAnswer[] }
 
 /**
  * Represents a record that could not be written or read, with the HTTP status the review page answers.
@@ -93,22 +112,28 @@ export class FactoryRecordFile {
 export interface RecordsMasker { maskAction(line: JobLogLine): JobLogLine; maskReview(line: ReviewLine): ReviewLine }
 /** Reads one project's job log and comments. It skips what it cannot read and never throws. */
 export interface RecordsReader { read(project: string): ReadJobLog }
-/** Gives the masker of one project and the reader. Each rejects with `RecordsRefusal(503)` when there is none. */
-export interface RecordsSource { maskerFor(project: string): Promise<RecordsMasker>; reader(): Promise<RecordsReader> }
-/** What the factory's built job log file exports: `JobLogMask.forProject(project)` gives the masker of that project, `new JobLogReader()` the reader. */
-interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown }
+/** Reads every listed project's records back as jobs, one entry per project in the order given. It skips what it cannot read and never throws. */
+export interface JobsSource { read(projects: readonly string[]): ProjectJobs[] }
+/** Gives the masker of one project and the two readers. Each rejects with `RecordsRefusal(503)` when there is none. */
+export interface RecordsSource { maskerFor(project: string): Promise<RecordsMasker>; reader(): Promise<RecordsReader>; jobsReader(): Promise<JobsSource> }
+/**
+ * What the factory's built job log file exports: `JobLogMask.forProject(project)` gives the masker of that project, `new JobLogReader()` the reader of
+ * one project's lines, and `new JobsReader()` the reader of the projects' jobs.
+ */
+interface RecordsModuleExports { JobLogMask?: { forProject?: unknown }; JobLogReader?: unknown; JobsReader?: unknown }
 
 /**
  * The factory's job log code, loaded from its built file `lib/dist/jobLog.js`.
- * The file is imported on first use, not at start, so the plugin starts without it; a masker is built once for each project and the reader once.
- * Any failure is a 503: no path given, a path that is not absolute, a file that does not load, a file without `JobLogMask.forProject` or `JobLogReader`,
- * or a masker or reader that cannot be built.
+ * The file is imported on first use, not at start, so the plugin starts without it; a masker is built once for each project and each reader once.
+ * Any failure is a 503: no path given, a path that is not absolute, a file that does not load, a file without `JobLogMask.forProject`, `JobLogReader`
+ * or `JobsReader` (each checked only when it is needed), or a masker or reader that cannot be built.
  * Like the mask file of the decisions (`FactoryMaskModule`), Node keeps the file once it has loaded it, so a rebuilt file takes effect only after DSH restarts.
  * The refusal says which step failed and never repeats the error's own text, which could quote what was to be masked.
  */
 export class FactoryRecordsModule implements RecordsSource {
   private readonly maskers = new Map<string, RecordsMasker>()
   private kept: RecordsReader | undefined
+  private keptJobs: JobsSource | undefined
   readonly path: string | undefined
   constructor(path?: string) { this.path = path }
   async maskerFor(project: string): Promise<RecordsMasker> {
@@ -127,17 +152,24 @@ export class FactoryRecordsModule implements RecordsSource {
     return masker as RecordsMasker
   }
   async reader(): Promise<RecordsReader> {
-    if (this.kept) return this.kept
-    const Reader = (await this.load()).JobLogReader
-    if (typeof Reader !== 'function') throw new RecordsRefusal(503, 'The configured recordsModule does not export JobLogReader, so no record is read')
-    let reader: unknown
-    try { reader = new (Reader as new () => unknown)() }
-    catch { throw new RecordsRefusal(503, 'The configured recordsModule could not build a reader, so no record is read') }
-    if (reader === null || typeof reader !== 'object' || typeof (reader as RecordsReader).read !== 'function') {
-      throw new RecordsRefusal(503, 'The configured recordsModule gave no reader, so no record is read')
-    }
-    this.kept = reader as RecordsReader
+    this.kept ??= await this.build('JobLogReader', 'reader')
     return this.kept
+  }
+  async jobsReader(): Promise<JobsSource> {
+    this.keptJobs ??= await this.build('JobsReader', 'jobs reader')
+    return this.keptJobs
+  }
+  /** Builds the reader class the module exports as `name`, with no arguments; both readers have one method, `read`. */
+  private async build<Reader extends { read(arg: never): unknown }>(name: 'JobLogReader' | 'JobsReader', what: string): Promise<Reader> {
+    const Class = (await this.load())[name]
+    if (typeof Class !== 'function') throw new RecordsRefusal(503, `The configured recordsModule does not export ${name}, so no record is read`)
+    let reader: unknown
+    try { reader = new (Class as new () => unknown)() }
+    catch { throw new RecordsRefusal(503, `The configured recordsModule could not build a ${what}, so no record is read`) }
+    if (reader === null || typeof reader !== 'object' || typeof (reader as Reader).read !== 'function') {
+      throw new RecordsRefusal(503, `The configured recordsModule gave no ${what}, so no record is read`)
+    }
+    return reader as Reader
   }
   private async load(): Promise<RecordsModuleExports> {
     if (this.path === undefined || this.path === '') throw new RecordsRefusal(503, 'No recordsModule is configured, so no job log line or comment is written or read')

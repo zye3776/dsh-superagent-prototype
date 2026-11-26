@@ -62,8 +62,11 @@ export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type D
 export { FactoryJob, type JobAnswer } from './job.ts'
 export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
-export { FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type JobLogKind, type JobLogLine, type JobStep, type ReadJobLog, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine } from './records.ts'
-export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewedJob, type ReviewTokenSource } from './review.ts'
+export {
+  FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogKind, type JobLogLine, type JobsSource, type JobStep,
+  type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type TimelineStep,
+} from './records.ts'
+export { ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, type ReviewTokenSource, type ReviewView } from './review.ts'
 export { SharedTokenFile } from './token.ts'
 export { TokenTally, type TalliedEvent } from './usage.ts'
 export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

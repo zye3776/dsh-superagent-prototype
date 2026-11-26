@@ -1,7 +1,8 @@
 /**
- * The owner's review page, served at `/review` on DSH's web server: it shows what the super agent did in one job and takes the owner's comment on it.
- * This is the first, bare version: one job's lines in time order and one always-open comment field. It reads `<project>/.factory/actions.jsonl` and
- * `reviews.jsonl` of every listed project and writes only comment lines, each masked with the factory's own mask first (`records.ts`).
+ * The owner's review page, served at `/review` on DSH's web server: it shows what the super agent did in each job and takes the owner's comment on a job.
+ * Left, the listed (target) projects and the jobs of the picked one, newest first; in the middle, the picked job's timeline, which also holds the requests
+ * the fixed checks answered on their own while the job ran, and the job's always-open comment field. The factory's `JobsReader` builds the jobs from each
+ * project's `.factory/` records (`records.ts`); this page groups nothing itself. It writes only comment lines, each masked with the factory's own mask first.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
  * everything but the sign-in form needs the cookie the owner gets by typing the shared token (`token.ts`) into that form once.
  * The page loads nothing from anywhere else and brings no colours of its own: its style names DSH's design tokens only.
@@ -10,8 +11,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { createHmac, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isAbsolute, resolve } from 'node:path'
-import { FactoryRecordsModule, RecordsRefusal, ReviewWriter, type JobLogLine, type RecordsSource } from './records.ts'
+import { basename, isAbsolute, resolve } from 'node:path'
+import { FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type TimelineStep } from './records.ts'
 import { SharedTokenFile } from './token.ts'
 
 /** Where the page gets the shared token from, on every request. `undefined` means there is no usable token. */
@@ -83,8 +84,11 @@ export class ReviewAccess {
   }
 }
 
-/** One job as the page shows it: its lines in time order, and the owner's newest comment on it (empty when there is none). */
-export interface ReviewedJob { job_id: string; project: string; started: string; lines: JobLogLine[]; comment: string }
+/**
+ * What one page shows: every listed project, the picked one, and in it the picked job, or the automatic answers that fell in no job (`outside`), or neither
+ * when the project has no job yet.
+ */
+export interface ReviewView { projects: readonly ProjectJobs[]; project: ProjectJobs; job?: RecordedJob; outside: boolean }
 
 /**
  * Builds the HTML of the review page. Every piece of text from a record or a request is escaped before it goes into the page.
@@ -95,7 +99,13 @@ export interface ReviewedJob { job_id: string; project: string; started: string;
 export class ReviewPage {
   /** How long the owner must stop typing before the comment is saved, in milliseconds. */
   static readonly PAUSE_MS = 1000
-  static readonly NO_JOB = 'No job recorded yet.'
+  static readonly NO_JOB = 'No job yet. A job appears here once the super agent has run in this project.'
+  static readonly NO_PROJECT = 'No target project is listed.'
+  static readonly OUTSIDE = 'Outside a job'
+  static readonly NO_STOP = 'ended without a stop'
+  /** How an answer of the fixed checks is named: in words, never only by colour or dimming. */
+  static readonly AUTOMATIC: Record<AutomaticAnswer['answer'], string> = { allow: 'automatic yes', refuse: 'automatic no' }
+  static readonly CHECKED = 'answered by the fixed checks · not reviewed'
   static readonly SAVING = 'Saving…'
   static readonly SAVED = 'Saved'
   static readonly NOT_SAVED = 'Not saved. Your text is kept here; it is tried again when you type.'
@@ -107,10 +117,22 @@ export class ReviewPage {
   private static readonly STYLE = [
     'body { margin: 16px; font-size: 13px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1); }',
     'h1 { font-size: 13px; }',
+    'h2 { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); margin: 16px 0 8px; }',
+    '.crumb { font-size: 12px; color: var(--dsw-alias-label-secondary); padding-bottom: 8px; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
+    '.cols { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }',
+    '@media (max-width: 1100px) { .cols { grid-template-columns: 1fr; } }',
+    '.left a { display: block; padding: 6px 8px; border-radius: 8px; color: inherit; text-decoration: none; }',
+    '.left a.on { background: var(--dsw-alias-bg-layer-2); }',
+    '.left span { display: block; }',
+    '.l2, .meta, .who { font-size: 11px; color: var(--dsw-alias-label-tertiary); }',
+    '.pill { font-size: 11px; padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; color: var(--dsw-alias-label-secondary); }',
     'ol { list-style: none; padding: 0; }',
     'li { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
-    'time { font-family: var(--ds-font-family-code); font-size: 11px; color: var(--dsw-alias-label-tertiary); }',
-    'label, nav, #comment-status { font-size: 12px; color: var(--dsw-alias-label-secondary); }',
+    'li.auto { color: var(--dsw-alias-label-tertiary); }',
+    'time, code { font-family: var(--ds-font-family-code); font-size: 11px; }',
+    'time { color: var(--dsw-alias-label-tertiary); }',
+    'code { overflow-wrap: anywhere; }',
+    'label, #comment-status { font-size: 12px; color: var(--dsw-alias-label-secondary); }',
     'a { color: var(--dsw-alias-link); }',
     'textarea, input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font: inherit; color: inherit; background: var(--dsw-alias-bg-layer-1); }',
     'textarea { min-height: 120px; }',
@@ -126,7 +148,7 @@ export class ReviewPage {
   if (!field || !status) return
   let saved = field.value, timer, sending = false, again = false
   const send = (text, keepalive) => fetch(${JSON.stringify(ReviewRoute.COMMENT_PATH)}, { method: 'POST', credentials: 'same-origin', keepalive,
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ job_id: field.dataset.job, comment: text }) })
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: field.dataset.project, job_id: field.dataset.job, comment: text }) })
   const save = async () => {
     clearTimeout(timer)
     const text = field.value
@@ -176,20 +198,112 @@ export class ReviewPage {
   /** A page that says one thing, such as that no job is recorded yet. */
   notice(text: string): string { return this.document(`<p>${ReviewPage.escape(text)}</p>`) }
 
-  /** One job: its lines in time order, the comment field, and plain links to the other jobs. */
-  job(job: ReviewedJob, others: readonly ReviewedJob[]): string {
-    const lines = job.lines.map(line => `<li><time datetime="${ReviewPage.escape(line.ts)}">${ReviewPage.escape(line.ts)}</time> <strong>${
-      ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong><div>${ReviewPage.escape(line.summary)}</div></li>`).join('\n')
-    const links = others.map(other => `<a href="${ReviewRoute.PATH}?job=${encodeURIComponent(other.job_id)}">${ReviewPage.escape(other.started)}</a>`).join(' ')
-    return this.document(`<p>${ReviewPage.escape(job.project)}</p>
+  /**
+   * The page of one view: a line naming where the owner is, the left panel (projects, then the picked project's jobs and, when it has any, its answers
+   * outside a job), and the middle panel: the job's timeline and its comment field, the answers outside a job, or the text saying there is no job yet.
+   * An automatic answer has no comment field; neither has the list outside a job.
+   */
+  view(view: ReviewView): string {
+    const { project, job } = view
+    const name = ReviewPage.escape(ReviewPage.nameOf(project.project))
+    let crumb = `<span title="${ReviewPage.escape(project.project)}">${name}</span>`
+    let middle: string
+    if (view.outside) {
+      crumb += ` › ${ReviewPage.OUTSIDE}`
+      middle = `<h2>${ReviewPage.OUTSIDE} · ${ReviewPage.count(project.outside.length, 'automatic answer')}</h2>
 <ol>
-${lines}
+${project.outside.map(answer => ReviewPage.automaticRow(answer)).join('\n')}
+</ol>`
+    } else if (job === undefined) {
+      middle = `<p>${ReviewPage.escape(ReviewPage.NO_JOB)}</p>`
+    } else {
+      crumb += ` › Job ${job.number} · ${ReviewPage.escape(ReviewPage.span(job))}${job.guideline_version === undefined ? '' : ` · <span class="pill">guideline ${ReviewPage.escape(job.guideline_version)}</span>`}`
+      const comment = job.reviews.findLast(review => review.step_id === undefined)?.comment ?? ''
+      middle = `<h2>Timeline · ${ReviewPage.count(job.steps.length, 'step')}</h2>
+<ol>
+${job.steps.map(step => ReviewPage.row(step)).join('\n')}
 </ol>
 <label for="comment">Your comment on this job</label>
-<textarea id="comment" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.escape(job.comment)}</textarea>
-<p id="comment-status" role="status"></p>${links === '' ? '' : `\n<nav>Other jobs: ${links}</nav>`}
-<script nonce="${this.nonce}">${ReviewPage.script()}</script>`)
+<textarea id="comment" data-project="${ReviewPage.escape(job.project)}" data-job="${ReviewPage.escape(job.job_id)}">${ReviewPage.escape(comment)}</textarea>
+<p id="comment-status" role="status"></p>
+<script nonce="${this.nonce}">${ReviewPage.script()}</script>`
+    }
+    return this.document(`<div class="crumb">${crumb}</div>
+<div class="cols">
+<nav class="left" aria-label="Projects and jobs">
+${ReviewPage.left(view)}
+</nav>
+<main>
+${middle}
+</main>
+</div>`)
   }
+
+  /** The left panel: every listed project, then the picked project's jobs, newest first, then its answers outside a job when there are any. */
+  private static left(view: ReviewView): string {
+    const { project } = view
+    const projects = view.projects.map(each => {
+      const on = each.project === project.project
+      return `<a class="proj${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.address(each.project))}" title="${
+        ReviewPage.escape(each.project)}">${ReviewPage.escape(ReviewPage.nameOf(each.project))}</a>`
+    })
+    const jobs = project.jobs.map(job => {
+      const on = !view.outside && view.job?.job_id === job.job_id
+      const comments = new Set(job.reviews.map(review => review.step_id ?? '')).size
+      return `<a class="job${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.address(project.project, job.job_id))}"><span>Job ${
+        job.number}${job.guideline_version === undefined ? '' : ` <span class="pill">${ReviewPage.escape(job.guideline_version)}</span>`}</span><span class="l2">${
+        ReviewPage.escape(ReviewPage.span(job))}</span><span class="l2">${ReviewPage.count(job.steps.length, 'step')} · ${comments === 0 ? 'no comments yet' : ReviewPage.count(comments, 'comment')}</span></a>`
+    })
+    if (project.outside.length > 0) {
+      jobs.push(`<a class="job outside${view.outside ? ' on' : ''}"${view.outside ? ' aria-current="page"' : ''} href="${
+        ReviewPage.escape(ReviewRoute.address(project.project, undefined, true))}"><span>${ReviewPage.OUTSIDE}</span><span class="l2">${
+        ReviewPage.count(project.outside.length, 'automatic answer')}</span></a>`)
+    }
+    return `<h2>Projects</h2>
+${projects.join('\n')}
+<h2>Jobs in ${ReviewPage.escape(ReviewPage.nameOf(project.project))}</h2>
+${jobs.join('\n')}`
+  }
+
+  /** One row of a timeline. */
+  private static row(step: TimelineStep): string {
+    if (step.automatic) return ReviewPage.automaticRow(step.answer)
+    const line = step.line
+    const who = line.from === undefined || line.to === undefined ? '' : ` <span class="who">· ${ReviewPage.escape(line.from)} ──▶ ${ReviewPage.escape(line.to)}</span>`
+    const pill = line.guideline_version === undefined ? '' : ` <span class="pill">guideline ${ReviewPage.escape(line.guideline_version)}</span>`
+    const cost = [line.tokens === undefined ? '' : `${line.tokens.toLocaleString('en-US')} tokens`, line.ms === undefined ? '' : `${(line.ms / 1000).toFixed(1)} s`].filter(part => part !== '')
+    return `<li>${ReviewPage.time(line.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>${who}${pill}<div>${
+      ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}</li>`
+  }
+
+  /** A request the fixed checks answered: dimmed, named "automatic yes" or "automatic no", with what was asked in full and no comment field. */
+  private static automaticRow(answer: AutomaticAnswer): string {
+    const input = answer.tool_input
+    const command = input !== null && typeof input === 'object' && typeof (input as { command?: unknown }).command === 'string' ? (input as { command: string }).command : undefined
+    const asked = command ?? JSON.stringify(input) ?? String(input)
+    return `<li class="auto" data-automatic="${answer.answer}">${ReviewPage.time(answer.ts)} <strong>${ReviewPage.escape(answer.tool_name)}</strong> <span class="pill">${
+      ReviewPage.AUTOMATIC[answer.answer]}</span><div>Asked: <code>${ReviewPage.escape(asked)}</code></div>${
+      answer.reason === '' ? '' : `<div class="meta">Reason given: ${ReviewPage.escape(answer.reason)}</div>`}<div class="meta">${
+      ReviewPage.escape(answer.session_id)} · ${ReviewPage.CHECKED}</div></li>`
+  }
+
+  /** The project's folder name, which is what the owner calls it; the full path is in the link's title. */
+  private static nameOf(project: string): string { return basename(project) || project }
+
+  /** When a job ran: day, start and end times, and how long it took, or that it ended without a stop. */
+  private static span(job: RecordedJob): string {
+    const day = new Date(job.started).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+    const times = `${day}, ${ReviewPage.clock(job.started)}–${ReviewPage.clock(job.last)}`
+    if (job.stopped === null) return `${times} · ${ReviewPage.NO_STOP}`
+    const minutes = Math.round((Date.parse(job.stopped) - Date.parse(job.started)) / 60_000)
+    const hours = Math.floor(minutes / 60)
+    return `${times} · ${hours === 0 ? `${minutes} min` : `${hours} h ${String(minutes % 60).padStart(2, '0')} min`}`
+  }
+
+  /** The time of day of a record, on this machine's clock, inside a `<time>` that keeps the exact moment. */
+  private static time(ts: string): string { return `<time datetime="${ReviewPage.escape(ts)}">${ReviewPage.clock(ts)}</time>` }
+  private static clock(ts: string): string { return new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }) }
+  private static count(n: number, what: string): string { return `${n} ${what}${n === 1 ? '' : 's'}` }
 
   private document(body: string): string {
     return `<!doctype html>
@@ -227,7 +341,9 @@ type ReviewTarget = 'page' | 'login' | 'comment'
 
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
- * `GET /review` shows the newest job, or the job named by `?job=<id>`; without the cookie it answers 401 with the sign-in form and no record content.
+ * `GET /review` shows the first listed project and its newest job; `?project=<path>` picks a project, `&job=<id>` one of its jobs (a `job` alone is looked
+ * for in every project), and `&outside=1` its answers outside a job. A project or job no listed project holds is 404. Without the cookie it answers 401
+ * with the sign-in form and no record content.
  * `POST /review/login` takes the token from the form, and answers 303 to `/review` with the cookie set, 401 for a wrong or empty token, 503 with no token file.
  * `POST /review/comment` takes `{ job_id, comment }` as JSON and appends the masked comment to that job's project `reviews.jsonl`; it answers 400 for an
  * empty comment or a body that is not that object, 404 for a job no listed project holds, 413 for a body over 64 KiB, and 401 without the cookie.
@@ -291,14 +407,28 @@ export class ReviewRoute {
     }
   }
 
+  /** The page's address for a project, one of its jobs, or its answers outside a job. */
+  static address(project: string, jobId?: string, outside = false): string {
+    const query = new URLSearchParams({ project })
+    if (jobId !== undefined) query.set('job', jobId)
+    if (outside) query.set('outside', '1')
+    return `${ReviewRoute.PATH}?${query}`
+  }
+
   /** `GET /review` for a signed-in owner. */
   private async show(req: IncomingMessage, res: ServerResponse, page: ReviewPage): Promise<void> {
-    const jobs = await this.jobs()
-    const wanted = new URL(req.url ?? ReviewRoute.PATH, 'http://127.0.0.1').searchParams.get('job')
-    if (jobs.length === 0 && wanted === null) { ReviewRoute.sendPage(res, 200, page.notice(ReviewPage.NO_JOB), page); return }
-    const job = wanted === null ? jobs[0] : jobs.find(known => known.job_id === wanted)
-    if (job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
-    ReviewRoute.sendPage(res, 200, page.job(job, jobs.filter(other => other !== job)), page)
+    const projects = await this.read()
+    const query = new URL(req.url ?? ReviewRoute.PATH, 'http://127.0.0.1').searchParams
+    const wantedProject = query.get('project'), wantedJob = query.get('job'), outside = query.get('outside') === '1'
+    if (projects.length === 0) { ReviewRoute.sendPage(res, 200, page.notice(ReviewPage.NO_PROJECT), page); return }
+    let project: ProjectJobs | undefined
+    if (wantedProject !== null) project = projects.find(each => each.project === wantedProject)
+    else if (wantedJob !== null) project = projects.find(each => each.jobs.some(job => job.job_id === wantedJob))
+    else project = projects[0]
+    if (project === undefined) throw new ReviewRefusal(404, wantedProject !== null ? 'That project is not listed' : 'No listed project holds that job')
+    const job = outside ? undefined : wantedJob === null ? project.jobs[0] : project.jobs.find(each => each.job_id === wantedJob)
+    if (!outside && wantedJob !== null && job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
+    ReviewRoute.sendPage(res, 200, page.view({ projects, project, job, outside }), page)
   }
 
   /** `POST /review/login`: the token comes in the form's body, never in the address. */
@@ -320,36 +450,21 @@ export class ReviewRoute {
       throw new ReviewRefusal(400, 'The request body is not JSON')
     }
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new ReviewRefusal(400, 'The request body must be an object')
-    const { job_id, comment } = body as { job_id?: unknown; comment?: unknown }
+    const { project, job_id, comment } = body as { project?: unknown; job_id?: unknown; comment?: unknown }
+    if (project !== undefined && (typeof project !== 'string' || project === '')) throw new ReviewRefusal(400, 'project must be non-empty text')
     if (typeof job_id !== 'string' || job_id === '') throw new ReviewRefusal(400, 'job_id must be non-empty text')
     if (typeof comment !== 'string' || comment.trim() === '') throw new ReviewRefusal(400, 'comment must be non-empty text')
-    const job = (await this.jobs()).find(known => known.job_id === job_id)
+    // Two projects may hold the same `job_id` (each is its own job), so the page names the project it shows and the job is looked for there only.
+    const projects = (await this.read()).filter(each => project === undefined || each.project === project)
+    const job = projects.flatMap(each => each.jobs).find(known => known.job_id === job_id)
     if (job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
     await this.writer.write({ ts: this.now().toISOString(), project: job.project, job_id, comment })
     ReviewRoute.sendJson(res, 200, { saved: true })
   }
 
-  /**
-   * Every job the listed projects hold, the newest first. A job is the lines of one project's job log that share a `job_id`, in `ts` order; it started
-   * at its first line's time. Its comment is the last comment line in that project's file for that `job_id`.
-   */
-  private async jobs(): Promise<ReviewedJob[]> {
-    const reader = await this.records.reader()
-    const jobs: ReviewedJob[] = []
-    for (const project of this.projects) {
-      const read = reader.read(project)
-      const byId = new Map<string, JobLogLine[]>()
-      for (const line of read.actions) byId.set(line.job_id, [...(byId.get(line.job_id) ?? []), line])
-      for (const [job_id, lines] of byId) {
-        // The sort keeps file order for lines of the same time. ISO-8601 times in UTC sort as text.
-        lines.sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)
-        // The last line in the file is the one that counts, whatever its time says: a clock that was set back must not bring an older comment back.
-        // A comment on one step (it has a `step_id`) is not the comment on the whole job.
-        const newest = read.reviews.findLast(review => review.job_id === job_id && review.step_id === undefined)
-        jobs.push({ job_id, project, started: lines[0]!.ts, lines, comment: newest?.comment ?? '' })
-      }
-    }
-    return jobs.sort((a, b) => a.started < b.started ? 1 : a.started > b.started ? -1 : 0)
+  /** Every listed project's jobs, as the factory's `JobsReader` builds them from the records. */
+  private async read(): Promise<ProjectJobs[]> {
+    return (await this.records.jobsReader()).read(this.projects)
   }
 
   /**

@@ -1,5 +1,6 @@
 /**
  * A stand-in for the factory's built job log file (`lib/dist/jobLog.js`), with the same exports, for the tests of the job log and of the review page.
+ * Its `JobsReader` only groups the job log into jobs: it reads no automatic answer, which the review page's tests check with the real built file.
  * Its mask refuses an unknown kind or field, replaces one planted value in every text field and puts the fields in the agreed order; its reader skips what is not JSON or lacks its fields, as the real one does.
  */
 import { writeFileSync } from 'node:fs'
@@ -43,6 +44,25 @@ export class JobLogReader {
       })
     }
     return { actions: lines('actions.jsonl', 'summary'), reviews: lines('reviews.jsonl', 'comment') }
+  }
+}
+const byTs = (a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0
+export class JobsReader {
+  read(projects) {
+    return [...new Set(projects)].map(project => {
+      const { actions, reviews } = new JobLogReader().read(project)
+      const byId = new Map()
+      for (const line of actions) byId.set(line.job_id, [...(byId.get(line.job_id) ?? []), line])
+      const jobs = [...byId].map(([job_id, lines]) => {
+        lines.sort(byTs)
+        const start = lines.find(line => line.kind === 'job_start'), stop = lines.find(line => line.kind === 'job_stop')
+        return { project, job_id, number: 0, started: lines[0].ts, stopped: stop ? stop.ts : null, last: lines.at(-1).ts,
+          ...(start?.guideline_version ? { guideline_version: start.guideline_version } : {}),
+          steps: lines.map(line => ({ automatic: false, ts: line.ts, line })), reviews: reviews.filter(review => review.job_id === job_id) }
+      })
+      jobs.sort((a, b) => byTs({ ts: a.started }, { ts: b.started })).forEach((job, index) => { job.number = index + 1 })
+      return { project, jobs: jobs.reverse(), outside: [] }
+    })
   }
 }
 `

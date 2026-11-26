@@ -6,10 +6,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { JSDOM } from 'jsdom'
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
-import { FactoryRecordFile, FactoryRecordsModule, type JobLogLine, type ReviewLine } from '../src/factory/records.ts'
-import { ReviewAccess, ReviewPage, ReviewRoute, type ReviewedJob } from '../src/factory/review.ts'
+import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine } from '../src/factory/records.ts'
+import { ReviewAccess, ReviewPage, ReviewRoute } from '../src/factory/review.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -237,7 +237,7 @@ it('refuses a caller whose address is not loopback, whatever its Host header and
   }
 })
 
-it('shows the newest job: its lines in time order and an always-open comment field with its newest comment, and no Save button', async () => {
+it('lists the projects, then the picked project\'s jobs newest first; shows a job\'s lines in time order and an always-open comment field with its newest comment', async () => {
   const other = join(root, 'other')
   mkdirSync(join(other, FactoryRecordFile.FOLDER), { recursive: true })
   await serve([project, other])
@@ -245,7 +245,7 @@ it('shows the newest job: its lines in time order and an always-open comment fie
   put('actions.jsonl', [action()])
   put('reviews.jsonl', [review()])
   put('actions.jsonl', [
-    action({ project: other, job_id: 'job-2', step_id: 'step-b', ts: '2026-11-26T11:30:00.000Z', summary: 'Second line of the newest job.' }),
+    action({ project: other, job_id: 'job-2', step_id: 'step-b', ts: '2026-11-26T11:30:00.000Z', kind: 'job_stop', summary: 'Second line of the newest job.' }),
     action({ project: other, job_id: 'job-2', step_id: 'step-a', ts: '2026-11-26T11:00:00.000Z', summary: 'First line of the newest job.' }),
     action({ project: other, job_id: 'job-0', step_id: 'step-z', ts: '2026-11-25T07:00:00.000Z', summary: 'The oldest job.' }),
   ], other)
@@ -255,11 +255,21 @@ it('shows the newest job: its lines in time order and an always-open comment fie
     review({ project: other, job_id: 'job-0', ts: '2026-11-26T11:55:00.000Z', comment: 'On another job.' }),
   ], other)
   const cookie = await signIn()
+  // With nothing picked: the first listed project and its newest job.
   const answer = await call('GET', '/review', { cookie })
   expect(answer.status).toBe(200)
-  const page = dom(answer.text)
-  expect([...page.querySelectorAll('ol li')].map(row => [row.querySelector('time')!.textContent, row.querySelector('strong')!.textContent, row.querySelector('div')!.textContent]))
-    .toEqual([['2026-11-26T11:00:00.000Z', 'Job started', 'First line of the newest job.'], ['2026-11-26T11:30:00.000Z', 'Job started', 'Second line of the newest job.']])
+  const first = dom(answer.text)
+  expect([...first.querySelectorAll('nav a.proj')].map(link => [link.textContent, link.getAttribute('title'), link.getAttribute('href'), link.getAttribute('aria-current')]))
+    .toEqual([['project', project, ReviewRoute.address(project), 'page'], ['other', other, ReviewRoute.address(other), null]])
+  expect([...first.querySelectorAll('nav a.job')].map(link => link.firstElementChild!.textContent)).toEqual(['Job 1'])
+  expect([first.querySelector('ol li div')!.textContent, first.querySelector('textarea')!.value]).toEqual(['The first job started.', 'Keep it small.'])
+  // The second project: its jobs newest first, numbered from the oldest, and its newest job shown.
+  const page = dom((await call('GET', ReviewRoute.address(other), { cookie })).text)
+  expect([...page.querySelectorAll('nav a.job')].map(link => [link.getAttribute('href'), link.firstElementChild!.textContent, link.getAttribute('aria-current')]))
+    .toEqual([[ReviewRoute.address(other, 'job-2'), 'Job 2', 'page'], [ReviewRoute.address(other, 'job-0'), 'Job 1', null]])
+  expect([...page.querySelectorAll('ol li')].map(row => [row.querySelector('time')!.getAttribute('datetime'), row.querySelector('strong')!.textContent, row.querySelector('div')!.textContent]))
+    .toEqual([['2026-11-26T11:00:00.000Z', 'Job started', 'First line of the newest job.'], ['2026-11-26T11:30:00.000Z', 'Job stopped', 'Second line of the newest job.']])
+  expect(page.querySelector('.crumb')!.textContent).toMatch(/^other › Job 2 · .* · 30 min$/)
   const field = page.querySelector('textarea')!
   expect([field.id, field.dataset.job, field.value, field.disabled, field.readOnly]).toEqual(['comment', 'job-2', 'The newest comment <b>&</b> "quoted".', false, false])
   // The comment is text in the field, never markup of the page.
@@ -267,14 +277,16 @@ it('shows the newest job: its lines in time order and an always-open comment fie
   expect(page.querySelector('#comment-status')!.textContent).toBe('')
   // No button, no form, no dialog: the field saves by itself.
   expect([page.querySelector('button'), page.querySelector('form'), page.querySelector('dialog'), page.querySelector('input')]).toEqual([null, null, null, null])
-  // Plain links to the other jobs, the newer first.
-  expect([...page.querySelectorAll('nav a')].map(link => [link.getAttribute('href'), link.textContent]))
-    .toEqual([['/review?job=job-1', '2026-11-26T08:00:00.000Z'], ['/review?job=job-0', '2026-11-25T07:00:00.000Z']])
-  // Another job on request, with its own comment.
-  const first = dom((await call('GET', '/review?job=job-1', { cookie })).text)
-  expect([first.querySelector('ol li div')!.textContent, first.querySelector('textarea')!.value]).toEqual(['The first job started.', 'Keep it small.'])
+  // A job without a stop says so in place of its duration.
+  const older = dom((await call('GET', ReviewRoute.address(other, 'job-0'), { cookie })).text)
+  expect([older.querySelector('ol li div')!.textContent, older.querySelector('textarea')!.value, older.querySelector('.crumb')!.textContent])
+    .toEqual(['The oldest job.', 'On another job.', expect.stringMatching(/^other › Job 1 · .* · ended without a stop$/)])
+  // A job asked for by its id alone is looked for in every project.
+  expect(dom((await call('GET', '/review?job=job-2', { cookie })).text).querySelector('textarea')!.dataset.job).toBe('job-2')
   const unknown = await call('GET', '/review?job=nope', { cookie })
   expect([unknown.status, dom(unknown.text).querySelector('textarea')]).toEqual([404, null])
+  const notListed = await call('GET', ReviewRoute.address(join(root, 'elsewhere')), { cookie })
+  expect([notListed.status, dom(notListed.text).querySelector('p')!.textContent]).toEqual([404, 'That project is not listed'])
   // The token is in no page.
   for (const text of [answer.text, unknown.text]) expect(text).not.toContain(TOKEN)
 })
@@ -301,7 +313,7 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   expect(style).toContain('var(--dsw-alias-label-primary)')
 })
 
-it('says "No job recorded yet." when no listed project holds a job, and skips lines it cannot read', async () => {
+it('says there is no job yet when the project holds none, and skips lines it cannot read', async () => {
   await serve([project, join(root, 'missing')])
   const cookie = await signIn()
   const empty = await call('GET', '/review', { cookie })
@@ -332,7 +344,30 @@ it('saves a comment: the masked line is appended last to the job\'s project revi
   // The earlier line is still there, and nothing went to the other listed project.
   expect(JSON.parse(written[0]!)).toEqual(review())
   expect(existsSync(file('reviews.jsonl', other))).toBe(false)
-  expect(dom((await call('GET', '/review', { cookie })).text).querySelector('textarea')!.value).toBe(`Reject this; never print ${REDACTED}.`)
+  // The first listed project has no job yet; the job is found by its id.
+  expect(dom((await call('GET', '/review', { cookie })).text).querySelector('main p')!.textContent).toBe(ReviewPage.NO_JOB)
+  expect(dom((await call('GET', '/review?job=job-1', { cookie })).text).querySelector('textarea')!.value).toBe(`Reject this; never print ${REDACTED}.`)
+})
+
+it('saves a comment on the shown project\'s job when another listed project holds the same job_id', async () => {
+  const other = join(root, 'other')
+  mkdirSync(join(other, FactoryRecordFile.FOLDER), { recursive: true })
+  await serve([other, project])
+  put('actions.jsonl', [action({ project: other })], other)
+  put('actions.jsonl', [action()])
+  const cookie = await signIn()
+  const field = dom((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).text).querySelector('textarea')!
+  expect([field.getAttribute('data-project'), field.getAttribute('data-job')]).toEqual([project, 'job-1'])
+  // The body the page's own script sends.
+  const answer = await comment(cookie, { project: field.getAttribute('data-project'), job_id: field.getAttribute('data-job'), comment: 'For this project.' })
+  expect(answer.status).toBe(200)
+  expect(JSON.parse(lines('reviews.jsonl')[0]!)).toEqual({ ts: NOW, project, job_id: 'job-1', comment: 'For this project.' })
+  expect(existsSync(file('reviews.jsonl', other))).toBe(false)
+  // A project that is not listed, or not text, is refused and nothing is written.
+  expect((await comment(cookie, { project: join(root, 'unlisted'), job_id: 'job-1', comment: 'Nowhere.' })).status).toBe(404)
+  expect((await comment(cookie, { project: 7, job_id: 'job-1', comment: 'Nowhere.' })).status).toBe(400)
+  expect(lines('reviews.jsonl')).toHaveLength(1)
+  expect(existsSync(file('reviews.jsonl', other))).toBe(false)
 })
 
 it('saves nothing without access: no cookie or a wrong one is 401', async () => {
@@ -396,9 +431,9 @@ it('answers 503 and writes nothing without a working records module, and 409 whe
   expect(existsSync(file('reviews.jsonl'))).toBe(false)
   await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
   // A reader that still knows the job, though the folder is gone when the comment is written.
-  const kept = JSON.stringify([action()])
+  const kept = JSON.stringify([{ project, jobs: [{ project, job_id: 'job-1', number: 1, started: NOW, stopped: null, last: NOW, steps: [], reviews: [] }], outside: [] }])
   await serve([project], new FactoryRecordsModule(recordsModule(root, `export const JobLogMask = { forProject: () => ({ maskAction: line => line, maskReview: line => line }) }
-export class JobLogReader { read() { return { actions: ${kept}, reviews: [] } } }\n`)))
+export class JobsReader { read() { return ${kept} } }\n`)))
   rmSync(join(project, FactoryRecordFile.FOLDER), { recursive: true })
   const refused = await comment(await signIn(), { job_id: 'job-1', comment: 'Should not be saved.' })
   expect([refused.status, JSON.parse(refused.text)]).toEqual([409, { error: 'The project has no .factory folder yet' }])
@@ -413,7 +448,7 @@ it('puts every text of a record into the page as text, never as markup: a summar
   const page = dom((await call('GET', '/review', { cookie })).text)
   expect(page.querySelector('ol li div')!.textContent).toBe('<b>bold</b> & "q"')
   expect([page.querySelector('b'), page.querySelector('img')]).toEqual([null, null])
-  const href = page.querySelector('nav a')!.getAttribute('href')!
+  const href = page.querySelector('nav a.job:not(.on)')!.getAttribute('href')!
   expect(new URL(href, origin()).searchParams.get('job')).toBe(odd)
   // The link leads to that job, whose id is the field's, raw.
   const other = dom((await call('GET', href, { cookie })).text)
@@ -438,7 +473,7 @@ it('shows the comment on the whole job, not a later comment on one of its steps'
 
 it('answers 500 with one fixed text when something else fails, and repeats nothing of the error', async () => {
   await serve([project], new FactoryRecordsModule(recordsModule(root, `export const JobLogMask = { forProject: () => ({ maskAction: line => line, maskReview: line => line }) }
-export class JobLogReader { read() { throw new Error(${JSON.stringify(PLANTED)}) } }\n`)))
+export class JobsReader { read() { throw new Error(${JSON.stringify(PLANTED)}) } }\n`)))
   const cookie = await signIn()
   const page = await call('GET', '/review', { cookie })
   expect([page.status, dom(page.text).querySelector('p')!.textContent]).toEqual([500, 'The review page failed'])
@@ -465,8 +500,12 @@ it('cuts the connection, and does not throw, when something fails after the answ
 })
 
 /** The page of one job in a browser stand-in whose `fetch` is the test's, with the page's script running. */
-function browser(job: Partial<ReviewedJob>, fetch: (url: string, init: { method: string; body: string; credentials: string; headers: Record<string, string> }) => Promise<{ ok: boolean }>) {
-  const html = new ReviewPage('nonce').job({ job_id: 'job-1', project, started: NOW, lines: [action()], comment: '', ...job }, [])
+function browser(job: { job_id?: string; comment?: string }, fetch: (url: string, init: { method: string; body: string; credentials: string; headers: Record<string, string> }) => Promise<{ ok: boolean }>) {
+  const jobId = job.job_id ?? 'job-1'
+  const reviews = job.comment === undefined ? [] : [review({ job_id: jobId, comment: job.comment })]
+  const shown: RecordedJob = { project, job_id: jobId, number: 1, started: NOW, stopped: null, last: NOW, steps: [{ automatic: false, ts: NOW, line: action({ job_id: jobId }) }], reviews }
+  const entry: ProjectJobs = { project, jobs: [shown], outside: [] }
+  const html = new ReviewPage('nonce').view({ projects: [entry], project: entry, job: shown, outside: false })
   const window = new JSDOM(html, { runScripts: 'dangerously', url: 'http://127.0.0.1:3083/review', beforeParse: view => { (view as unknown as { fetch: unknown }).fetch = fetch } }).window
   const field = window.document.querySelector('textarea')!
   const status = () => window.document.querySelector('#comment-status')!.textContent
@@ -491,7 +530,7 @@ it('saves the comment when the owner leaves the field, showing "Saving…" then 
   page.type('Reject this at this stage.')
   page.leave()
   expect(page.status()).toBe('Saving…')
-  expect(sent).toEqual([{ url: '/review/comment', method: 'POST', body: { job_id: 'job-1', comment: 'Reject this at this stage.' }, credentials: 'same-origin', type: 'application/json' }])
+  expect(sent).toEqual([{ url: '/review/comment', method: 'POST', body: { project, job_id: 'job-1', comment: 'Reject this at this stage.' }, credentials: 'same-origin', type: 'application/json' }])
   answer(true)
   await settle()
   expect(page.status()).toBe('Saved')
@@ -610,4 +649,92 @@ it('is wired into the plugin: the page reads the configured token file and the c
   expect(info).toHaveBeenCalled()
   expect(JSON.stringify([info.mock.calls, warn.mock.calls])).not.toContain(TOKEN)
   expect([plugin.ReviewRoute, plugin.ReviewPage, plugin.ReviewAccess]).toEqual([ReviewRoute, ReviewPage, ReviewAccess])
+})
+
+/** An answer of the fixed checks, as the factory's `JobsReader` gives it. */
+const automatic = (fields: Partial<AutomaticAnswer> = {}): AutomaticAnswer => ({ ts: '2026-11-26T08:05:00.000Z', request_id: 'req-1', session_id: 'worker-1', tool_name: 'Bash',
+  tool_input: { command: 'git push origin story-4-2' }, reason: 'Share the branch.', answer: 'allow', ...fields })
+
+it('shows an answer of the fixed checks in the job\'s timeline as automatic, with what was asked and the answer, and no comment field of its own', () => {
+  const started = action(), yes = automatic(), no = automatic({ request_id: 'req-2', ts: '2026-11-26T08:06:00.000Z', tool_name: 'Write', tool_input: { file_path: '/etc/hosts', content: '<x>' }, reason: '', answer: 'refuse' })
+  const job: RecordedJob = { project, job_id: 'job-1', number: 1, started: started.ts, stopped: null, last: no.ts, reviews: [],
+    steps: [{ automatic: false, ts: started.ts, line: started }, { automatic: true, ts: yes.ts, answer: yes }, { automatic: true, ts: no.ts, answer: no }] }
+  const entry: ProjectJobs = { project, jobs: [job], outside: [automatic({ request_id: 'req-3', ts: '2026-11-27T08:00:00.000Z', answer: 'refuse' })] }
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, job, outside: false }))
+  const rows = [...page.querySelectorAll('ol li')]
+  expect(rows.map(row => [row.className, row.getAttribute('data-automatic'), row.querySelector('strong')!.textContent, row.querySelector('.pill')?.textContent ?? null]))
+    .toEqual([['', null, 'Job started', null], ['auto', 'allow', 'Bash', 'automatic yes'], ['auto', 'refuse', 'Write', 'automatic no']])
+  expect([...rows[1]!.querySelectorAll('div')].map(part => part.textContent))
+    .toEqual(['Asked: git push origin story-4-2', 'Reason given: Share the branch.', 'worker-1 · answered by the fixed checks · not reviewed'])
+  // Anything but a command is shown in full as JSON, as text and never as markup.
+  expect(rows[2]!.querySelector('code')!.textContent).toBe('{"file_path":"/etc/hosts","content":"<x>"}')
+  expect(page.querySelector('x')).toBeNull()
+  // One comment field, on the whole job, and none in a row.
+  expect([page.querySelectorAll('textarea').length, page.querySelectorAll('ol textarea').length]).toEqual([1, 0])
+  // The job ended without a stop, and the project's answers outside a job are the last entry of the left panel.
+  expect([...page.querySelectorAll('nav a.job')].map(link => [...link.querySelectorAll('span')].filter(part => part.parentElement === link).map(part => part.textContent)))
+    .toEqual([['Job 1', expect.stringMatching(/ · ended without a stop$/), '3 steps · no comments yet'], ['Outside a job', '1 automatic answer']])
+})
+
+it('lists the answers outside a job on their own, with no comment field', () => {
+  const entry: ProjectJobs = { project, jobs: [], outside: [automatic(), automatic({ request_id: 'req-2', answer: 'refuse' })] }
+  const page = dom(new ReviewPage('nonce').view({ projects: [entry], project: entry, outside: true }))
+  expect([page.querySelector('.crumb')!.textContent, page.querySelector('main h2')!.textContent]).toEqual(['project › Outside a job', 'Outside a job · 2 automatic answers'])
+  expect([...page.querySelectorAll('ol li')].map(row => row.querySelector('.pill')!.textContent)).toEqual(['automatic yes', 'automatic no'])
+  expect([page.querySelector('textarea'), page.querySelector('script')]).toEqual([null, null])
+  expect(page.querySelector('nav a.job.on')!.getAttribute('href')).toBe(ReviewRoute.address(project, undefined, true))
+})
+
+/** The factory's folder, when the environment says where it is: its built job log file and its review sample are read from it. */
+const FACTORY = process.env.ZEES_FACTORY_DIR?.trim() ?? ''
+const realTitle = FACTORY === '' ? 'the factory\'s real built JobsReader (SKIPPED: set ZEES_FACTORY_DIR to the factory\'s folder to run it)' : 'the factory\'s real built JobsReader'
+
+describe.skipIf(FACTORY === '')(realTitle, () => {
+  /** Writes the factory's review sample (`lib/fixtures/review-jobs.json`) into two projects and serves the page with the real built file. */
+  async function serveSample(): Promise<{ a: string; b: string; cookie: string }> {
+    const a = join(root, 'project-a'), b = join(root, 'project-b')
+    let text = readFileSync(join(FACTORY, 'lib', 'fixtures', 'review-jobs.json'), 'utf8')
+    text = text.replaceAll('<project-a>', a).replaceAll('<project-b>', b)
+    const sample = JSON.parse(text) as { projects: Record<string, Record<string, (string | object)[]>> }
+    for (const [folder, files] of Object.entries(sample.projects)) {
+      mkdirSync(join(folder, FactoryRecordFile.FOLDER), { recursive: true })
+      for (const [name, written] of Object.entries(files)) if (written.length > 0) put(name, written, folder)
+    }
+    const built = join(FACTORY, 'lib', 'dist', 'jobLog.js')
+    expect(existsSync(built), `${built} is missing: run the factory's build`).toBe(true)
+    await serve([a, b], new FactoryRecordsModule(built))
+    return { a, b, cookie: await signIn() }
+  }
+  const jobsOf = (page: Document) => [...page.querySelectorAll('nav a.job')].map(link => [...link.querySelectorAll('span')].filter(part => part.parentElement === link).map(part => part.textContent))
+  const rowsOf = (page: Document) => [...page.querySelectorAll('ol li')].map(row => [row.getAttribute('data-automatic'), row.querySelector('.pill')?.textContent ?? null, row.querySelector('div')!.textContent])
+
+  it('lists the sample\'s three jobs under the right projects, newest first, the crashed one ended without a stop', async () => {
+    const { a, b, cookie } = await serveSample()
+    const first = dom((await call('GET', ReviewRoute.address(a), { cookie })).text)
+    expect([...first.querySelectorAll('nav a.proj')].map(link => link.textContent)).toEqual(['project-a', 'project-b'])
+    expect(jobsOf(first)).toEqual([
+      ['Job 2 v1', expect.stringMatching(/ · ended without a stop$/), '3 steps · no comments yet'],
+      ['Job 1', expect.stringMatching(/ · 1 h 00 min$/), '5 steps · 1 comment'],
+      ['Outside a job', '1 automatic answer'],
+    ])
+    const second = dom((await call('GET', ReviewRoute.address(b), { cookie })).text)
+    expect(jobsOf(second)).toEqual([['Job 1', expect.stringMatching(/ · 30 min$/), '4 steps · no comments yet'], ['Outside a job', '1 automatic answer']])
+  })
+
+  it('shows the automatic answers in the timeline labelled automatic, with no comment box, and the ones outside a job on their own', async () => {
+    const { a, b, cookie } = await serveSample()
+    const job = dom((await call('GET', ReviewRoute.address(a, 'job-a1'), { cookie })).text)
+    expect(rowsOf(job)).toEqual([
+      [null, null, 'The super agent started.'],
+      ['allow', 'automatic yes', 'Asked: git status'],
+      [null, null, 'Approved: run the upload tests.'],
+      ['allow', 'automatic yes', 'Asked: git push origin story-4-2'],
+      [null, null, 'The super agent stopped.'],
+    ])
+    expect([job.querySelectorAll('textarea').length, job.querySelectorAll('ol textarea').length, job.querySelector('textarea')!.value]).toEqual([1, 0, 'Good pace.'])
+    const outside = dom((await call('GET', ReviewRoute.address(a, undefined, true), { cookie })).text)
+    expect([rowsOf(outside), outside.querySelector('textarea')]).toEqual([[['refuse', 'automatic no', 'Asked: {"file_path":"/etc/hosts","content":"x"}']], null])
+    const other = dom((await call('GET', ReviewRoute.address(b), { cookie })).text)
+    expect(rowsOf(other).map(row => row[1])).toEqual([null, null, 'automatic no', null])
+  })
 })

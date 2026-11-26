@@ -32,8 +32,12 @@ export interface JudgeToolCall { name: string; arguments: unknown }
 export interface JudgeGuard { check(call: JudgeToolCall, cwd: string): string | undefined }
 /** Gives the guard every judge Session is checked with. It rejects with `AssessRefusal(503)` when there is none. */
 export interface GuardSource { guard(): Promise<JudgeGuard> }
-/** Opens the judge Session of one worker session. The route knows only this much of `JudgeSessions`. */
-export interface JudgeOpener { open(project: string, sessionId: string): Promise<unknown> }
+/** A judge's answer to one question: its text, and the full paths of the files it read with the `read` tool while it answered, in the order it first read them. */
+export interface JudgeReply { text: string; reads: string[] }
+/** A judge as the one who asks it sees it: the brief, one question at a time, and whether it ever read a file. */
+export type AskedJudge = Pick<JudgeSession, 'brief' | 'consult' | 'readPath'>
+/** Opens the judge Session of one worker session. `ModelJudge` (`verdict.ts`) knows only this much of `JudgeSessions`. */
+export interface JudgeOpener { open(project: string, sessionId: string): Promise<AskedJudge> }
 /** What the factory's built guard file exports: `JudgeToolGuard.forHome()` gives the guard of this machine's owner. */
 interface GuardModuleExports { JudgeToolGuard?: { forHome?: unknown } }
 
@@ -81,6 +85,14 @@ export class ReadLedger {
   get size(): number { return this.stamps.size }
   /** Remembers `path`, a full path, as it is now. */
   record(path: string): void { this.stamps.set(path, ReadLedger.stampOf(path)) }
+  /** Remembers `path`, a full path, when a file is there now, and says whether one is. */
+  recordExisting(path: string): boolean {
+    const stamp = ReadLedger.stampOf(path)
+    if (stamp !== undefined) this.stamps.set(path, stamp)
+    return stamp !== undefined
+  }
+  /** Whether `path`, a full path, was ever recorded. */
+  has(path: string): boolean { return this.stamps.has(path) }
   /** The remembered files that changed or vanished since they were last recorded or listed, in the order they were first read. Each is listed once for each change. */
   changed(): string[] {
     const found: string[] = []
@@ -97,13 +109,15 @@ export class ReadLedger {
 /**
  * One judge: the DSH Session that reads a project for one worker session of the factory.
  * `brief()` is the text that goes before a question: on first contact it tells the judge to read the code, the dev setup and the planning documents; after that
- * it lists only the files the judge read with the `read` tool that have changed since. `ask()` sends a message and returns the judge's answer.
- * The route does not call `ask` yet: this version opens the Session and asks it nothing, so it spends no model tokens.
+ * it lists only the files the judge read with the `read` tool that have changed since. `consult()` sends a message and returns the judge's answer with the files it
+ * read for it; `ask()` returns the answer's text alone. `ModelJudge` (`verdict.ts`) asks one question for each request.
  */
 export class JudgeSession {
   /** The files this judge was allowed to read. */
   readonly ledger = new ReadLedger()
   private briefed = false
+  /** The files read with the `read` tool since the question now being answered was sent: full paths, each once, in the order they were first read. */
+  private reading: string[] = []
   /** Questions are asked one after the other, so one answer cannot be taken for another's. */
   private asking: Promise<unknown> = Promise.resolve()
   /**
@@ -134,20 +148,56 @@ export class JudgeSession {
     return ['These files you read with the read tool have changed since. Re-read only these:', ...changed.map(path => `- ${path}`)].join('\n')
   }
 
+  /** `path` as a full path: `~` is the home folder, and a relative path starts at the project. */
+  pathOf(path: string): string {
+    if (path === '~') return homedir()
+    return path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(this.project, path)
+  }
+
+  /**
+   * Notes that the judge was allowed to read `path` with the `read` tool: in the ledger, and in the list of the question now being answered.
+   * It is called before the read runs, so a file that is not there is not noted: that read fails and is no real read.
+   */
+  noteRead(path: string): void {
+    const full = this.pathOf(path)
+    if (!this.ledger.recordExisting(full)) return
+    if (!this.reading.includes(full)) this.reading.push(full)
+  }
+
+  /** The full path of `path` when this judge ever read that file with the `read` tool, in any question; `undefined` when it never did. */
+  readPath(path: string): string | undefined {
+    const full = this.pathOf(path)
+    return this.ledger.has(full) ? full : undefined
+  }
+
   /**
    * Sends `text` to the judge as its next message and returns the text of its last answer once its turn has ended; empty when it gave none.
    * @param signal - gives up waiting when aborted; the judge's turn is not stopped.
    */
   ask(text: string, signal: AbortSignal): Promise<string> {
+    return this.consult(text, signal).then(reply => reply.text)
+  }
+
+  /**
+   * Like `ask`, and also returns the files the judge read with the `read` tool between this question and its answer.
+   * @param text - the message, or a function that gives it. The function is called when the message is sent, after the questions before it were answered, so a
+   * message built from `brief()` there names the files as they are then; it is not called for a question given up before it was sent.
+   * @param signal - gives up waiting when aborted; the judge's turn is not stopped.
+   */
+  consult(text: string | (() => string), signal: AbortSignal): Promise<JudgeReply> {
     const answer = this.asking.then(() => this.exchange(text, signal))
     // A question that failed or was given up may have left the judge's turn running: the next one waits for that turn to end, so it cannot take its answer.
     this.asking = answer.catch(() => this.agent.whenIdle().catch(() => {}))
     return answer
   }
 
-  private async exchange(text: string, signal: AbortSignal): Promise<string> {
+  private async exchange(message: string | (() => string), signal: AbortSignal): Promise<JudgeReply> {
     signal.throwIfAborted()
+    const text = typeof message === 'string' ? message : message()
     const agent = this.agent
+    // Questions run one after the other, so every read from here to the answer belongs to this question.
+    const reads: string[] = []
+    this.reading = reads
     const before = agent.session.snapshotEvents().length
     agent.followup(freezeMessage({ id: MessageId(`dsh-superagent-factory:${randomUUID()}`), role: 'user' as const, content: [{ type: 'text' as const, text }],
       source: { kind: 'dsh-superagent-factory' as const, form: 'relay' as const } }))
@@ -156,7 +206,8 @@ export class JudgeSession {
     signal.addEventListener('abort', abort, { once: true })
     try { await Promise.race([agent.whenIdle(), aborted.promise]) } finally { signal.removeEventListener('abort', abort) }
     const last = agent.session.snapshotEvents().slice(before).filter(event => event.type === 'assistant/message').at(-1)
-    return last?.type === 'assistant/message' ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : ''
+    return { text: last?.type === 'assistant/message' ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : '',
+      reads: [...reads] }
   }
 }
 
@@ -241,7 +292,7 @@ export class JudgeSessions implements JudgeOpener {
     }
   }
 
-  /** The guard's answer for one tool call of `judge`, with the project as the folder. An allowed `read` is noted in the judge's ledger. A guard that throws refuses the call. */
+  /** The guard's answer for one tool call of `judge`, with the project as the folder. An allowed `read` is noted by the judge (`noteRead`). A guard that throws refuses the call. */
   private static refusal(guard: JudgeGuard, judge: JudgeSession, execution: { name: string; arguments: unknown }): string | undefined {
     let refusal: string | undefined
     try { refusal = guard.check({ name: execution.name, arguments: execution.arguments }, judge.project) }
@@ -249,13 +300,8 @@ export class JudgeSessions implements JudgeOpener {
     if (refusal !== undefined && typeof refusal !== 'string') return 'Refused: the judge guard gave no usable answer for this call, so it does not run.'
     if (refusal === undefined && execution.name === 'read') {
       const path = (execution.arguments as { file_path?: unknown } | null)?.file_path
-      if (typeof path === 'string') judge.ledger.record(JudgeSessions.absolute(path, judge.project))
+      if (typeof path === 'string') judge.noteRead(path)
     }
     return refusal
-  }
-
-  private static absolute(path: string, project: string): string {
-    if (path === '~') return homedir()
-    return path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(project, path)
   }
 }

@@ -1,5 +1,5 @@
 /**
- * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions the route opens.
+ * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -9,10 +9,11 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-workspace'
 import s from '@deepseek-ai/schemastery'
-import { AssessRoute, StubJudge } from './assess.ts'
+import { AssessRoute } from './assess.ts'
 import { DecisionWriter, FactoryMaskModule } from './decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { SharedTokenFile } from './token.ts'
+import { ModelJudge } from './verdict.ts'
 
 export const name = 'dsh-superagent-factory'
 export const inject = ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']
@@ -29,12 +30,14 @@ export const Config = s.object({
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
-  const route = new AssessRoute(config.projects ?? [], new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH), new StubJudge(), undefined,
-    new DecisionWriter(new FactoryMaskModule(config.maskModule)), new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule)))
+  const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
+  const route = new AssessRoute(config.projects ?? [], new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH), new ModelJudge(judges), undefined,
+    new DecisionWriter(new FactoryMaskModule(config.maskModule)))
   ctx.effect(() => route.register(ctx), 'factory: assess route')
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
 }
-export { AssessRoute, StubJudge, type TokenSource } from './assess.ts'
+export { AssessRoute, StubJudge, type AssessRequest, type Judge, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
-export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeToolCall } from './judge.ts'
+export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export { SharedTokenFile } from './token.ts'
+export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

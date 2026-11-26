@@ -280,6 +280,31 @@ describe('JudgeSession.ask', () => {
     expect(dsh.agents.get(judge.id)!.asked).toEqual(['one', 'two'])
   })
 
+  it('returns with each answer the files read for that question, takes a question\'s text when it is sent, and knows whether a file was ever read', async () => {
+    let turn = 0
+    const dsh = fakeDsh((text, run) => {
+      turn++
+      // The second read of a file in one question counts once, and a refused call does not count.
+      for (const path of turn === 1 ? ['src/a.ts', join(project, 'src', 'a.ts'), 'src/b.ts'] : ['src/b.ts']) run({ name: 'read', arguments: { file_path: path } })
+      run({ name: 'write', arguments: { file_path: 'src/c.ts' } })
+      return `answer to: ${text}`
+    })
+    const judge = await new JudgeSessions(dsh.ctx, fakeGuard().source).open(project, 's1')
+    const signal = new AbortController().signal
+    let built = 0
+    const [first, second] = await Promise.all([judge.consult('one', signal), judge.consult(() => `two after ${++built && turn} turn`, signal)])
+    expect(first).toEqual({ text: 'answer to: one', reads: [join(project, 'src', 'a.ts'), join(project, 'src', 'b.ts')] })
+    // The second text was built only after the first question was answered.
+    expect(second).toEqual({ text: 'answer to: two after 1 turn', reads: [join(project, 'src', 'b.ts')] })
+    expect([judge.readPath('src/a.ts'), judge.readPath(join(project, 'src', 'b.ts')), judge.readPath('src/c.ts')]).toEqual([join(project, 'src', 'a.ts'), join(project, 'src', 'b.ts'), undefined])
+    expect([judge.ledger.has(join(project, 'src', 'a.ts')), judge.ledger.has('src/a.ts')]).toEqual([true, false])
+    // A question given up before it was sent never builds its text.
+    const stopped = new AbortController()
+    stopped.abort(new Error('stopped'))
+    await expect(judge.consult(() => `${++built}`, stopped.signal)).rejects.toThrow('stopped')
+    expect(built).toBe(1)
+  })
+
   it('sends nothing once its signal is aborted, and still answers the next question', async () => {
     const dsh = fakeDsh(), judge = await new JudgeSessions(dsh.ctx, fakeGuard().source).open(project, 's1')
     const stopped = new AbortController()

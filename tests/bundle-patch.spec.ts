@@ -98,7 +98,7 @@ it('defines the factory\'s judge preset, off unless a profile turns it on: a she
     '@deepseek-ai/dsh-agent-instructions']) expect(names, name).not.toContain(name)
 })
 
-it('turns the judge preset and the factory route on in the factory\'s example profile, and names the guard file', () => {
+it('turns the judge preset and the factory route on in the factory\'s example profile, and names the guard file, the mask file and the job log file', () => {
   const example = readFileSync(join(import.meta.dirname, '..', 'examples', 'factory-profile.cordis.patch.yml'), 'utf8')
   expect(example).toMatch(/^- id: dsh-superagent-judge-preset\n  disabled: false$/m)
   expect(example).toMatch(/^- id: dsh-superagent-factory\n  disabled: false$/m)
@@ -106,4 +106,5 @@ it('turns the judge preset and the factory route on in the factory\'s example pr
   for (const id of ['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu']) expect(example).toMatch(new RegExp(`^- id: ${id}\\n  disabled: true$`, 'm'))
   expect(example).toMatch(/^    guardModule: <absolute path of lib\/dist\/judgeGuard\.js /m)
   expect(example).toMatch(/^    maskModule: <absolute path of lib\/dist\/decisionMask\.js /m)
+  expect(example).toMatch(/^    recordsModule: <absolute path of lib\/dist\/jobLog\.js /m)
 })

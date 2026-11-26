@@ -260,9 +260,10 @@ it('is a plugin that needs the web server and DSH\'s Session services, and mount
   const registered: Route[] = []
   const dispose = vi.fn()
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return dispose } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() } }
   plugin.apply(ctx as never, plugin.Config({ projects: [project] }))
-  expect(registered.map(route => route.path)).toEqual(['/assess'])
+  // The review page's three addresses come after it (tests/factory-review.spec.ts).
+  expect(registered.map(route => route.path)).toEqual(['/assess', '/review', '/review/login', '/review/comment'])
 })
 
 it('is a plugin that reads the shared token from the configured token file, masks with the configured mask module, guards its judges with the configured guard module and answers with the judge\'s decision', async () => {
@@ -273,7 +274,7 @@ it('is a plugin that reads the shared token from the configured token file, mask
   const registered: Route[] = []
   const dsh = fakeDsh(judgeReply)
   const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() } }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() } }
   // Without a guard module the plugin's route opens no judge Session and writes nothing.
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath() }))
   const unguarded = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })

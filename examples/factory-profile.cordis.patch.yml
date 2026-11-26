@@ -1,6 +1,6 @@
-# Example profile that runs only the factory's /assess route ($DSH_HOME/profiles/factory/cordis.patch.yml).
+# Example profile that runs only the factory's /assess route and its review page ($DSH_HOME/profiles/factory/cordis.patch.yml).
 # The owner's software factory posts a permission request to http://127.0.0.1:3083/assess and gets a decision back.
-# Replace the three <placeholders> before first start.
+# Replace the four <placeholders> before first start.
 - id: webserver
   config:
     host: 127.0.0.1
@@ -32,5 +32,13 @@
     # read-only shell commands run, and no secret file is read. There is no default: without it no judge Session is opened and
     # the route answers 503 and writes nothing. Like the mask file it is loaded once: restart DSH after the factory rebuilds it.
     guardModule: <absolute path of lib/dist/judgeGuard.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/judgeGuard.js>
+    # The factory's built job log file. Every job log line (actions.jsonl) and every comment the owner writes on the review page
+    # (reviews.jsonl) is masked with it before it is written, and the review page at http://127.0.0.1:3083/review reads both files
+    # with it. There is no default: without it nothing is written to either file and the review page answers 503. Like the mask
+    # file it is loaded once: restart DSH after the factory rebuilds it.
+    # A job starts when DSH starts on this profile: start it in the folder of a project listed below (one that has its .factory
+    # folder), and one job_start line is added to that project's actions.jsonl. Started anywhere else, DSH logs one warning.
+    # The review page asks once for the token in the token file above, in a sign-in form.
+    recordsModule: <absolute path of lib/dist/jobLog.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/jobLog.js>
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

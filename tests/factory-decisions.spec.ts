@@ -8,7 +8,7 @@ import { AssessRefusal, DecisionsFile, DecisionWriter, FactoryMaskModule, type D
 let root = '', project = ''
 const file = (of: string = project) => join(of, DecisionsFile.FOLDER, DecisionsFile.FILE)
 const lines = (of: string = project) => readFileSync(file(of), 'utf8').split('\n').filter(line => line !== '')
-const line = (fields: Partial<DecisionLine> = {}): DecisionLine => ({ decision_id: 'd-1', request_id: 'req-1', kind: 'permission', decision: 'deny', choice: null, risk: 'high',
+const line = (fields: Partial<DecisionLine> = {}): DecisionLine => ({ decision_id: 'd-1', request_id: 'req-1', kind: 'permission', decision: 'deny', choice: null, risk: 'high', tier: 1, tier_set_by: 'judge',
   reason: 'The command prints planted-secret-value.', alternative: 'Ask for a narrower command.', cites: 'Ticket 3.', reads: [{ path: '.env', used: false }], tokens: 12,
   seconds: 0.5, ts: '2026-11-26T08:09:10.123Z', project, ...fields })
 /** Writes a stand-in for the factory's built mask file and returns its path. Each one gets a name of its own, because Node loads a path once. */

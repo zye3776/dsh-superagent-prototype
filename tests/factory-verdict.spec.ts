@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { AssessRoute, DecisionsFile } from '../src/factory/assess.ts'
-import { AssessRefusal, DecisionWriter, FactoryMaskModule, type DecisionLine } from '../src/factory/decisions.ts'
+import { AssessRefusal, DecisionWriter, FactoryMaskModule, TierChoice, type DecisionLine } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions, type AskedJudge } from '../src/factory/judge.ts'
 import { TempRule } from '../src/factory/temprule.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
@@ -113,11 +113,63 @@ describe('JudgeQuestion', () => {
     expect(text).toContain(JudgeQuestion.SHAPE)
   })
 
+  it('tells the judge the gate\'s tier and how deep to check at it, or that its own grade sets the tier when the gate set none', () => {
+    // A tier in a wrong shape is passed as it would arrive unchecked, to show it counts as none.
+    const textOf = (tier: unknown) => new JudgeQuestion({ ...requests.plain(), tier: tier as 1, tier_rule: tier === null ? null : 'some-rule' }).text('B')
+    for (const tier of [1, 2, 3] as const) {
+      const lines = textOf(tier).split('\n')
+      expect(lines).toContain(`The factory's gate sorted this request into checking tier ${tier} by plain code over the action, not the worker's words. Check this deep:`)
+      expect(lines).toContain(`- ${JudgeQuestion.TIER_DEPTH[tier]}`)
+      for (const other of TierChoice.TIERS.filter(one => one !== tier)) expect(lines).not.toContain(`- ${JudgeQuestion.TIER_DEPTH[other]}`)
+      expect(lines).toContain(JudgeQuestion.TIER_RAISE)
+    }
+    expect(JudgeQuestion.TIER_DEPTH[3]).toContain('do not read the project')
+    expect(JudgeQuestion.TIER_DEPTH[3]).toContain('docs_lookup and ask_helper are refused')
+    // No gate tier: a null, a request without one, and a tier in a wrong shape all say the judge's grade sets it, and list every depth.
+    for (const text of [textOf(null), new JudgeQuestion(requests.plain()).text('B'), textOf('1')]) {
+      const lines = text.split('\n')
+      expect(lines).toContain('The factory\'s gate left this request\'s checking tier open: your risk grade sets it. Check as deep as that tier asks:')
+      for (const tier of TierChoice.TIERS) expect(lines).toContain(`- ${JudgeQuestion.TIER_DEPTH[tier]}`)
+    }
+    // The tier lines stand after the request and its reason line, before the kinds of request.
+    const lines = textOf(1).split('\n')
+    expect(lines.findIndex(line => line.startsWith('The factory\'s gate sorted'))).toBeGreaterThan(lines.findIndex(line => line.startsWith('Its `reason`')))
+    expect(lines.findIndex(line => line.startsWith('The factory\'s gate sorted'))).toBeLessThan(lines.indexOf('How to judge each kind of request:'))
+  })
+
   it('says what was wrong with an answer and asks for the same request again', () => {
     const text = new JudgeQuestion(requests.plain()).repair('`risk` must be one of "low", "medium", "high"')
     expect(text).toContain('Your answer could not be used: `risk` must be one of "low", "medium", "high".')
     expect(text).toContain('"req-plain"')
     expect(text).toContain(JudgeQuestion.SHAPE)
+  })
+})
+
+describe('TierChoice', () => {
+  it('takes the gate\'s tier unless the judge\'s grade asks for more, and the grade\'s tier when the gate set none', () => {
+    const risks = ['high', 'medium', 'low'] as const
+    const table = [null, 1, 2, 3].flatMap(gate => risks.map(risk => [gate, risk, TierChoice.of(gate as 1 | 2 | 3 | null, risk)]))
+    expect(table).toEqual([
+      [null, 'high', { tier: 1, tier_set_by: 'judge' }], [null, 'medium', { tier: 2, tier_set_by: 'judge' }], [null, 'low', { tier: 3, tier_set_by: 'judge' }],
+      [1, 'high', { tier: 1, tier_set_by: 'gate' }], [1, 'medium', { tier: 1, tier_set_by: 'gate' }], [1, 'low', { tier: 1, tier_set_by: 'gate' }],
+      [2, 'high', { tier: 1, tier_set_by: 'judge' }], [2, 'medium', { tier: 2, tier_set_by: 'gate' }], [2, 'low', { tier: 2, tier_set_by: 'gate' }],
+      [3, 'high', { tier: 1, tier_set_by: 'judge' }], [3, 'medium', { tier: 2, tier_set_by: 'judge' }], [3, 'low', { tier: 3, tier_set_by: 'gate' }],
+    ])
+  })
+
+  it('reads a gate tier only as a whole 1, 2 or 3, and holds only that, null or nothing as a request\'s tier', () => {
+    expect([1, 2, 3, null, undefined, 0, 4, 1.5, '1', true].map(tier => TierChoice.gateTierOf({ tier }))).toEqual([1, 2, 3, null, null, null, null, null, null, null])
+    expect([1, 2, 3, null, undefined, 0, 4, 1.5, '1', true].map(tier => TierChoice.holds(tier))).toEqual([true, true, true, true, true, false, false, false, false, false])
+  })
+
+  it('records the final tier on the verdict: a gate tier 1 stays 1 against a low grade, an unsorted medium is 2 by the judge, a high grade raises a gate tier 3', async () => {
+    const decide = async (tier: 1 | 2 | 3 | null, risk: string) => {
+      const { judge } = modelJudge(judgeThat(answer({ risk })).reply)
+      return judge.decide({ ...requests.plain(), tier, tier_rule: tier === null ? null : 'some-rule' })
+    }
+    expect(await decide(1, 'low')).toMatchObject({ risk: 'low', tier: 1, tier_set_by: 'gate' })
+    expect(await decide(null, 'medium')).toMatchObject({ risk: 'medium', tier: 2, tier_set_by: 'judge' })
+    expect(await decide(3, 'high')).toMatchObject({ risk: 'high', tier: 1, tier_set_by: 'judge' })
   })
 })
 
@@ -206,7 +258,7 @@ describe('ModelJudge', () => {
     const { judge, asked } = modelJudge(fake.reply)
     const verdict = await judge.decide(requests.editedScript())
     expect(verdict).toEqual({ decision_id: expect.stringMatching(/^[0-9a-f-]{36}$/), request_id: 'req-edited-script', kind: 'permission', decision: 'approve', choice: null,
-      risk: 'low', reason: 'The script only compiles.', alternative: '', cites: 'Ticket 5: the judge decides.', reads: [{ path: inProject(RecordedRequests.SCRIPT), used: true }], tokens: 0 })
+      risk: 'low', tier: 3, tier_set_by: 'judge', reason: 'The script only compiles.', alternative: '', cites: 'Ticket 5: the judge decides.', reads: [{ path: inProject(RecordedRequests.SCRIPT), used: true }], tokens: 0 })
     expect(fake.refusals).toEqual([undefined])
     // One question: the first-contact brief, then the request.
     expect(asked()).toHaveLength(1)
@@ -388,7 +440,8 @@ describe('ModelJudge', () => {
     let clock = 5_000
     const judge = new ModelJudge({ open: async () => { clock = 7_000; return recording } }, undefined, () => clock)
     expect((await judge.decide(requests.plain())).decision).toBe('approve')
-    expect(seen).toEqual([{ arrived: 5_000 }, { arrived: 5_000, helpers: false }])
+    // No gate tier on this request: both questions say so.
+    expect(seen).toEqual([{ arrived: 5_000, tier: null }, { arrived: 5_000, tier: null, helpers: false }])
   })
 })
 
@@ -564,7 +617,7 @@ describe('the /assess route with the model judge, over real HTTP', () => {
     const fake = judgeThat(answer({ reason: 'The script only compiles.', reads: [{ path: RecordedRequests.SCRIPT, used: true }] }), [readOf(RecordedRequests.SCRIPT)])
     const line = await judged(fake.reply, requests.editedScript())
     expect(line).toEqual({ decision_id: expect.stringMatching(/^[0-9a-f-]{36}$/), request_id: 'req-edited-script', kind: 'permission', decision: 'approve', choice: null, risk: 'low',
-      reason: `The script only compiles.${MASKED}`, alternative: '', cites: 'Ticket 5: the judge decides.', reads: [{ path: inProject(RecordedRequests.SCRIPT), used: true }], tokens: 0,
+      tier: 3, tier_set_by: 'judge', reason: `The script only compiles.${MASKED}`, alternative: '', cites: 'Ticket 5: the judge decides.', reads: [{ path: inProject(RecordedRequests.SCRIPT), used: true }], tokens: 0,
       seconds: expect.any(Number), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT[\d:.]+Z$/), project })
   })
 

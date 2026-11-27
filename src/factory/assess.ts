@@ -5,6 +5,8 @@
  * The route asks its `Judge` for the decision. In the plugin that is `ModelJudge` (`verdict.ts`), which asks the judge Session of the request's worker session;
  * when that judge cannot be opened or gives no usable answer in time, the route answers 503 and writes nothing. `StubJudge` gives the same fixed, safe
  * answer to every request and asks no model: the factory's contract check uses it. This file loads no judge code itself, so Node can run it straight from source.
+ * Each request may carry the checking tier the factory's gate gave it (`tier`, `tier_rule`); every decision records its final `tier` and `tier_set_by`
+ * (`TierChoice` in `decisions.ts`), the stub's too.
  * Only the factory is answered: a caller must be on this machine and send the shared token (`token.ts`), and the route sends
  * the token back with each decision, so the factory can tell this route's reply from another service's.
  *
@@ -25,10 +27,10 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
 import { PendingApprovals, type ApprovalClaim } from './approvals.ts'
-import { AssessRefusal, DecisionWriter, type Decision, type DecisionLine } from './decisions.ts'
+import { AssessRefusal, DecisionWriter, TierChoice, type Decision, type DecisionLine, type Tier } from './decisions.ts'
 import { AskKey, SharedTokenFile } from './token.ts'
 
-export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
+export { AssessRefusal, DecisionsFile, TierChoice, type Decision, type DecisionLine, type DecisionRead, type Tier } from './decisions.ts'
 
 /** One path of a shared temp folder (such as `/tmp`) that a request names, with what the factory's hook found out about it. */
 export interface TempPathFact {
@@ -72,8 +74,14 @@ export class TempFactsShape {
  * What the factory posts: its masked request record. Only these fields are read here; `project` is the raw absolute path, and `session_id` names the
  * worker session that asks, which gets a judge Session of its own. `temp` holds the request's temp-folder facts for the judge: left out by a caller
  * that sends none, `null` when the hook could not work them out. `context` is background a worker gave with an ask: its own claim, never evidence.
+ * `tier` is the checking tier the factory's gate sorted the request into by plain code (1 project direction, 2 third-party tools, 3 low risk), and
+ * `tier_rule` the name of its rule: both `null` when the gate left the request unsorted, and left out by a caller that sends none. An `/ask` never
+ * carries them: a worker cannot set its own tier.
  */
-export interface AssessRequest { request_id: string; project: string; session_id: string; temp?: TempFacts | null; context?: string; [field: string]: unknown }
+export interface AssessRequest {
+  request_id: string; project: string; session_id: string; temp?: TempFacts | null; context?: string; tier?: Tier | null; tier_rule?: string | null
+  [field: string]: unknown
+}
 /**
  * What a worker posts to `/ask` before it acts: the call it is about to make (`session_id`, `tool_name` and `tool_input`, exactly as its tool call
  * will carry them), `description` (what the action is and why) and, when it has some, `context` (background the judge would not see otherwise).
@@ -98,7 +106,7 @@ export class StubJudge implements Judge {
   /** The decision for one request, without `seconds`, which the route measures. */
   decide(request: AssessRequest): Verdict {
     return { decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision: 'ask_owner', choice: null, risk: 'high',
-      reason: StubJudge.REASON, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0 }
+      ...TierChoice.of(TierChoice.gateTierOf(request), 'high'), reason: StubJudge.REASON, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0 }
   }
 }
 
@@ -312,7 +320,8 @@ export class AssessRoute {
 
   /**
    * Checks a parsed body and returns it as the request, unchanged. Refuses with 400 a body that is not an object, one without `request_id`, `project` or
-   * `session_id`, one whose `temp` is present but neither `null` nor the agreed facts, and one whose `context` is present but not text. Public, so the factory's contract check can run the same check.
+   * `session_id`, one whose `temp` is present but neither `null` nor the agreed facts, one whose `context` is present but not text, and one whose `tier` is
+   * present but neither `null` nor the whole number 1, 2 or 3, or whose `tier_rule` is present but neither `null` nor text. Public, so the factory's contract check can run the same check.
    */
   static requestOf(body: unknown): AssessRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
@@ -322,6 +331,8 @@ export class AssessRoute {
     if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
     if ('temp' in body && !TempFactsShape.holds((body as Record<string, unknown>).temp)) throw new AssessRefusal(400, 'The request has a malformed temp')
     if ('context' in body && typeof (body as Record<string, unknown>).context !== 'string') throw new AssessRefusal(400, 'The request has a malformed context')
+    const { tier, tier_rule: rule } = body as Record<string, unknown>
+    if (!TierChoice.holds(tier) || (rule !== undefined && rule !== null && typeof rule !== 'string')) throw new AssessRefusal(400, 'The request has a malformed tier')
     return body as AssessRequest
   }
 

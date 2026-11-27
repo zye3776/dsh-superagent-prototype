@@ -41,7 +41,7 @@ export function apply(ctx: Context, config: FactoryConfig): void {
 }
 export { PendingApprovals, type ApprovalClaim, type HeldApproval } from './approvals.ts'
 export { AssessRoute, StubJudge, TempFactsShape, type AskRequest, type AssessRequest, type ClaimRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
-export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
+export { DecisionsFile, DecisionWriter, FactoryMaskModule, TierChoice, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { DocsLookup, type DocsLookupArgs, type DocumentationBodies, type Fetcher } from './docs.ts'
 export { HelperFrame, HelperRunner, NodeSpawner, type HelperArgs, type HelperCommandBuilder, type HelperExit, type HelperJob, type HelperProcess, type HelperResult, type HelperSpawner, type ReadCheck } from './helpers.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type ConsultOptions, type GuardSource, type HelperWindow, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeTools, type JudgeToolCall } from './judge.ts'

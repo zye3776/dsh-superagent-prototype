@@ -21,6 +21,10 @@ export interface Decision {
   decision: 'approve' | 'deny' | 'ask_owner'
   choice: string | null
   risk: 'low' | 'medium' | 'high'
+  /** How deep the request was checked: 1 project direction, 2 third-party tools, 3 low risk (`TierChoice`). */
+  tier: Tier
+  /** Who set `tier`: `gate` when the factory's gate sorted the request and the judge kept that tier, `judge` when the judge's risk grade set or raised it. */
+  tier_set_by: 'gate' | 'judge'
   reason: string
   alternative: string
   cites: string
@@ -28,6 +32,35 @@ export interface Decision {
   tokens: number
   seconds: number
 }
+/** A checking tier: 1 project direction, 2 third-party tools, 3 low risk. */
+export type Tier = 1 | 2 | 3
+
+/**
+ * Works out a decision's final checking tier from the tier the factory's gate gave the request (plain code, never the worker's words) and the judge's
+ * risk grade. The grade stands for a tier of its own: high is 1, medium 2, low 3. Without a gate tier the judge's tier is the tier. With one, the lower
+ * number wins: the judge may raise the checking (a lower number), never lower it below what the gate set.
+ */
+export class TierChoice {
+  static readonly TIERS: readonly Tier[] = [1, 2, 3]
+  /** The tier each risk grade stands for. */
+  static readonly BY_RISK: Readonly<Record<Decision['risk'], Tier>> = { high: 1, medium: 2, low: 3 }
+  /** Whether a request's `tier` is in the agreed shape: left out, `null` (the gate left it unsorted) or the whole number 1, 2 or 3. */
+  static holds(value: unknown): value is Tier | null | undefined {
+    return value === undefined || value === null || (TierChoice.TIERS as readonly unknown[]).includes(value)
+  }
+  /** The gate's tier of a request, or `null` when it has none. */
+  static gateTierOf(request: { tier?: unknown }): Tier | null {
+    const tier = request.tier
+    return (TierChoice.TIERS as readonly unknown[]).includes(tier) ? tier as Tier : null
+  }
+  /** The final tier and who set it. */
+  static of(gate: Tier | null, risk: Decision['risk']): Pick<Decision, 'tier' | 'tier_set_by'> {
+    const judge = TierChoice.BY_RISK[risk]
+    if (gate === null) return { tier: judge, tier_set_by: 'judge' }
+    return judge < gate ? { tier: judge, tier_set_by: 'judge' } : { tier: gate, tier_set_by: 'gate' }
+  }
+}
+
 /** A line of `decisions.jsonl`: the decision, the time it was written (ISO-8601, UTC) and the project's absolute path. */
 export type DecisionLine = Decision & { ts: string; project: string }
 

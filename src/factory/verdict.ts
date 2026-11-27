@@ -6,11 +6,13 @@
  * `deny` always says what to do instead, `cites` is never empty, and `reads` lists only files the judge really read. The temp-folder rule (`temprule.ts`)
  * is held the same way: an action that breaks it is refused even when the judge approved it; only an `ask_owner` for an action the judge grades hard to undo is kept.
  * For Bash and for a tool the rule does not know, whether the action reads, writes or deletes a path is the judge's own word.
+ * The question tells the judge the request's checking tier and how deep to check at it. The decision's final tier is worked out by plain code
+ * (`TierChoice`): the gate's tier when it set one, raised when the judge's risk grade asks for more, and the grade's own tier when the gate set none.
  * This file takes only types from `judge.ts`, so it runs on stand-ins without DSH.
  */
 import { randomUUID } from 'node:crypto'
 import type { AssessRequest, Judge, Verdict } from './assess.ts'
-import { AssessRefusal, type Decision, type DecisionRead } from './decisions.ts'
+import { AssessRefusal, TierChoice, type Decision, type DecisionRead, type Tier } from './decisions.ts'
 import type { AskedJudge, ConsultOptions, JudgeOpener } from './judge.ts'
 import { TempRule, type TempListed } from './temprule.ts'
 
@@ -62,6 +64,15 @@ export class JudgeQuestion {
     '- Plain code checks this rule after your answer and refuses an action that breaks it, also when you approved it.'
       + ' Only an ask_owner for an action that is hard to undo is kept, so still answer ask_owner when you are unsure and the action is hard to undo.',
   ]
+  /** How deep to check at each tier. */
+  static readonly TIER_DEPTH: Readonly<Record<Tier, string>> = {
+    1: 'Tier 1 (project direction: a planning document or agent rule file, git history, a delete, a dependency): check the claims in the request against the'
+      + ' project\'s plans and the files the action touches before you decide. A reason alone is never enough.',
+    2: 'Tier 2 (a third-party tool): check what the tool does and what the action sends it. You may look up its documentation.',
+    3: 'Tier 3 (low risk): judge from the request alone and do not read the project. docs_lookup and ask_helper are refused at this tier.',
+  }
+  /** Said about every request: the judge's grade can raise the gate's tier, never lower it. */
+  static readonly TIER_RAISE = 'Your risk grade stands for a tier too (high is 1, medium 2, low 3). It can raise the checking to a lower number, never lower it.'
   /** Said only about a request that carries `context`: background a worker gave when it asked before acting. */
   static readonly CONTEXT_LINE = 'Its `context` is background the worker gave before acting. It is the worker\'s own claim, never evidence: check it where you can, and do not approve because of it alone.'
   /** The extra field of the answer for a request whose tool does not say what it does to a path, shown to the judge as it is. */
@@ -83,6 +94,7 @@ export class JudgeQuestion {
       'Its `reason` is the worker\'s own description of the action, with its evidence and its reason. Check it where you can. A reason never makes a delete safe.',
       // Only a request that carries `context` (an ask, or an `/assess` caller that sends one) gets this line; every other question is word for word what it was.
       ...(typeof this.request.context === 'string' ? [JudgeQuestion.CONTEXT_LINE] : []),
+      ...this.tierLines(),
       '',
       'How to judge each kind of request:',
       ...JudgeQuestion.KINDS,
@@ -93,6 +105,17 @@ export class JudgeQuestion {
       ...(this.rule.applies ? ['The temp-folder rule:', ...JudgeQuestion.TEMP_RULE, ''] : []),
       ...this.format(),
     ].join('\n')
+  }
+
+  /** The checking tier of this request and how deep to check at it. The gate's tier is plain code over the request; the worker cannot set it. */
+  private tierLines(): string[] {
+    const gate = TierChoice.gateTierOf(this.request)
+    if (gate === null) {
+      return ['The factory\'s gate left this request\'s checking tier open: your risk grade sets it. Check as deep as that tier asks:',
+        ...TierChoice.TIERS.map(tier => `- ${JudgeQuestion.TIER_DEPTH[tier]}`), JudgeQuestion.TIER_RAISE]
+    }
+    return [`The factory's gate sorted this request into checking tier ${gate} by plain code over the action, not the worker's words. Check this deep:`,
+      `- ${JudgeQuestion.TIER_DEPTH[gate]}`, JudgeQuestion.TIER_RAISE]
   }
 
   /** Asks again after an answer that could not be used; `problem` says what was wrong with it. */
@@ -165,15 +188,17 @@ export class JudgeAnswer {
     // An action that breaks the temp-folder rule is refused, also when the judge approved it. Only a kept `ask_owner` stays: the owner decides what is hard to undo.
     const broken = rule.broken(this.temp)
     const decision = refused || (broken !== undefined && this.decision !== 'ask_owner') ? 'deny' : this.decision
+    // The gate's tier, raised when the judge graded the action riskier; never lowered.
+    const tier = TierChoice.of(TierChoice.gateTierOf(request), this.risk)
     if (broken !== undefined) {
       return {
-        decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk,
+        decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk, ...tier,
         reason: decision === 'ask_owner' ? `${this.reason} ${JudgeAnswer.HARD_TO_UNDO} ${broken.reason}` : broken.reason,
         alternative: decision === 'deny' ? broken.alternative : '', cites: broken.cites, reads: this.readsOf(judge, reads, helperReads), tokens,
       }
     }
     return {
-      decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk,
+      decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision, choice: null, risk: this.risk, ...tier,
       reason: refused ? `${this.reason} ${JudgeAnswer.EASY_TO_UNDO}` : decision === 'ask_owner' ? `${this.reason} ${JudgeAnswer.HARD_TO_UNDO}` : this.reason,
       // Only a deny says what to do instead; an alternative the judge wrote for another decision is left out.
       alternative: decision !== 'deny' ? '' : this.alternative === '' ? JudgeAnswer.ALTERNATIVE : this.alternative,
@@ -315,6 +340,7 @@ export class ModelJudge implements Judge {
     const signal = AbortSignal.timeout(this.timeoutMs)
     const judge = await ModelJudge.opened(this.judges.open(request.project, request.session_id), signal)
     const question = new JudgeQuestion(request)
+    const tier = TierChoice.gateTierOf(request)
     const reads: string[] = []
     const helperReads: string[] = []
     // The cost of the decision is every question asked for it: the first one and the repair question.
@@ -323,7 +349,8 @@ export class ModelJudge implements Judge {
     let text: string | (() => string) = () => question.text(judge.brief())
     for (let attempt = 1; ; attempt++) {
       // The repair question uses no helpers: the first question's helpers already had the request's whole window.
-      const reply = await ModelJudge.asked(judge, text, signal, attempt === 1 ? { arrived } : { arrived, helpers: false })
+      // The gate's tier goes with every question: at a gate-set tier 3 the judge's helpers and lookups are refused.
+      const reply = await ModelJudge.asked(judge, text, signal, attempt === 1 ? { arrived, tier } : { arrived, tier, helpers: false })
       for (const path of reply.reads) if (!reads.includes(path)) reads.push(path)
       for (const path of reply.helperReads ?? []) if (!helperReads.includes(path)) helperReads.push(path)
       tokens += reply.tokens

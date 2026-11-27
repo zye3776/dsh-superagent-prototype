@@ -68,13 +68,14 @@ interface GuardModuleExports { JudgeToolGuard?: { forHome?: unknown; forJudge?: 
  * at all, how many helpers the judge asked for it, whether it is still being answered, the files its helpers read, and a signal that is aborted when it is
  * answered, which stops every helper still running for it.
  */
-interface Question { origin: number; helpersAllowed: boolean; helpers: number; open: boolean; helperReads: string[]; closed: AbortController }
+interface Question { origin: number; helpersAllowed: boolean; helpers: number; open: boolean; helperReads: string[]; closed: AbortController; gateTier: 1 | 2 | 3 | null }
 /**
  * How one question is asked. `arrived`: when the request it decides arrived, so the helper and lookup windows count from then and a question that waited
  * behind another, or a repair question, gets no fresh window; without it they count from when the question is sent. `helpers: false` lets the question use
- * no helper (a repair question).
+ * no helper (a repair question). `tier`: the checking tier the factory's gate gave the request (`null` or left out when it gave none); at tier 3 the question
+ * gets no helper and no documentation lookup.
  */
-export interface ConsultOptions { arrived?: number; helpers?: boolean }
+export interface ConsultOptions { arrived?: number; helpers?: boolean; tier?: 1 | 2 | 3 | null }
 /** What a helper of the question now being answered needs: the time it must have ended by, the signal that stops it, and where its reads go. */
 export interface HelperWindow { deadline: number; signal: AbortSignal; note(paths: readonly string[]): void }
 
@@ -196,6 +197,10 @@ export class JudgeSession {
   static readonly HELPER_START_MS = 10_000
   /** Every helper is stopped by this long after the question was sent, so the answer is in within the factory hook's 30-second wait. */
   static readonly HELPER_END_MS = 20_000
+  /** The refusal of a helper for a request the factory's gate sorted into tier 3 (low risk), which is judged from the request alone. */
+  static readonly TIER_3_HELPER = 'Refused: the gate sorted this request into tier 3 (low risk), which is judged from the request alone, so no helper is asked. Answer with what you have.'
+  /** The refusal of a documentation lookup for such a request. */
+  static readonly TIER_3_LOOKUP = 'Refused: the gate sorted this request into tier 3 (low risk), which is judged from the request alone, so nothing is looked up. Answer with what you have.'
   /** The files this judge was allowed to read. */
   readonly ledger = new ReadLedger()
   /** Whether this judge has documentation lookups (the guard file has the judge variant); the first-contact brief says so. */
@@ -229,6 +234,7 @@ export class JudgeSession {
         'a claim in the request must be checked, or a rule below tells you to read a file.',
         'You have the tools read, grep, glob and bash. bash runs read-only commands only, written as plain commands; secret files are refused.',
         'When a call is refused, the refusal says why and what to do instead.',
+        'Each question names the request\'s checking tier (1 project direction, 2 third-party tools, 3 low risk) and how deep to check at it.',
         ...this.helpers ? [
           `To check claims faster, you may ask up to ${JudgeSession.MAX_HELPERS} helpers with ask_helper, only within the first ${JudgeSession.HELPER_START_MS / 1000} seconds of a request; each one is stopped 15 seconds after it starts and at the latest ${JudgeSession.HELPER_END_MS / 1000} seconds after the request arrived.`,
           'engine "claude" reads the project with Read, Grep and Glob and answers one narrow question (model haiku, the default, or sonnet for a harder one); the files it reads are recorded with your decision.',
@@ -263,13 +269,14 @@ export class JudgeSession {
   }
 
   /**
-   * Why the judge may not ask a helper now, or `undefined`, counting the helper when it may: none for a question asked without helpers, at most
-   * `MAX_HELPERS` per question, only in the first `HELPER_START_MS` of the question's window.
+   * Why the judge may not ask a helper now, or `undefined`, counting the helper when it may: none for a question asked without helpers or for a
+   * request the gate sorted into tier 3, at most `MAX_HELPERS` per question, only in the first `HELPER_START_MS` of the question's window.
    */
   helperRefusal(): string | undefined {
     const question = this.question
     if (question === undefined || !question.open) return 'Refused: no question is being answered, so no helper is asked.'
     if (!question.helpersAllowed) return 'Refused: this question repeats a request whose answer could not be used, and it gets no helpers. Answer with what you have.'
+    if (question.gateTier === 3) return JudgeSession.TIER_3_HELPER
     if (question.helpers >= JudgeSession.MAX_HELPERS) {
       return `Refused: at most ${JudgeSession.MAX_HELPERS} helpers per question, and they are asked. Answer with what you and they have found.`
     }
@@ -296,10 +303,14 @@ export class JudgeSession {
       } }
   }
 
-  /** Why the judge may not look up documentation now, or `undefined`: a lookup starts only in the first `HELPER_START_MS` of a question, so it ends in time. */
+  /**
+   * Why the judge may not look up documentation now, or `undefined`: none for a request the gate sorted into tier 3, and a lookup starts only in the
+   * first `HELPER_START_MS` of a question, so it ends in time.
+   */
   lookupRefusal(): string | undefined {
     const question = this.question
     if (question === undefined || !question.open) return 'Refused: no question is being answered, so nothing is looked up.'
+    if (question.gateTier === 3) return JudgeSession.TIER_3_LOOKUP
     if (this.now() - question.origin >= JudgeSession.HELPER_START_MS) {
       return `Refused: documentation lookups start only within the first ${JudgeSession.HELPER_START_MS / 1000} seconds of a request. Answer with what you have.`
     }
@@ -343,7 +354,7 @@ export class JudgeSession {
     this.reading = reads
     const started = this.now()
     const question: Question = { origin: Math.min(started, options.arrived ?? started), helpersAllowed: options.helpers !== false, helpers: 0, open: true,
-      helperReads: [], closed: new AbortController() }
+      helperReads: [], closed: new AbortController(), gateTier: options.tier ?? null }
     this.question = question
     const before = agent.session.snapshotEvents().length
     agent.followup(freezeMessage({ id: MessageId(`dsh-superagent-factory:${randomUUID()}`), role: 'user' as const, content: [{ type: 'text' as const, text }],

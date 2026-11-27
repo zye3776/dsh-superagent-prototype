@@ -19,6 +19,9 @@ export type RecordedRequest = {
   gate: string
   project: string
   temp?: TempFacts | null
+  /** The checking tier the factory's gate gave the request, and its rule; `null` when it left it unsorted. Left out by most recorded requests. */
+  tier?: 1 | 2 | 3 | null
+  tier_rule?: string | null
 }
 
 /** Builds the recorded requests of one project, all from one worker session unless a test says otherwise. */

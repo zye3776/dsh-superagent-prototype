@@ -131,7 +131,7 @@ it('answers a valid request with the stub decision, masked, and appends the same
   const answer = await call('POST', sample())
   expect(answer.status).toBe(200)
   expect(answer.body).toEqual({ decision_id: expect.stringMatching(/^[0-9a-f-]{36}$/), request_id: 'req-1', kind: 'permission', decision: 'ask_owner',
-    choice: null, risk: 'high', reason: `${StubJudge.REASON}${MASKED}`, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0, seconds: expect.any(Number),
+    choice: null, risk: 'high', tier: 1, tier_set_by: 'judge', reason: `${StubJudge.REASON}${MASKED}`, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0, seconds: expect.any(Number),
     ts: NOW, project })
   // The factory's decision shape refuses an empty `cites`.
   expect(StubJudge.CITES).not.toBe('')
@@ -488,7 +488,7 @@ function fixedJudge(decision: Verdict['decision'] = 'approve'): Judge & { seen: 
   const seen: AssessRequest[] = []
   return { seen, decide: (asked: AssessRequest): Verdict => {
     seen.push(asked)
-    return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission', decision, choice: null, risk: 'low', reason: JUDGED,
+    return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission', decision, choice: null, risk: 'low', tier: 3, tier_set_by: 'judge', reason: JUDGED,
       alternative: decision === 'deny' ? 'Do it another way.' : '', cites: 'Ticket 19', reads: [], tokens: 7 }
   } }
 }
@@ -568,7 +568,7 @@ it('keeps a held approve claimable when a newer ask of the same call is denied o
     const judge = { decide: (asked: AssessRequest) => {
       seen.push(asked)
       const decision = answers[seen.length - 1] as 'approve' | 'deny' | 'ask_owner'
-      return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission' as const, decision, choice: null, risk: 'low' as const,
+      return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission' as const, decision, choice: null, risk: 'low' as const, tier: 3 as const, tier_set_by: 'judge' as const,
         reason: JUDGED, alternative: decision === 'deny' ? 'Do it another way.' : '', cites: 'Ticket 19', reads: [], tokens: 7 }
     } }
     await serve([project], writer(), judge)
@@ -677,6 +677,35 @@ it('answers an ask with 503 and asks no judge when the mask module is missing or
     await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
   }
   expect(existsSync(file())).toBe(false)
+})
+
+it('refuses a tier that is not null or a whole 1, 2 or 3, or a tier rule that is not text, with 400, and writes nothing', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  for (const fields of [{ tier: 7 }, { tier: '1' }, { tier: 0 }, { tier: 1.5 }, { tier: true }, { tier: [1] }, { tier: 2, tier_rule: 3 }, { tier_rule: ['x'] }]) {
+    const answer = await call('POST', sample(fields))
+    expect([answer.status, answer.body], JSON.stringify(fields)).toEqual([400, { error: 'The request has a malformed tier' }])
+  }
+  expect(judge.seen).toEqual([])
+  expect(existsSync(file())).toBe(false)
+  for (const fields of [{ tier: 1, tier_rule: 'project-direction-file' }, { tier: null, tier_rule: null }, {}]) expect((await call('POST', sample(fields))).status).toBe(200)
+  expect(judge.seen.map(request => [request.tier, request.tier_rule])).toEqual([[1, 'project-direction-file'], [null, null], [undefined, undefined]])
+})
+
+it('records the gate\'s tier on the stub\'s decision: its high grade keeps a gate tier 1 and raises any other', async () => {
+  await serve([project], writer())
+  const recorded = async (fields: Record<string, unknown>) => (await call('POST', sample(fields))).body as Record<string, unknown>
+  expect(await recorded({ request_id: 'r1', tier: 1, tier_rule: 'project-direction-file' })).toMatchObject({ tier: 1, tier_set_by: 'gate' })
+  expect(await recorded({ request_id: 'r2', tier: 3, tier_rule: 'read-only' })).toMatchObject({ tier: 1, tier_set_by: 'judge' })
+  expect(await recorded({ request_id: 'r3' })).toMatchObject({ tier: 1, tier_set_by: 'judge' })
+})
+
+it('takes no tier from a worker\'s ask: the judged request carries none', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  expect((await ask({ tier: 3, tier_rule: 'read-only' })).status).toBe(200)
+  expect('tier' in judge.seen[0]!).toBe(false)
+  expect('tier_rule' in judge.seen[0]!).toBe(false)
 })
 
 it('refuses an assess request whose context is not text, and hands a text context to the judge', async () => {

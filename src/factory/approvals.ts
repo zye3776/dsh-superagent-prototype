@@ -28,6 +28,7 @@ export class PendingApprovals {
   /**
    * How long a settled key is remembered, in seconds. It only bounds memory: an ask cannot take longer than the judge's time limit (120 seconds),
    * so a record older than this can no longer stop any ask.
+   * It is not the only limit: the records also share the cap `max`, and a record can be dropped for room long before it is this old (see `settle`).
    */
   static readonly SETTLED_SECONDS = PendingApprovals.MAX_SECONDS
   /** Kept in the order they were held, so the first entry is the oldest. `expires` is in milliseconds, as `now()` counts them. */
@@ -59,6 +60,9 @@ export class PendingApprovals {
    * (one held for another session or project stays, as in `claim`), and the key is remembered, so `hold` refuses an approve of an ask that
    * started before this moment. The newest record for a key replaces the older one. Records past `SETTLED_SECONDS` are dropped first, then the
    * oldest ones while there is no room.
+   * The trade-off of the cap: when there is no room the oldest record goes whatever its age. So if more than `max` other keys are settled while
+   * one ask is still with the judge, the record of that ask's key is forgotten, and its late approve is held again as before this record existed.
+   * That keeps the memory bounded, at the price of this one rare case.
    */
   settle(claim: ApprovalClaim): void {
     const now = this.now()

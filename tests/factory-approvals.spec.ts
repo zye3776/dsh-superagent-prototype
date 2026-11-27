@@ -127,6 +127,7 @@ it('remembers at most its cap of settled keys, and none past the horizon', () =>
   for (const key of ['a', 'b', 'c']) approvals.settle(claim({ request_key: key }))
   // `a` was the oldest and made room: its record is gone, the other two still stop a late approve.
   expect(approvals.settledCount).toBe(2)
+  expect(approvals.hold(approval({ request_key: 'a' }), before)).toBeInstanceOf(Date)
   expect(approvals.hold(approval({ request_key: 'b' }), before)).toBeUndefined()
   expect(approvals.hold(approval({ request_key: 'c' }), before)).toBeUndefined()
   // Settling `b` again makes it the newest, so `c` goes when `d` comes.
@@ -135,9 +136,19 @@ it('remembers at most its cap of settled keys, and none past the horizon', () =>
   expect(approvals.settledCount).toBe(2)
   expect(approvals.hold(approval({ request_key: 'b' }), before)).toBeUndefined()
   expect(approvals.hold(approval({ request_key: 'c' }), before)).toBeInstanceOf(Date)
-  // Past the horizon every older record is dropped at the next settlement.
-  now = PendingApprovals.SETTLED_SECONDS * 1000
-  approvals.settle(claim({ request_key: 'e' }))
-  expect(approvals.settledCount).toBe(1)
   expect(PendingApprovals.SETTLED_SECONDS).toBeGreaterThan(120)
+  // The horizon, with room to spare so the cap plays no part: one millisecond before it a record is kept and still blocks; at it, the record goes.
+  now = 0
+  const aged = new PendingApprovals(10, () => now, 10)
+  const start = aged.mark()
+  aged.settle(claim({ request_key: 'x' }))
+  now = PendingApprovals.SETTLED_SECONDS * 1000 - 1
+  aged.settle(claim({ request_key: 'y' }))
+  expect(aged.settledCount).toBe(2)
+  expect(aged.hold(approval({ request_key: 'x' }), start)).toBeUndefined()
+  now = PendingApprovals.SETTLED_SECONDS * 1000
+  aged.settle(claim({ request_key: 'z' }))
+  expect(aged.settledCount).toBe(2)
+  expect(aged.hold(approval({ request_key: 'x' }), start)).toBeInstanceOf(Date)
+  expect(aged.hold(approval({ request_key: 'y' }), start)).toBeUndefined()
 })

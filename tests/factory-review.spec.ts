@@ -350,7 +350,7 @@ it('lists the projects, then the picked project\'s jobs newest first; shows a jo
   expect(page.querySelector('#comment-status')!.textContent).toBe('')
   // No form, no dialog, and no button but the review talk's: the field saves by itself.
   expect([page.querySelector('form'), page.querySelector('dialog'), page.querySelector('input')]).toEqual([null, null, null])
-  expect([...page.querySelectorAll('button')].map(button => button.textContent)).toEqual([ReviewPage.START_TALK])
+  expect([...page.querySelectorAll('button')].map(button => button.textContent || button.id)).toEqual([ReviewPage.START_TALK, 'theme-switch'])
   // A job without a stop says so in place of its duration.
   const older = dom((await call('GET', ReviewRoute.address(other, 'job-0'), { cookie })).text)
   expect([older.querySelector('ol li div')!.textContent, older.querySelector('textarea')!.value, older.querySelector('.crumb')!.textContent])
@@ -376,7 +376,8 @@ it('lets the page load nothing but its own style and script, and names only DSH\
     // same-origin, not no-referrer: under no-referrer a browser may send Origin: null with the page's own posts, which admit refuses (owner's check, story 3.1).
     .toEqual(['no-store', 'nosniff', 'DENY', 'same-origin', 'text/html; charset=utf-8'])
   const page = dom(answer.text)
-  expect([page.querySelectorAll('script').length, page.querySelector('script')!.getAttribute('nonce'), page.querySelector('style')!.getAttribute('nonce')]).toEqual([1, nonce, nonce])
+  // Two scripts, both the page's own and both with the nonce: the one in the head that applies the owner's light or dark choice before anything is drawn, and the page's script.
+  expect([[...page.querySelectorAll('script')].map(script => [script.parentElement!.tagName, script.getAttribute('nonce')]), page.querySelector('style')!.getAttribute('nonce')]).toEqual([[['HEAD', nonce], ['BODY', nonce]], nonce])
   expect([page.querySelector('script[src]'), page.querySelector('link'), page.querySelector('img'), page.querySelector('[style]')]).toEqual([null, null, null, null])
   // A new nonce for each answer.
   expect(String((await call('GET', '/review', {})).headers['content-security-policy'])).not.toContain(nonce)
@@ -450,7 +451,7 @@ it('folds the left panel into the top bar in a narrow window: the same links beh
   expect([fold.hasAttribute('open'), fold.querySelector('.left')!.getAttribute('aria-label'), page.querySelector('form, select, input')]).toEqual([false, 'Projects and jobs', null])
   // In the page's text it sits where it is drawn: after the tabs and before the line that says where the owner is; the proposal notice comes after both.
   expect([...page.body.children].filter(each => each.tagName !== 'SCRIPT').map(each => each.id !== '' ? `#${each.id}` : `${each.tagName.toLowerCase()}.${each.className}`))
-    .toEqual(['h1.', 'nav.tabs', 'details.fold', 'div.head', '#talk-notice', '#proposal-notice', 'div.cols with-detail'])
+    .toEqual(['h1.', 'nav.tabs', 'details.fold', 'div.head', '#theme-switch', '#talk-notice', '#proposal-notice', 'div.cols with-detail'])
   // The line that says where the owner is may be cut short in the bar, so its whole text is its tooltip.
   expect(page.querySelector('.crumb')!.getAttribute('title')).toBe(page.querySelector('.crumb')!.textContent)
   // The style shows the fold and hides the panel under 1100px only, and the panels left take the whole width.
@@ -497,6 +498,64 @@ it('words the page as the mockups do where the records allow: a permission answe
   const view = dom(new ReviewPage('n').guideline(read, undefined, [open], open))
   expect([...view.querySelector('.answer')!.children].map(part => part.id || part.textContent)).toEqual([ReviewPage.NOTHING_SAVED, 'accept-proposal', 'reject-proposal'])
   expect([...view.querySelectorAll('.halves section:last-child .line')].map(line => [line.className, line.textContent])).toEqual([['line h', '# Scope'], ['line', 'New.']])
+})
+
+it('has a light/dark switch at the end of the top bar on both tabs: it follows the system until clicked, then keeps the choice in this browser only', async () => {
+  await serve()
+  put('actions.jsonl', [action()])
+  const cookie = await signIn()
+  const jobs = await call('GET', '/review', { cookie })
+  const guideline = await call('GET', ReviewRoute.guidelineAddress(), { cookie })
+  // One icon button on each tab, a direct child of the body after the line that says where the owner is, so it is in the top bar in the wide layout
+  // and in both narrow ones. It is named by what a click does, with the same words as its tooltip, and holds a moon and a sun drawn in the page itself.
+  for (const answer of [jobs, guideline]) {
+    const button = dom(answer.text).querySelector('body > button#theme-switch.theme')!
+    expect([button.getAttribute('type'), button.getAttribute('aria-label'), button.getAttribute('title'), button.textContent]).toEqual(['button', ReviewPage.TO_DARK, ReviewPage.TO_DARK, ''])
+    expect([...button.querySelectorAll('svg')].map(icon => [icon.getAttribute('class'), icon.getAttribute('aria-hidden')])).toEqual([['moon', 'true'], ['sun', 'true']])
+    expect(['crumb', 'head']).toContain(button.previousElementSibling!.className)
+    expect(dom(answer.text).querySelectorAll('#theme-switch').length).toBe(1)
+  }
+  // The style puts it in the top bar's first row, which stays one row in every layout, and turns the page's colours and the icon by the root's mark.
+  const style = dom(jobs.text).querySelector('style')!.textContent
+  for (const rule of ['.theme { grid-row: 1; grid-column: 5;', ':root[data-theme="light"] { color-scheme: light; }', ':root[data-theme="dark"] { color-scheme: dark; }',
+    ':root[data-theme="dark"] .theme .sun { display: block; }', '@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .theme .sun { display: block; }']) expect(style).toContain(rule)
+  expect(/@media \(max-width: 700px\) \{.*\}/.exec(style)![0]).not.toContain('.theme {')
+  // A page run in a browser, with what the browser kept from before. The script in the head marks the root before the body exists.
+  const sent: string[] = []
+  const opened: { close(): void }[] = []
+  const run = (kept: string | undefined, storage = true) => {
+    const virtualConsole = new VirtualConsole()
+    const window = new JSDOM(jobs.text, { runScripts: 'dangerously', virtualConsole, url: `${origin()}/review`, beforeParse: view => {
+      (view as unknown as { fetch: unknown }).fetch = (url: string) => { sent.push(url); return new Promise(() => {}) }
+      if (kept !== undefined) view.localStorage.setItem(ReviewPage.THEME_KEY, kept)
+      if (!storage) Object.defineProperty(view, 'localStorage', { get: () => { throw new Error('blocked') } })
+    } }).window
+    opened.push(window)
+    const button = window.document.querySelector<HTMLButtonElement>('#theme-switch')!
+    return { window, button, state: () => [window.document.documentElement.getAttribute('data-theme'), button.getAttribute('aria-label'), button.title] }
+  }
+  // Nothing kept: no mark, so the page follows the system (light here, where the test browser has no setting), and the button offers dark.
+  const fresh = run(undefined)
+  expect(fresh.state()).toEqual([null, ReviewPage.TO_DARK, ReviewPage.TO_DARK])
+  // A click turns the page dark, keeps the choice under the one key, and the button now offers light; a second click turns it back.
+  fresh.button.click()
+  expect([...fresh.state(), fresh.window.localStorage.getItem(ReviewPage.THEME_KEY), fresh.window.localStorage.length]).toEqual(['dark', ReviewPage.TO_LIGHT, ReviewPage.TO_LIGHT, 'dark', 1])
+  fresh.button.click()
+  expect([...fresh.state(), fresh.window.localStorage.getItem(ReviewPage.THEME_KEY)]).toEqual(['light', ReviewPage.TO_DARK, ReviewPage.TO_DARK, 'light'])
+  // A kept choice is applied on the next page, and the button says so from the start.
+  expect(run('dark').state()).toEqual(['dark', ReviewPage.TO_LIGHT, ReviewPage.TO_LIGHT])
+  expect(run('light').state()).toEqual(['light', ReviewPage.TO_DARK, ReviewPage.TO_DARK])
+  // Anything else that was kept is ignored, and a browser that refuses storage follows the system and still switches for this page.
+  expect(run('blue').state()).toEqual([null, ReviewPage.TO_DARK, ReviewPage.TO_DARK])
+  const blocked = run(undefined, false)
+  blocked.button.click()
+  expect(blocked.state()).toEqual(['dark', ReviewPage.TO_LIGHT, ReviewPage.TO_LIGHT])
+  // The switch sends nothing to the server: the only request these pages may have made is their question whether a proposal is waiting.
+  expect(sent.filter(url => url !== ReviewRoute.PROPOSAL_PATH)).toEqual([])
+  for (const window of opened) window.close()
+  // The script in the head is in every page, the plain ones too, so they are drawn in the kept mode; it is the same few words each time.
+  expect(dom(new ReviewPage('n').notice('x')).querySelector('head script')!.textContent).toBe(ReviewPage.themeBoot())
+  expect(ReviewPage.themeBoot()).toContain(`localStorage.getItem("${ReviewPage.THEME_KEY}")`)
 })
 
 it('says there is no job yet when the project holds none, and skips lines it cannot read', async () => {
@@ -1369,7 +1428,7 @@ describe('comments on a job and on any step', () => {
     // The only controls are the comment field and the review talk's button: no form, other button, select, radio or checkbox, and no word of a mark,
     // grade or setting.
     const page = dom(html)
-    expect([...page.querySelectorAll('form, button, select, input')].map(control => control.id)).toEqual(['start-talk'])
+    expect([...page.querySelectorAll('form, button, select, input')].map(control => control.id)).toEqual(['start-talk', 'theme-switch'])
     expect(page.body.textContent).not.toMatch(/\b(mark|grade|score|rating|never[- ]decide|setting)s?\b/i)
   })
 })
@@ -1435,7 +1494,7 @@ describe('the Guideline tab', () => {
     expect([...jobs.querySelectorAll('nav.tabs a')].map(link => [link.textContent, link.getAttribute('href'), link.classList.contains('on')]))
       .toEqual([['Jobs', '/review', true], ['Guideline', ReviewRoute.guidelineAddress(), false]])
     const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
-    expect([...page.querySelectorAll('form, button, select, input, textarea')].map(control => control.id)).toEqual(['write-trend'])
+    expect([...page.querySelectorAll('form, button, select, input, textarea')].map(control => control.id)).toEqual(['theme-switch', 'write-trend'])
   })
 })
 
@@ -1555,7 +1614,7 @@ describe('the review talk and its proposals', () => {
     expect([...right!.querySelectorAll('.line')].map(each => [each.tagName, each.textContent])).toEqual([['SPAN', '# Guideline'], ['INS', 'Keep to the minimum feature.'], ['SPAN', 'Ask first.']])
     expect(view.querySelector('main')!.textContent).toContain(ReviewPage.NOTHING_SAVED)
     // Its only controls are the owner's two answers, for the proposal shown.
-    expect([...view.querySelectorAll('form, button, select, input, textarea')].map(control => [control.id, control.textContent])).toEqual([['accept-proposal', 'Accept as v2'], ['reject-proposal', 'Reject']])
+    expect([...view.querySelectorAll('form, button, select, input, textarea')].map(control => [control.id, control.textContent])).toEqual([['theme-switch', ''], ['accept-proposal', 'Accept as v2'], ['reject-proposal', 'Reject']])
     expect((view.getElementById('accept-proposal') as HTMLElement).dataset).toMatchObject({ project, job: 'job-1', ts: NOW })
     // What waits, for the page's script: no text, only where to open it.
     const waiting = await call('GET', ReviewRoute.PROPOSAL_PATH, { cookie })

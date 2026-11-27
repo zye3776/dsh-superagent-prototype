@@ -188,6 +188,10 @@ export class ReviewPage {
   /** The event the comment field's script sends on the page once a comment is saved. */
   static readonly COMMENT_SAVED = 'review-comment-saved'
   static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
+  /** The light/dark switch: its two names, said by what a click does, and the one key its choice is kept under in this browser. */
+  static readonly TO_LIGHT = 'Switch to light mode'
+  static readonly TO_DARK = 'Switch to dark mode'
+  static readonly THEME_KEY = 'factory-review-theme'
   static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
   /** The pill on a proposal that waits for the owner's answer, in the Guideline tab's list. */
   static readonly WAITING = 'waiting'
@@ -256,11 +260,14 @@ export class ReviewPage {
    */
   private static readonly STYLE = [
     ':root { color-scheme: light dark; }',
+    // The owner's choice with the light/dark switch, which the script in the head marks on the root before anything is drawn.
+    ':root[data-theme="light"] { color-scheme: light; }',
+    ':root[data-theme="dark"] { color-scheme: dark; }',
     '* { box-sizing: border-box; }',
     '[hidden] { display: none !important; }',
     'html, body { height: 100%; margin: 0; }',
     `html { background: ${ReviewPage.BG}; }`,
-    `body { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: ${ReviewPage.INK}; background: ${ReviewPage.BG}; }`,
+    `body { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto; grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: ${ReviewPage.INK}; background: ${ReviewPage.BG}; }`,
     'p { margin: 0 0 8px; }',
     `a { color: ${ReviewPage.LINK}; }`,
     `:focus-visible { outline: 2px solid ${ReviewPage.BRAND}; outline-offset: -2px; }`,
@@ -274,7 +281,14 @@ export class ReviewPage {
     'body > .crumb, body > .head { grid-column: 4; }',
     `.crumb { min-width: 0; padding: 0 16px; line-height: 43px; color: ${ReviewPage.INK2}; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; }`,
     `.crumb > span[title] { color: ${ReviewPage.INK}; font-weight: 600; }`,
-    'body > .head { display: flex; align-items: center; gap: 16px; padding-right: 16px; }',
+    'body > .head { display: flex; align-items: center; gap: 16px; padding-right: 8px; }',
+    // The light/dark switch, at the right end of the top bar: a moon on a light page, a sun on a dark one.
+    `.theme { grid-row: 1; grid-column: 5; align-self: center; display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; margin-right: 12px; padding: 0; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; color: ${ReviewPage.INK2}; background: ${ReviewPage.BG}; }`,
+    `.theme:hover { background: ${ReviewPage.HOVER}; }`,
+    '.theme .sun { display: none; }',
+    '@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .theme .sun { display: block; } :root:not([data-theme="light"]) .theme .moon { display: none; } }',
+    ':root[data-theme="dark"] .theme .sun { display: block; }',
+    ':root[data-theme="dark"] .theme .moon { display: none; }',
     '.head > .crumb { flex: 1; }',
     '.talk { display: flex; flex: 0 1 auto; align-items: center; gap: 8px; min-width: 0; }',
     '.talk button { flex: none; }',
@@ -290,7 +304,8 @@ export class ReviewPage {
     `body > .notice { grid-column: 1 / -1; margin: 0; padding: 8px 16px; border: 0; border-bottom: 1px solid ${ReviewPage.LINE}; border-radius: 0; background: ${ReviewPage.WELL}; }`,
     // The review talk's notice comes before the proposal's in the page's text, so it is drawn first too.
     'body > .notice { grid-row: 3; }',
-    'body > .head + .notice { grid-row: 2; }',
+    // The notice right after the switch is the review talk's when the job has one, so it is drawn first, as in the page's text.
+    'body > .theme + .notice { grid-row: 2; }',
     `.notice.refused { border-color: ${ReviewPage.NO}; }`,
     '.notice .small { font-size: 11px; }',
     'body > p { grid-row: 4; grid-column: 1 / -1; margin: 0; padding: 16px; }',
@@ -381,13 +396,59 @@ export class ReviewPage {
     // A narrow window: the left panel leaves the screen and its fold shows in the top bar, so the timeline and the step detail keep their room.
     '@media (max-width: 1100px) { .fold { display: block; } .cols > .left { display: none; } .cols { grid-template-columns: minmax(0, 1fr); } .cols.with-detail { grid-template-columns: minmax(0, 1fr) clamp(240px, 30vw, 380px); } }',
     // A very narrow window: the top bar takes two lines, the second for where the owner is and the review talk's button.
-    `@media (max-width: 700px) { body { grid-template-rows: auto auto auto auto minmax(0, 1fr); } body > .crumb, body > .head { grid-row: 2; grid-column: 1 / -1; border-bottom: 1px solid ${ReviewPage.LINE}; } body > .head + .notice { grid-row: 3; } body > .notice { grid-row: 4; } body > .cols, body > p { grid-row: 5; } .fold > summary { max-width: 45vw; } .hint { display: none; } }`,
+    `@media (max-width: 700px) { body { grid-template-rows: auto auto auto auto minmax(0, 1fr); } body > .crumb, body > .head { grid-row: 2; grid-column: 1 / -1; border-bottom: 1px solid ${ReviewPage.LINE}; } body > .theme + .notice { grid-row: 3; } body > .notice { grid-row: 4; } body > .cols, body > p { grid-row: 5; } .fold > summary { max-width: 35vw; } .hint { display: none; } }`,
   ].join('\n')
   /**
    * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
    * on a page without its element. The parts are joined with a semicolon, or each would be read as a call of the one before it.
    */
-  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript(), ReviewPage.answerScript(), ReviewPage.trendScript()].join(';\n') }
+  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript(), ReviewPage.answerScript(), ReviewPage.trendScript(), ReviewPage.themeScript()].join(';\n') }
+
+  /**
+   * The script in the page's head, run before anything is drawn: when the owner chose light or dark with the switch, it marks the page's root with the
+   * choice, and the style turns every colour to it. With no choice kept, or a browser that keeps none, the page follows the system's setting.
+   */
+  static themeBoot(): string {
+    return `try { const kept = localStorage.getItem(${JSON.stringify(ReviewPage.THEME_KEY)}); if (kept === 'light' || kept === 'dark') document.documentElement.dataset.theme = kept } catch {}`
+  }
+
+  /**
+   * The light/dark switch: an icon button at the right end of the top bar, a moon while the page is light and a sun while it is dark (the style
+   * shows the one that fits). It is named by what a click does; the name here is the one for a light page, and the page's script corrects it.
+   */
+  private static themeSwitch(): string {
+    const icon = (name: string, shape: string) => `<svg class="${name}" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${shape}</svg>`
+    return `<button type="button" id="theme-switch" class="theme" aria-label="${ReviewPage.TO_DARK}" title="${ReviewPage.TO_DARK}">${
+      icon('moon', '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>')}${
+      icon('sun', '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>')}</button>`
+  }
+
+  /**
+   * The switch's part of the script. A click turns the page to the other mode and keeps the choice in this browser, under one key; it sends nothing
+   * to the server. The button's name and tooltip say what the next click does, from the mode in effect: the kept choice, else the system's setting.
+   */
+  private static themeScript(): string {
+    return `(() => {
+  const button = document.getElementById('theme-switch')
+  if (!button) return
+  const root = document.documentElement
+  const system = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: dark)') : undefined
+  const mode = () => root.dataset.theme === 'light' || root.dataset.theme === 'dark' ? root.dataset.theme : system && system.matches ? 'dark' : 'light'
+  const name = () => {
+    const text = mode() === 'dark' ? ${JSON.stringify(ReviewPage.TO_LIGHT)} : ${JSON.stringify(ReviewPage.TO_DARK)}
+    button.setAttribute('aria-label', text)
+    button.title = text
+  }
+  name()
+  if (system && system.addEventListener) system.addEventListener('change', name)
+  button.addEventListener('click', () => {
+    const next = mode() === 'dark' ? 'light' : 'dark'
+    root.dataset.theme = next
+    try { localStorage.setItem(${JSON.stringify(ReviewPage.THEME_KEY)}, next) } catch {}
+    name()
+  })
+})()`
+  }
 
   /**
    * The comment field's part of the script. It talks only to this page's own comment address.
@@ -614,7 +675,7 @@ export class ReviewPage {
     let crumb = `<span title="${ReviewPage.escape(project.project)}">${name}</span>`
     let middle: string
     let panel = ''
-    let talk = ''
+    let talk: { end: string; notice: string } | undefined
     if (view.outside) {
       crumb += ` › ${ReviewPage.OUTSIDE}`
       middle = `<h2>${ReviewPage.OUTSIDE} · ${ReviewPage.count(project.outside.length, 'automatic answer')}</h2>
@@ -638,12 +699,13 @@ ${this.commentField(job, view.step, comments)}
 </aside>`
     }
     const line = ReviewPage.crumbLine(crumb)
-    const head = talk === '' ? line : `<div class="head">${line}${talk}`
+    const head = talk === undefined ? line : `<div class="head">${line}${talk.end}`
     const left = ReviewPage.left(view)
     const where = `${name}${view.outside ? ` · ${ReviewPage.OUTSIDE}` : job === undefined ? '' : ` · Job ${job.number}`}`
     return this.document(`${ReviewPage.tabs('jobs')}
 ${ReviewPage.fold(where, 'Projects and jobs', left)}
 ${head}
+${ReviewPage.themeSwitch()}${talk === undefined ? '' : `\n${talk.notice}`}
 ${ReviewPage.proposalNotice(view.waiting ?? [])}
 <div class="cols${panel === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Projects and jobs">
@@ -657,17 +719,18 @@ ${panel}
   }
 
   /**
-   * The rest of a job's header: the "Start review talk" button, then the header's end and, under it, the review talk notice. The notice is empty and
+   * The rest of a job's header in two parts: `end`, the "Start review talk" button and the header's end, and `notice`, the review talk notice that
+   * goes under the top bar. The notice is empty and
    * hidden until a click fills it, unless the job's talk was started before: then it names the talk, with the link that starts a fresh one.
    */
-  private static talkHead(job: RecordedJob, talk: TalkState | undefined): string {
+  private static talkHead(job: RecordedJob, talk: TalkState | undefined): { end: string; notice: string } {
     // The same rule the talk's start applies: a job with no comment has no talk, so its button starts disabled with the reason beside it.
     const commented = new TalkComments(job).entries.length > 0
     const hint = commented ? '' : `<span id="talk-hint" class="hint">${ReviewPage.escape(TalkComments.NONE)}</span>`
     const button = `<span class="talk">${hint}<button type="button" id="start-talk" class="primary" data-project="${ReviewPage.escape(job.project)}" data-job="${
       ReviewPage.escape(job.job_id)}"${commented ? '' : ' disabled'}>${ReviewPage.START_TALK}</button></span></div>`
-    if (talk === undefined) return `${button}\n<div id="talk-notice" class="notice" role="status" hidden></div>`
-    return `${button}\n<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>`
+    if (talk === undefined) return { end: button, notice: '<div id="talk-notice" class="notice" role="status" hidden></div>' }
+    return { end: button, notice: `<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>` }
   }
 
   /** A line of a guideline that is a heading as it is written: one to six `#`, a space, then the title. */
@@ -751,6 +814,7 @@ ${ReviewPage.prose(picked.text)}`
     return this.document(`${ReviewPage.tabs('guideline')}
 ${list === '' ? '' : ReviewPage.fold(where, 'Guideline versions', list)}
 ${ReviewPage.crumbLine(crumb)}
+${ReviewPage.themeSwitch()}
 ${ReviewPage.proposalNotice(waiting)}
 <div class="cols${right === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Guideline versions">
@@ -1061,6 +1125,7 @@ ${part(ReviewPage.PARTS.looked_at, read === null ? undefined : read.length === 0
 <head>
 <meta charset="utf-8">
 <title>Review</title>
+<script nonce="${this.nonce}">${ReviewPage.themeBoot()}</script>
 <style nonce="${this.nonce}">
 ${ReviewPage.STYLE}
 </style>

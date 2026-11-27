@@ -55,12 +55,6 @@ export class PendingApprovals {
   }
 
   /**
-   * Forgets the approval held for this key, if any: a newer decision on the same call that is not an approve (a deny, or a hand-over to the
-   * owner) takes back the older approve, so the newest decision always counts.
-   */
-  release(requestKey: string): void { this.held.delete(requestKey) }
-
-  /**
    * Hands out the approval held for exactly this request, once: returns its `decision_id` and forgets it, or returns `undefined` when there is none.
    * It matches only the same key, the same session and the same project, and only before the approval expires. An expired approval is dropped; one held
    * for another session or project stays, because the claim was not for it.

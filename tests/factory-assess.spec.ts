@@ -11,7 +11,7 @@ import { AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessReque
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
-import { SharedTokenFile } from '../src/factory/token.ts'
+import { AskKey, SharedTokenFile } from '../src/factory/token.ts'
 import { ModelJudge } from '../src/factory/verdict.ts'
 import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
 
@@ -500,8 +500,16 @@ const asking = (fields: Record<string, unknown> = {}) => ({ project, session_id:
   description: 'Run the tests of ticket 19', ...fields })
 /** What the hook posts to `/claim` for the call `asking()` describes. */
 const claiming = (fields: Record<string, unknown> = {}) => ({ request_id: 'hook-req-1', request_key: keyOf('s1', 'Bash', asking().tool_input), session_id: 's1', project, ...fields })
-const ask = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = { [SharedTokenFile.HEADER]: undefined }) =>
-  call('POST', asking(fields), headers, '/ask')
+/** The ask key a worker session holds: the key of `session` under the test token. */
+const keyFor = (session: unknown, token: string = TOKEN) => AskKey.compute(token, String(session))
+/**
+ * Sends a worker's ask: no shared token, and by default the right ask key for the body's `session_id`. `headers` adds to these or replaces them;
+ * `undefined` leaves a header out.
+ */
+const ask = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = {}) => {
+  const body = asking(fields)
+  return call('POST', body, { [SharedTokenFile.HEADER]: undefined, [AskKey.HEADER]: keyFor(body.session_id), ...headers }, '/ask')
+}
 const claim = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = {}) => call('POST', claiming(fields), headers, '/claim')
 
 it('judges an ask without a token, masked and keyed with the factory\'s functions, and holds the approve for one claim', async () => {
@@ -556,7 +564,7 @@ it('holds nothing for an ask the judge denies or hands to the owner, and an ask 
   expect(lines()).toHaveLength(2)
 })
 
-it('takes back a held approve when a newer ask of the same call is denied or handed to the owner', async () => {
+it('keeps a held approve claimable when a newer ask of the same call is denied or handed to the owner', async () => {
   for (const later of ['deny', 'ask_owner'] as const) {
     const answers: string[] = ['approve', later]
     const seen: Record<string, unknown>[] = []
@@ -569,7 +577,8 @@ it('takes back a held approve when a newer ask of the same call is denied or han
     await serve([project], writer(), judge)
     expect((await ask()).body.pending_until, later).not.toBeNull()
     expect((await ask({ context: 'The plan changed.' })).body.pending_until, later).toBeNull()
-    expect((await claim()).body, later).toEqual({ claimed: false, request_id: 'hook-req-1', decision_id: null, project })
+    // A weak ask cannot cancel the approval: the call that was approved can still run on it.
+    expect((await claim()).body, later).toEqual({ claimed: true, request_id: 'hook-req-1', decision_id: 'd-1', project })
     await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
   }
 })
@@ -584,7 +593,7 @@ it('holds an approve for the configured approvalSeconds when it runs as the plug
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), maskModule: maskPath(), guardModule: guardPath, approvalSeconds: 30 }))
   const askRoute = registered.find(route => route.path === '/ask')!
   const req = Object.assign(Readable.from([Buffer.from(JSON.stringify(asking()))]), { method: 'POST', socket: { remoteAddress: '127.0.0.1' },
-    headers: { host: '127.0.0.1:3083' } })
+    headers: { host: '127.0.0.1:3083', [AskKey.HEADER]: keyFor('s1') } })
   const answer = { status: 0, text: '' }
   const res = { writeHead: (status: number) => { answer.status = status }, end: (text: string) => { answer.text = text } }
   const before = Date.now()
@@ -647,12 +656,14 @@ it('admits an ask like an assess request but for the token, and refuses a malfor
   expect((await call('POST', '{not json', { [SharedTokenFile.HEADER]: undefined }, '/ask')).status).toBe(400)
   expect(judge.seen).toEqual([])
   expect(existsSync(file())).toBe(false)
-  // An ask works while the route has no token file: it needs none.
+  // Without its token file the route cannot check any ask key, so it answers no ask, and asks no judge.
   rmSync(tokenPath())
-  expect((await ask()).status).toBe(200)
+  expect((await ask()).status).toBe(503)
+  expect(judge.seen).toEqual([])
+  writeToken()
   // Fields the route does not know never reach the judge: a worker cannot state its own temp facts.
   expect((await ask({ temp: null, extra: 'x' })).status).toBe(200)
-  expect(Object.keys(judge.seen[1]!)).toEqual(['request_id', 'request_key', 'project', 'session_id', 'tool_name', 'tool_input', 'reason'])
+  expect(Object.keys(judge.seen[0]!)).toEqual(['request_id', 'request_key', 'project', 'session_id', 'tool_name', 'tool_input', 'reason'])
 })
 
 it('answers an ask with 503 and asks no judge when the mask module is missing or is from a factory that cannot key or mask a request', async () => {
@@ -678,4 +689,46 @@ it('refuses an assess request whose context is not text, and hands a text contex
   expect(judge.seen).toEqual([])
   expect((await call('POST', sample({ context: 'Background.' }))).status).toBe(200)
   expect(judge.seen[0]!.context).toBe('Background.')
+})
+
+it('refuses an ask with no ask key, a wrong one or another session\'s with 401, before any judge, and leaves held approvals as they are', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  // Session s2 asks with its own key and holds an approval.
+  expect((await ask({ session_id: 's2' })).body.pending_until).not.toBeNull()
+  expect(judge.seen).toHaveLength(1)
+  const refused = [
+    await ask({}, { [AskKey.HEADER]: undefined }),
+    await ask({}, { [AskKey.HEADER]: '' }),
+    await ask({}, { [AskKey.HEADER]: '0'.repeat(64) }),
+    await ask({}, { [AskKey.HEADER]: keyFor('s1', OTHER_TOKEN) }),
+    // Another session's key (s2's) does not let a caller ask in s1's name.
+    await ask({}, { [AskKey.HEADER]: keyFor('s2') }),
+    // The shared token itself is not an ask key.
+    await ask({}, { [AskKey.HEADER]: TOKEN }),
+  ]
+  for (const [index, answer] of refused.entries()) {
+    expect(answer.status, String(index)).toBe(401)
+    expect(Object.keys(answer.body), String(index)).toEqual(['error'])
+    expect(answer.text, String(index)).not.toContain(keyFor('s1'))
+    expect(answer.headers[SharedTokenFile.HEADER], String(index)).toBeUndefined()
+  }
+  // No refused ask reached the judge or the decisions file, and s2's approval is still there for its own claim.
+  expect(judge.seen).toHaveLength(1)
+  expect(lines()).toHaveLength(1)
+  const s2Key = keyOf('s2', 'Bash', asking().tool_input)
+  expect((await claim({ session_id: 's2', request_key: s2Key })).body).toMatchObject({ claimed: true, decision_id: 'd-1' })
+  // With the right key the ask is judged.
+  expect((await ask()).status).toBe(200)
+  expect(judge.seen).toHaveLength(2)
+})
+
+it('computes the ask key as the factory does: the pinned test vector', () => {
+  // The same vector is pinned in the factory's lib/askKey test; both sides must agree on it.
+  expect(AskKey.PREFIX).toBe('zees-ask-v1:')
+  expect(AskKey.HEADER).toBe('x-zees-ask-key')
+  expect(AskKey.compute(TOKEN, 'session-0001')).toBe('1db6e63a803f7acf619ed4b46312c11fe1a1fab443b3b52720411b6c422393f6')
+  // The token is trimmed first, so a line break after it changes nothing.
+  expect(AskKey.compute(`${TOKEN}\n`, 'session-0001')).toBe(AskKey.compute(TOKEN, 'session-0001'))
+  expect(AskKey.compute(TOKEN, 'session-0002')).not.toBe(AskKey.compute(TOKEN, 'session-0001'))
 })

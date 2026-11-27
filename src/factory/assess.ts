@@ -12,7 +12,10 @@
  * `POST /ask` takes the worker's action (`session_id`, `tool_name`, `tool_input`), its `description` and an optional `context`. The route masks them with
  * the factory's mask, has the judge of that worker session decide, and writes the decision as `/assess` does. An `approve` is then held for a short
  * time (`approvals.ts`) under the factory's own `request_key` of that exact call. A worker holds no shared token, so `/ask` asks for none and sends
- * none back; all it can produce is the judge's own decision.
+ * none back. Instead it sends its session's ask key (`AskKey` in `token.ts`), which only a holder of the token can make for that `session_id`: an ask
+ * without the right key for the body's `session_id` is refused with 401 before any judge is asked, so no caller can put questions into another
+ * session's judge thread. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
+ * approve replaces it.
  * `POST /claim` is for the factory's hook (shared token, as `/assess`): when the same call reaches the hook, it posts the call's key and gets the held
  * approval's `decision_id`, once, with no model call. With nothing to claim the hook posts to `/assess` as before.
  */
@@ -23,7 +26,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
 import { PendingApprovals, type ApprovalClaim } from './approvals.ts'
 import { AssessRefusal, DecisionWriter, type Decision, type DecisionLine } from './decisions.ts'
-import { SharedTokenFile } from './token.ts'
+import { AskKey, SharedTokenFile } from './token.ts'
 
 export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
 
@@ -160,10 +163,28 @@ export class AssessRoute {
 
   /**
    * Answers one `/ask` request: 200 with `{ decision, pending_until }`, or the status of the refusal with `{ error }`.
-   * The caller is a worker, which has no shared token: none is asked for and none is sent back.
+   * The caller is a worker, which has no shared token: none is asked for and none is sent back. It must send the ask key of the body's
+   * `session_id` instead, checked once the body is read (the key depends on it) and before any judge is asked.
    */
   handleAsk(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
-    return this.answer(req, res, port, false, async body => this.ask(AssessRoute.askOf(body)))
+    return this.answer(req, res, port, false, async body => {
+      const ask = AssessRoute.askOf(body)
+      this.checkAskKey(req, ask.session_id)
+      return this.ask(ask)
+    })
+  }
+
+  /**
+   * Refuses an ask that does not carry the ask key of `session`: 503 while this side has no usable token file (it cannot compute any key),
+   * 401 when the key is missing or wrong, including the key of another session. The key is compared in constant time and never echoed.
+   */
+  private checkAskKey(req: IncomingMessage, session: string): void {
+    const token = this.tokens.read()
+    if (token === undefined) throw new AssessRefusal(503, 'The route has no usable token file, so it answers nobody')
+    const sent = req.headers[AskKey.HEADER]
+    if (typeof sent !== 'string' || sent === '' || !SharedTokenFile.same(sent, AskKey.compute(token, session))) {
+      throw new AssessRefusal(401, 'The ask key is missing or wrong for this session')
+    }
   }
 
   /** Answers one `/claim` request: 200 with the claim reply and the shared token in its header, or the status of the refusal with `{ error }`. */
@@ -189,7 +210,8 @@ export class AssessRoute {
   /**
    * Checks who is calling, before any of the body is read, and returns the shared token to send back.
    * The order is fixed: where the request claims to go and come from, where it really comes from, the method, this side's own token file, then the caller's token.
-   * Without `withToken` (`/ask`) the last two steps are left out, the token file is not read, and nothing is returned.
+   * Without `withToken` (`/ask`) the last two steps are left out, the token file is not read here, and nothing is returned: `/ask` reads the
+   * token file after the body, to check the ask key of the body's `session_id`.
    */
   private admit(req: IncomingMessage, port: number, withToken: boolean): string | undefined {
     const host = req.headers.host
@@ -223,7 +245,8 @@ export class AssessRoute {
   /**
    * Judges an action a worker asks about before it runs it, and holds an `approve` for the hook to claim. Returns the reply text:
    * `{ decision, pending_until }`, where `decision` is the decision line as written and `pending_until` the moment the held approval expires
-   * (ISO-8601, UTC), or `null` when the judge did not approve: then nothing is held, and an approve held earlier for the same call is dropped.
+   * (ISO-8601, UTC), or `null` when the judge did not approve: then nothing new is held, and an approve held earlier for the same call stays
+   * claimable until it expires (a weak ask cannot cancel it; a newer approve of the same call replaces it).
    * The key is computed first, on the raw values, with the factory's own key function: the hook computes the same key for the real call. Then the
    * fields are masked with the factory's mask, as the hook masks a request, so the judge sees no secret and not who the owner is. Without the key
    * function or the mask the ask is refused with 503 before any judge is asked. The judged request has the shape of an `/assess` request, with a new
@@ -242,13 +265,9 @@ export class AssessRoute {
     const line = await this.assess({ request_id: randomUUID(), request_key: key, project: ask.project, session_id: session, tool_name: masked.tool_name,
       tool_input: masked.tool_input, reason: masked.reason, ...(typeof context === 'string' ? { context } : {}) })
     const decision = JSON.parse(line) as DecisionLine
-    let until: string | null = null
-    if (decision.decision === 'approve') {
-      until = this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }).toISOString()
-    } else {
-      // The newest decision counts: a deny or a hand-over to the owner takes back an approve held for the same call.
-      this.approvals.release(key)
-    }
+    const until = decision.decision === 'approve'
+      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }).toISOString()
+      : null
     // The line is put in as written, so the reply holds exactly what the decisions file holds.
     return `{"decision":${line},"pending_until":${JSON.stringify(until)}}`
   }

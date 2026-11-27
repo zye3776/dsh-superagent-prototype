@@ -70,11 +70,8 @@ it('holds at most its cap: expired approvals go first, then the oldest', () => {
   expect(['a', 'b', 'c', 'd', 'e', 'f'].map(key => approvals.claim(claim({ request_key: key })))).toEqual([undefined, undefined, 'dc2', undefined, 'de', 'df'])
 })
 
-it('takes back a held approval for its key when told to, and accepts only whole seconds', () => {
-  const approvals = new PendingApprovals(60, () => 1_000)
-  approvals.hold({ request_key: 'k1', session_id: 's1', project: '/p', decision_id: 'd1' })
-  approvals.release('k1')
-  approvals.release('k-unknown')
-  expect(approvals.claim({ request_key: 'k1', session_id: 's1', project: '/p' })).toBeUndefined()
+it('accepts only whole seconds, and offers no way to take back a held approval but its own claim or expiry', () => {
   expect(() => new PendingApprovals(1.5)).toThrow()
+  // A later ask that is not an approve must not cancel an approval held for the call, so there is nothing that releases one.
+  expect('release' in new PendingApprovals(60)).toBe(false)
 })

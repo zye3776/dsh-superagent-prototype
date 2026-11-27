@@ -308,22 +308,36 @@ export class TalkFolder {
 /** How one program ended: its output, or the reason it failed. */
 export type OrcaRun = { ok: true; stdout: string } | { ok: false; error: string }
 
-/** Runs one program with plain arguments, never through a shell, within a time limit. `OrcaLauncher` runs Orca through it; tests give a fake. */
+/** Where a program runs: its working folder, and variables set on top of DSH's own environment (`undefined` removes one). */
+export interface RunOptions { cwd?: string; env?: Readonly<Record<string, string | undefined>> }
+
+/**
+ * Runs one program with plain arguments, never through a shell, within a time limit. `OrcaLauncher` runs Orca through it, and the guideline's save
+ * path (`save.ts`) runs git and glab through it; tests give a fake.
+ */
 export interface OrcaRunner {
-  run(program: string, args: readonly string[], timeoutMs: number): Promise<OrcaRun>
+  run(program: string, args: readonly string[], timeoutMs: number, options?: RunOptions): Promise<OrcaRun>
 }
 
 /** The real runner: `execFile`, so the arguments reach the program as they are and nothing is read by a shell. It never blocks DSH while it waits. */
 export class ExecFileRunner implements OrcaRunner {
-  run(program: string, args: readonly string[], timeoutMs: number): Promise<OrcaRun> {
+  run(program: string, args: readonly string[], timeoutMs: number, options: RunOptions = {}): Promise<OrcaRun> {
+    const env = options.env === undefined ? undefined : ExecFileRunner.envOf(options.env)
     return new Promise(done => {
-      execFile(program, [...args], { timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' }, (error, stdout, stderr) => {
+      execFile(program, [...args], { timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, encoding: 'utf8', ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(env === undefined ? {} : { env }) }, (error, stdout, stderr) => {
         if (error === null) { done({ ok: true, stdout }); return }
         const timedOut = (error as { killed?: boolean }).killed === true && (error as { signal?: string | null }).signal === 'SIGKILL'
         const said = [stderr, stdout].map(text => text.trim()).find(text => text !== '')
         done({ ok: false, error: timedOut ? `no answer within ${timeoutMs / 1000} seconds` : said ?? error.message })
       })
     })
+  }
+  /** DSH's own environment with `changes` on top; a change to `undefined` leaves that variable out. */
+  static envOf(changes: Readonly<Record<string, string | undefined>>, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...base }
+    for (const [name, value] of Object.entries(changes)) { if (value === undefined) delete env[name]; else env[name] = value }
+    return env
   }
 }
 
@@ -524,4 +538,10 @@ export class GuidelineProposals {
   of(project: string, jobId: string): GuidelineProposal | undefined { return this.byJob.get(GuidelineProposals.keyOf(project, jobId)) }
   /** Every waiting proposal, newest first. */
   newest(): GuidelineProposal[] { return [...this.byJob.values()].reverse() }
+  /** Drops the proposal of one job, only when it is still the one made at `ts`; returns whether it did. A newer one stays. */
+  remove(project: string, jobId: string, ts: string): boolean {
+    const key = GuidelineProposals.keyOf(project, jobId)
+    if (this.byJob.get(key)?.ts !== ts) return false
+    return this.byJob.delete(key)
+  }
 }

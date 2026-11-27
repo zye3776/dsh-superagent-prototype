@@ -2,16 +2,19 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import { JSDOM } from 'jsdom'
+import { Context } from '@deepseek-ai/cordis'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import { JSDOM, VirtualConsole } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
 import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
-import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn } from '../src/factory/review.ts'
-import { OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, type OrcaRun } from '../src/factory/talk.ts'
+import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn, type GuidelineAnswerer } from '../src/factory/review.ts'
+import type { GuidelineSaved } from '../src/factory/save.ts'
+import { OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, type GuidelineProposal, type OrcaRun } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -82,14 +85,15 @@ class DshConnection {
 }
 let dsh = new DshConnection()
 /** Serves the page of a fake DSH web server over real HTTP, reading the token file and the stand-in records module of the test. */
-async function serve(projects: string[] = [project], records: FactoryRecordsModule = new FactoryRecordsModule(recordsModule(root)), talks: ReviewTalks = talksFor(records)): Promise<Route[]> {
+async function serve(projects: string[] = [project], records: FactoryRecordsModule = new FactoryRecordsModule(recordsModule(root)), talks: ReviewTalks = talksFor(records),
+  saver?: GuidelineAnswerer): Promise<Route[]> {
   routes = []
   // DSH's `exact` routes match the path alone, without the query.
   server = createServer((req, res) => { void routes.find(route => route.path === new URL(req.url ?? '/', 'http://127.0.0.1').pathname)!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { routes.push(registered); return () => {} } } }
-  reviewRoute = new ReviewRoute(projects, new SharedTokenFile(tokenPath()), records, () => new Date(NOW), talks)
+  reviewRoute = new ReviewRoute(projects, new SharedTokenFile(tokenPath()), records, () => new Date(NOW), talks, saver)
   reviewRoute.register(ctx as never)
   reviewRoute.signIn.use(dsh)
   return routes
@@ -131,14 +135,14 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-it('registers four exact routes, anonymous to DSH\'s web server so the page answers its own line, and refuses a web server that is not on loopback', async () => {
+it('registers five exact routes, anonymous to DSH\'s web server so the page answers its own line, and refuses a web server that is not on loopback', async () => {
   const registered = await serve()
   expect(registered.map(route => [route.kind, route.path, route.auth])).toEqual([['exact', '/review', 'anonymous'],
-    ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous']])
+    ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous'], ['exact', '/review/answer', 'anonymous']])
   const disposed: string[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => () => { disposed.push(route.path) } } }
   new ReviewRoute([project]).register(ctx as never)()
-  expect(disposed).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal'])
+  expect(disposed).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer'])
   expect(() => new ReviewRoute([project]).register({ webServer: { host: '0.0.0.0', port: 3083, register: () => () => {} } } as never)).toThrow('loopback')
   expect(() => new ReviewRoute(['relative/project'])).toThrow('absolute')
 })
@@ -757,6 +761,74 @@ it('is wired into the plugin without DSH\'s connection service: the page refuses
   expect(proposed.answer.status).toBe(409)
 })
 
+it('is wired into the plugin for Accept and the guideline: sessions read the remote\'s main after the start fetch, and Accept merges through the configured glab', async () => {
+  // A throwaway factory: a bare remote and a clone, the clone holding the records module so its guideline reader names the clone's folder.
+  const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
+  const bare = join(root, 'remote.git'), factory = join(root, 'factory'), other = join(root, 'other')
+  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', bare)
+  git(root, 'clone', '--quiet', bare, factory)
+  // The plugin's git reads the owner's global config: the clone's own settings decide identity and signing here.
+  for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', '/dev/null']]) git(factory, 'config', name!, value!)
+  mkdirSync(join(factory, 'guideline'))
+  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\n')
+  git(factory, 'add', '.'); git(factory, 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
+  // Another session merged v2 on the remote; the clone has not fetched it, and its checkout keeps v1.
+  git(root, 'clone', '--quiet', bare, other)
+  writeFileSync(join(other, 'guideline', 'v2.md'), '# Guideline\nKeep to the minimum feature.\n')
+  git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(other, 'push', '--quiet', 'origin', 'main')
+  const records = recordsModule(factory)
+  writeFileSync(join(factory, 'proposeServer.js'), '// stand-in for the built propose server\n')
+  put('actions.jsonl', [action()])
+  put('reviews.jsonl', [review()])
+  // Stand-ins for orca and glab, named by the settings: glab's merge moves the bare remote's main to the commit it is given, as GitLab would.
+  const orca = join(root, 'fake-orca')
+  writeFileSync(orca, `#!/bin/sh\n[ "$2" = list ] && printf '%s' '{"result":{"repos":[]}}'\nexit 0\n`)
+  const glab = join(root, 'fake-glab'), glabLog = join(root, 'fake-glab.log')
+  writeFileSync(glab, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${glabLog}'\nif [ "$2" = create ]; then echo 'https://gitlab.example/factory/-/merge_requests/9'; exit 0; fi\n`
+    + `while [ $# -gt 0 ]; do if [ "$1" = --sha ]; then git --git-dir='${bare}' update-ref refs/heads/main "$2"; exit $?; fi; shift; done\nexit 1\n`)
+  chmodSync(orca, 0o755); chmodSync(glab, 0o755)
+  const registered: Route[] = []
+  const { ctx } = pluginContext(registered, dsh)
+  const listeners: Record<string, (payload: { agent: unknown }) => Promise<unknown>> = {}
+  Object.assign(ctx, { on: (name: string, listener: (payload: { agent: unknown }) => Promise<unknown>) => { listeners[name] = listener; return () => {} } })
+  const root0 = TalkFolder.ROOT
+  Object.assign(TalkFolder, { ROOT: talkRoot() })
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  // The start fetch runs in the background: wait for the clone's copy of main to reach v2.
+  for (let tries = 0; git(factory, 'rev-parse', 'refs/remotes/origin/main') !== git(bare, 'rev-parse', 'main'); tries++) {
+    if (tries > 200) throw new Error('the start fetch never landed')
+    await new Promise(resolve => { setTimeout(resolve, 25) })
+  }
+  const sectionOf = async (id: string) => {
+    const session = new Context()
+    try {
+      await session.plugin(SystemPrompt)
+      await listeners['agent/created']!({ agent: { id, ctx: session } })
+      return (await session.systemPrompt.assemble()).sections.find(section => section.name === plugin.GuidelineSection.NAME)?.text ?? ''
+    } finally { await session.fiber.dispose() }
+  }
+  expect(await sectionOf('main-1')).toContain('version 2')
+  // A talk, a proposal, then the owner's Accept through the plugin's own routes.
+  const handler = (path: string) => registered.find(route => route.path === path)!.handler
+  const talk = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1' }))
+  await handler('/review/talk')(talk.req, talk.res)
+  expect(talk.answer.status).toBe(200)
+  const proposed = direct('127.0.0.1', 'POST', { [SharedTokenFile.HEADER]: TOKEN, 'content-type': 'application/json' }, JSON.stringify({ job_id: 'job-1', text: '# Guideline\nThree.\n' }))
+  await handler('/review/proposal')(proposed.req, proposed.res)
+  expect(proposed.answer.status).toBe(200)
+  const asked = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await handler('/review/proposal')(asked.req, asked.res)
+  const { ts } = (JSON.parse(asked.answer.text) as { waiting: { ts: string }[] }).waiting[0]!
+  const accepted = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1', ts, answer: 'accept', base: 2 }))
+  await handler('/review/answer')(accepted.req, accepted.res)
+  expect([accepted.answer.status, JSON.parse(accepted.answer.text)]).toMatchObject([200, { answered: 'accepted', version: 3, mr: 'https://gitlab.example/factory/-/merge_requests/9' }])
+  expect(git(bare, 'show', 'main:guideline/v3.md')).toContain('Three.')
+  expect(readFileSync(glabLog, 'utf8')).toContain('mr merge 9 --yes --auto-merge=false --sha')
+  expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
+  expect(await sectionOf('main-2')).toContain('version 3')
+})
+
 it('is wired into the plugin for the review talk: a start writes .mcp.json with the propose server beside the configured records module and the configured token file', async () => {
   put('actions.jsonl', [action()])
   put('reviews.jsonl', [review()])
@@ -1147,9 +1219,9 @@ describe('the Guideline tab', () => {
     expect([...page.querySelectorAll('main p')].map(line => line.textContent)).toEqual([ReviewPage.NO_GUIDELINE_FOLDER, 'No zees-software-factory folder entry.'])
   })
 
-  it('is reached from the Jobs tab, has no control, keeps the four routes, and needs DSH\'s sign-in', async () => {
+  it('is reached from the Jobs tab, has no control, keeps the five routes, and needs DSH\'s sign-in', async () => {
     const registered = await serve([project], new GuidelineRecords(twoVersions()))
-    expect(registered.map(route => route.path)).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal'])
+    expect(registered.map(route => route.path)).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer'])
     expect((await call('GET', ReviewRoute.guidelineAddress())).status).toBe(401)
     const cookie = await signIn()
     const jobs = dom((await call('GET', ReviewRoute.PATH, { cookie })).text)
@@ -1275,7 +1347,9 @@ describe('the review talk and its proposals', () => {
     expect([...left!.querySelectorAll('.line')].map(each => [each.tagName, each.textContent])).toEqual([['SPAN', '# Guideline'], ['DEL', 'Keep it small.'], ['SPAN', 'Ask first.']])
     expect([...right!.querySelectorAll('.line')].map(each => [each.tagName, each.textContent])).toEqual([['SPAN', '# Guideline'], ['INS', 'Keep to the minimum feature.'], ['SPAN', 'Ask first.']])
     expect(view.querySelector('main')!.textContent).toContain(ReviewPage.NOTHING_SAVED)
-    expect([...view.querySelectorAll('form, button, select, input, textarea')].length).toBe(0)
+    // Its only controls are the owner's two answers, for the proposal shown.
+    expect([...view.querySelectorAll('form, button, select, input, textarea')].map(control => [control.id, control.textContent])).toEqual([['accept-proposal', 'Accept as v2'], ['reject-proposal', 'Reject']])
+    expect((view.getElementById('accept-proposal') as HTMLElement).dataset).toMatchObject({ project, job: 'job-1', ts: NOW })
     // What waits, for the page's script: no text, only where to open it.
     const waiting = await call('GET', ReviewRoute.PROPOSAL_PATH, { cookie })
     expect(JSON.parse(waiting.text)).toEqual({ waiting: [{ project, job_id: 'job-1', number: 1, ts: NOW, href: ReviewRoute.proposalAddress(project, 'job-1') }] })
@@ -1555,6 +1629,156 @@ describe('the review talk and its proposals', () => {
       expect([page.sent.length, notice.hasAttribute('hidden')]).toEqual([2, true])
       page.window.close()
     }
+  })
+})
+
+describe('the owner\'s answer to a proposal', () => {
+  /** A stand-in for the guideline's save path: it writes down what it was asked to save and answers what the test says. */
+  class Saver implements GuidelineAnswerer {
+    busy = false
+    readonly asked: GuidelineProposal[] = []
+    answer: GuidelineSaved = { saved: true, version: 2, mr: 'https://gitlab.example/factory/-/merge_requests/7' }
+    async accept(proposal: GuidelineProposal, _base: number | null): Promise<GuidelineSaved> { this.asked.push(proposal); return this.answer }
+  }
+  const TEXT = '# Guideline\nKeep to the minimum feature.\nAsk first.\n'
+  /** A page with v1 and one proposal for job 1 waiting, as a talk's tool leaves it. */
+  async function waiting(saver?: Saver): Promise<string> {
+    put('actions.jsonl', [action()])
+    put('reviews.jsonl', [review()])
+    mkdirSync(join(root, 'guideline'), { recursive: true })
+    writeFileSync(join(root, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\nAsk first.\n')
+    await serve(undefined, undefined, undefined, saver)
+    reviewRoute!.proposals.put({ project, job_id: 'job-1', number: 1, text: TEXT, ts: NOW })
+    return signIn()
+  }
+  const answer = (cookie: string | undefined, body: unknown, headers: Record<string, string | undefined> = {}) =>
+    call('POST', ReviewRoute.ANSWER_PATH, { origin: origin(), cookie, 'content-type': 'application/json', ...headers }, typeof body === 'string' ? body : JSON.stringify(body))
+  const listed = async (cookie: string) => (JSON.parse((await call('GET', ReviewRoute.PROPOSAL_PATH, { cookie })).text) as { waiting: unknown[] }).waiting.length
+
+  it('Accept saves the proposal shown through the saver, drops it, and sends the page to the new version', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    const accepted = await answer(cookie, { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 })
+    expect([accepted.status, JSON.parse(accepted.text)]).toEqual([200, { answered: 'accepted', version: 2, href: ReviewRoute.guidelineAddress(2), mr: 'https://gitlab.example/factory/-/merge_requests/7' }])
+    expect(saver.asked).toEqual([{ project, job_id: 'job-1', number: 1, text: TEXT, ts: NOW }])
+    expect(await listed(cookie)).toBe(0)
+  })
+
+  it('Reject drops the proposal and saves nothing', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    const rejected = await answer(cookie, { project, job_id: 'job-1', ts: NOW, answer: 'reject' })
+    expect([rejected.status, JSON.parse(rejected.text)]).toEqual([200, { answered: 'rejected', href: ReviewRoute.guidelineAddress() }])
+    expect([saver.asked, await listed(cookie), readdirSync(join(root, 'guideline'))]).toEqual([[], 0, ['v1.md']])
+    // The Guideline tab shows the current version again, and the proposal view is gone.
+    expect((await call('GET', ReviewRoute.proposalAddress(project, 'job-1'), { cookie })).status).toBe(404)
+  })
+
+  it('a failed save keeps the proposal and answers 503 with the step and the merge request\'s address', async () => {
+    const saver = new Saver()
+    saver.answer = { saved: false, reason: 'Not saved: the merge step failed: merge conflict', mr: 'https://gitlab.example/factory/-/merge_requests/8' }
+    const cookie = await waiting(saver)
+    const failed = await answer(cookie, { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 })
+    expect([failed.status, JSON.parse(failed.text)]).toEqual([503, { error: 'Not saved: the merge step failed: merge conflict', mr: 'https://gitlab.example/factory/-/merge_requests/8' }])
+    expect(await listed(cookie)).toBe(1)
+  })
+
+  it('a newer proposal that comes while the save runs stays, and the saver is told the version the page showed', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    const bases: (number | null)[] = []
+    saver.accept = async (_shown: GuidelineProposal, base: number | null): Promise<GuidelineSaved> => {
+      bases.push(base)
+      reviewRoute!.proposals.put({ project, job_id: 'job-1', number: 1, text: `${TEXT}Newer.\n`, ts: '2026-11-26T12:05:00.000Z' })
+      return { saved: true, version: 2, mr: undefined }
+    }
+    expect((await answer(cookie, { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 })).status).toBe(200)
+    expect(bases).toEqual([1])
+    const left = JSON.parse((await call('GET', ReviewRoute.PROPOSAL_PATH, { cookie })).text) as { waiting: { ts: string }[] }
+    expect(left.waiting.map(each => each.ts)).toEqual(['2026-11-26T12:05:00.000Z'])
+    // An Accept that does not say which version it was shown against is refused.
+    for (const base of [undefined, 0, 1.5, '1']) expect((await answer(cookie, { project, job_id: 'job-1', ts: '2026-11-26T12:05:00.000Z', answer: 'accept', base })).status).toBe(400)
+  })
+
+  it('answers only the proposal shown: a newer one for the job is not answered, and stays', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    reviewRoute!.proposals.put({ project, job_id: 'job-1', number: 1, text: `${TEXT}Newer.\n`, ts: '2026-11-26T12:05:00.000Z' })
+    for (const choice of ['accept', 'reject']) {
+      const stale = await answer(cookie, { project, job_id: 'job-1', ts: NOW, answer: choice, base: 1 })
+      expect([stale.status, (JSON.parse(stale.text) as { error: string }).error]).toEqual([409, 'A newer proposal for this job replaced the one shown, so nothing was answered. Reload the page to see it.'])
+    }
+    expect([saver.asked, await listed(cookie)]).toEqual([[], 1])
+  })
+
+  it('refuses a bad answer, a proposal not waiting, a save already running, and Accept without a saver; and needs DSH\'s sign-in and an Origin', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    const status = async (body: unknown, headers: Record<string, string | undefined> = {}, signedIn: string | null = cookie) => (await answer(signedIn ?? undefined, body, headers)).status
+    expect(await status({ project, job_id: 'job-1', ts: NOW, answer: 'maybe' })).toBe(400)
+    expect(await status({ project, job_id: 'job-1', answer: 'accept' })).toBe(400)
+    expect(await status('not json')).toBe(400)
+    expect(await status({ project, job_id: 'job-2', ts: NOW, answer: 'accept', base: 1 })).toBe(404)
+    expect(await status({ project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 }, {}, null)).toBe(401)
+    expect(await status({ project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 }, { origin: 'https://elsewhere.example' })).toBe(403)
+    expect((await call('GET', ReviewRoute.ANSWER_PATH, { cookie })).status).toBe(405)
+    saver.busy = true
+    expect(await status({ project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 })).toBe(409)
+    expect([saver.asked, await listed(cookie)]).toEqual([[], 1])
+    // The page with no saver given saves nothing, so no default ever runs git; Reject still works there.
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+    const plain = await waiting()
+    const refused = await answer(plain, { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 })
+    expect([refused.status, (JSON.parse(refused.text) as { error: string }).error]).toEqual([503, 'Not saved: saving a guideline version is not set up here'])
+    expect((await answer(plain, { project, job_id: 'job-1', ts: NOW, answer: 'reject' })).status).toBe(200)
+  })
+
+  it('the buttons post the answer for the proposal shown, go to the address the answer names, and show a refusal with the merge request\'s link', async () => {
+    const read: GuidelineRead = { folder: '/factory/guideline', versions: [{ version: 1, date: null, from_job: null, from_version: null, text: '# Guideline\n' }], current: null, reason: null }
+    read.current = read.versions[0]!
+    const open: GuidelineProposal = { project, job_id: 'job-1', number: 1, text: TEXT, ts: NOW }
+    const html = new ReviewPage('nonce').guideline(read, undefined, [open], open)
+    let reply: { ok: boolean; status: number; body: unknown } = { ok: true, status: 200, body: { answered: 'accepted', version: 2, href: ReviewRoute.guidelineAddress(2) } }
+    const sent: unknown[] = []
+    // jsdom cannot navigate: it reports each navigation the page asks for, and the test counts them.
+    const went: string[] = []
+    const browse = () => {
+      const virtualConsole = new VirtualConsole()
+      virtualConsole.on('jsdomError', error => { if (error.message.includes('navigation')) went.push(error.message) })
+      const window = new JSDOM(html, { runScripts: 'dangerously', virtualConsole, url: 'http://127.0.0.1:3083/review?tab=guideline', beforeParse: view => {
+        (view as unknown as { setInterval: unknown }).setInterval = () => 0
+        ;(view as unknown as { fetch: unknown }).fetch = (url: string, init: { method?: string; body?: string } = {}) => {
+          if (url === ReviewRoute.PROPOSAL_PATH) return Promise.resolve({ ok: true, json: () => Promise.resolve({ waiting: [] }) })
+          sent.push({ url, method: init.method, body: init.body === undefined ? undefined : JSON.parse(init.body) })
+          return Promise.resolve({ ok: reply.ok, status: reply.status, json: () => Promise.resolve(reply.body) })
+        }
+      } }).window
+      const document = window.document
+      return { window, accept: document.getElementById('accept-proposal') as HTMLButtonElement, reject: document.getElementById('reject-proposal') as HTMLButtonElement,
+        notice: document.getElementById('answer-notice')! }
+    }
+    const ok = browse()
+    expect(ok.notice.hasAttribute('hidden')).toBe(true)
+    ok.accept.click()
+    expect([ok.accept.disabled, ok.reject.disabled, ok.notice.textContent]).toEqual([true, true, ReviewPage.SAVING_VERSION])
+    await settle(); await settle(); await settle()
+    expect(sent).toEqual([{ url: ReviewRoute.ANSWER_PATH, method: 'POST', body: { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 } }])
+    expect(went.length).toBe(1)
+    ok.window.close()
+    // A failed save: the reason and the link to the merge request, as text; the buttons work again.
+    reply = { ok: false, status: 503, body: { error: 'Not saved: the merge step failed: <b>conflict</b>', mr: 'https://gitlab.example/factory/-/merge_requests/8' } }
+    const page = browse()
+    page.accept.click()
+    await settle(); await settle(); await settle()
+    expect([page.notice.querySelector('span')!.textContent, page.notice.querySelector('b'), page.notice.querySelector('a')!.getAttribute('href'), page.notice.classList.contains('refused')])
+      .toEqual(['Not saved: the merge step failed: <b>conflict</b>', null, 'https://gitlab.example/factory/-/merge_requests/8', true])
+    expect([page.accept.disabled, page.reject.disabled, went.length]).toEqual([false, false, 1])
+    // A refused Reject shows its reason; a link that is not https is never shown.
+    reply = { ok: false, status: 409, body: { error: 'A newer proposal for this job replaced the one shown', mr: 'javascript:alert(1)' } }
+    page.reject.click()
+    await settle(); await settle(); await settle()
+    expect([(sent.at(-1) as { body: { answer: string } }).body.answer, page.notice.querySelector('a')]).toEqual(['reject', null])
+    page.window.close()
   })
 })
 

@@ -5,7 +5,8 @@
  * it in Orca (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back. The page has no sign-in of its own: DSH's connection
  * service lets the owner's browser in with DSH's own sign-in, and while DSH has no connection service the page refuses every browser request.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
- * `job_start` names the version (`guideline.ts`).
+ * `job_start` names the version (`guideline.ts`). The guideline is read from the factory repository's remote `main`, never from a checkout, and the
+ * page's Accept saves a new version there through a merge request the fork merges at once (`save.ts`).
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -23,9 +24,10 @@ import { GuidelineSection } from './guideline.ts'
 import { FactoryJob } from './job.ts'
 import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
-import { FactoryRecordsModule, JobRecorder } from './records.ts'
+import { JobRecorder } from './records.ts'
 import { ReviewPage, ReviewRoute } from './review.ts'
-import { OrcaLauncher, ReviewTalks } from './talk.ts'
+import { FactoryRepoSave, GlabProgram, GuidelineSaver, RemoteGuidelineRecords } from './save.ts'
+import { ExecFileRunner, OrcaLauncher, ReviewTalks } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 import { ModelJudge } from './verdict.ts'
 
@@ -46,7 +48,9 @@ export const Config = s.object({
   review: s.object({
     orca: s.string().pattern(/^\//)
       .description('The orca program that opens a review talk in Orca. Absolute path, optional; when set, only this file is used. Without it DSH looks for orca on PATH, then at /opt/homebrew/bin/orca, once when it starts. With none found, "Start review talk" is refused.'),
-  }).default({}).description('The review page\'s review talk.'),
+    glab: s.string().pattern(/^\//)
+      .description('The glab program that opens and merges the merge request of an accepted guideline version. Absolute path, optional; when set, only this file is used. Without it DSH looks for glab on PATH, then at /opt/homebrew/bin/glab, once when it starts. With none found, Accept is refused and nothing is saved.'),
+  }).default({}).description('The review page\'s review talk and its Accept.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -56,7 +60,15 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   // Asking for the start folder throws when that folder was deleted since.
   try { folder = process.cwd() } catch { /* told below */ }
   if (folder === undefined) warn('No job_start line was written: the folder DSH was started in is gone')
-  const records = new FactoryRecordsModule(config.recordsModule)
+  // The guideline comes from the factory repository's remote main, so a version merged there reaches the next session (AD-18).
+  const runner = new ExecFileRunner()
+  const records = new RemoteGuidelineRecords(config.recordsModule, { runner })
+  // Once, in the background: the first sessions read the last fetched main until it lands. A failure only means an older copy is read.
+  void records.factoryRemote().then(async remote => {
+    if (!await remote.isRepository()) return
+    const fetched = await remote.fetch()
+    if (!fetched.ok) warn('The factory repository\'s main could not be fetched; the guideline is read from the last fetched copy')
+  }, () => { /* no factory repository: the guideline section says so */ })
   // Before any session exists, so every agent DSH creates gets the guideline, judges included.
   const guideline = new GuidelineSection(records, warn)
   guideline.install(ctx)
@@ -71,7 +83,8 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
   // A review talk's folder is outside every repository; its propose server is the factory's `lib/dist/proposeServer.js`, next to the job log file.
   const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage, orca: new OrcaLauncher({ program: OrcaLauncher.find(config.review?.orca) }) })
-  const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks)
+  const saver = new GuidelineSaver({ records, repo: new FactoryRepoSave({ glab: GlabProgram.find(config.review?.glab) }) })
+  const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks, saver)
   ctx.effect(() => review.register(ctx), 'factory: review page')
   // Optional, so `/assess` and the job log work without it: the review page asks DSH's connection service while DSH has it.
   // `connection.authentication` too: cordis refuses `admit`'s read of it from a context that did not inject it (seen on DSH 0.2.3).
@@ -89,9 +102,12 @@ export {
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
 export { TextDiff, type DiffLine, type DiffMark, type DiffSides } from './diff.ts'
-export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, ReviewSignIn, type ReviewConnection, type ReviewTokenSource, type ReviewView } from './review.ts'
+export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, ReviewSignIn, type GuidelineAnswerer, type ReviewConnection, type ReviewTokenSource, type ReviewView } from './review.ts'
 export {
-  ExecFileRunner, GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type OrcaRun, type OrcaRunner,
+  FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, type GuidelineSaved, type RepoChange, type SaveFile, type SaveOutcome, type SaveStep,
+} from './save.ts'
+export {
+  ExecFileRunner, GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type OrcaRun, type OrcaRunner, type RunOptions,
   type ReviewTalksOptions, type StepWords,
   type TalkServer, type TalkStart, type TalkState,
 } from './talk.ts'

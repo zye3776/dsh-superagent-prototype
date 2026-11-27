@@ -9,7 +9,8 @@
  * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
  * A job's header has "Start review talk": it prepares the job's review talk folder outside every repository and opens it as a Claude Code session in
  * Orca (`talk.ts`). The talk's one tool posts a proposed guideline text back to `POST /review/proposal`, with the shared token; the page
- * shows the newest proposal per job as before → after on the Guideline tab (`diff.ts`) and saves nothing.
+ * shows the newest proposal per job as before → after on the Guideline tab (`diff.ts`), with "Accept as v<N>" and "Reject". Accept saves the next
+ * version in the factory repository through a merge request the fork merges at once (`save.ts`); Reject, or no answer, saves nothing.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
  * DSH's own connection service must let it in: the page has no sign-in of its own and uses the one DSH's chat window uses (`ReviewSignIn`), so an
  * owner who opened DSH goes straight in from the "Review" link in DSH's sidebar. The one address a program posts to, the talk's proposal address,
@@ -27,6 +28,7 @@ import {
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
 import { TextDiff, type DiffLine } from './diff.ts'
+import type { GuidelineSaved } from './save.ts'
 import { GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 
@@ -187,6 +189,10 @@ export class ReviewPage {
   static readonly COMMENT_SAVED = 'review-comment-saved'
   static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
   static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
+  static readonly REJECT = 'Reject'
+  static readonly SAVING_VERSION = 'Saving: a merge request into the factory\'s main branch is opened and merged…'
+  static readonly NOT_ANSWERED = 'Not answered: the review page did not answer'
+  static readonly OPEN_MR = 'Open the merge request'
   /** How often the page asks whether a proposal is waiting, in milliseconds; it also asks when its window gets focus. */
   static readonly POLL_MS = 5000
   /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */
@@ -246,6 +252,9 @@ export class ReviewPage {
     '.head .crumb { border-bottom: 0; }',
     'button.primary { padding: 4px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); cursor: pointer; }',
     'button.primary:disabled { opacity: 0.45; cursor: not-allowed; }',
+    'button.plain { padding: 4px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font: inherit; font-size: 12px; color: inherit; background: transparent; cursor: pointer; }',
+    'button.plain:disabled { opacity: 0.45; cursor: not-allowed; }',
+    '.answer { display: flex; gap: 8px; align-items: center; }',
     '.head .talk { display: flex; gap: 8px; align-items: center; }',
     '.head .hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }',
     '.notice { margin: 8px 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font-size: 12px; }',
@@ -263,7 +272,7 @@ export class ReviewPage {
    * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
    * on a page without its element. The parts are joined with a semicolon, or each would be read as a call of the one before it.
    */
-  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript()].join(';\n') }
+  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript(), ReviewPage.answerScript()].join(';\n') }
 
   /**
    * The comment field's part of the script. It talks only to this page's own comment address.
@@ -390,6 +399,44 @@ export class ReviewPage {
 })()`
   }
 
+  /**
+   * The proposal view's part of the script: "Accept as v<N>" and "Reject" post the owner's answer, for the proposal the page shows (its time), to the
+   * page's answer address. An answer taken goes to the address the answer names: the new version, or the current one after a reject. A refusal shows
+   * its reason above the proposal, and the merge request's link when one was opened; the proposal stays. Both buttons are disabled while an answer runs.
+   */
+  private static answerScript(): string {
+    return `(() => {
+  const accept = document.getElementById('accept-proposal'), reject = document.getElementById('reject-proposal'), notice = document.getElementById('answer-notice')
+  if (!accept || !reject || !notice) return
+  let busy = false
+  const show = (text, mr, refused) => {
+    notice.replaceChildren()
+    notice.classList.toggle('refused', refused === true)
+    const words = document.createElement('span'); words.textContent = text; notice.append(words)
+    if (typeof mr === 'string' && mr.startsWith('https://')) {
+      const link = document.createElement('a'); link.href = mr; link.rel = 'noreferrer'; link.target = '_blank'; link.textContent = ${JSON.stringify(ReviewPage.OPEN_MR)}
+      notice.append(' ', link)
+    }
+    notice.hidden = false
+  }
+  const send = async answer => {
+    if (busy) return
+    busy = true; accept.disabled = true; reject.disabled = true
+    if (answer === 'accept') show(${JSON.stringify(ReviewPage.SAVING_VERSION)})
+    try {
+      const reply = await fetch(${JSON.stringify(ReviewRoute.ANSWER_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ project: accept.dataset.project, job_id: accept.dataset.job, ts: accept.dataset.ts, answer, base: accept.dataset.base ? Number(accept.dataset.base) : null }) })
+      const body = await reply.json().catch(() => ({}))
+      if (reply.ok && typeof body.href === 'string') { window.location.assign(body.href); return }
+      show(typeof body.error === 'string' && body.error !== '' ? body.error : 'Not answered: the review page answered HTTP ' + reply.status, body.mr, true)
+    } catch { show(${JSON.stringify(ReviewPage.NOT_ANSWERED)}, undefined, true) }
+    busy = false; accept.disabled = false; reject.disabled = false
+  }
+  accept.addEventListener('click', () => { void send('accept') })
+  reject.addEventListener('click', () => { void send('reject') })
+})()`
+  }
+
   /** `nonce` is the one-time word the answer's content security policy allows a style and a script to carry. */
   constructor(private readonly nonce: string) {}
 
@@ -477,8 +524,8 @@ ${panel}
    * job whose review led to it; in the middle, the picked version's text, shown as written. With no version it says there is no guideline yet, and when
    * the factory repository was not found it says so with the reader's reason.
    * With a proposal `open`, the middle shows it before → after instead: the current version on the left, the proposal on the right, both whole, removed
-   * lines marked as deletions and added lines as insertions (`TextDiff`), under the line "Nothing is saved until you accept."
-   * It only reads: there is no control on it.
+   * lines marked as deletions and added lines as insertions (`TextDiff`), under "Accept as v<N>", "Reject" and the line "Nothing is saved until you accept."
+   * Without a proposal open it only reads: there is no control on it.
    */
   guideline(read: GuidelineRead, picked: GuidelineVersion | undefined, waiting: readonly GuidelineProposal[] = [], open?: GuidelineProposal): string {
     let crumb = ReviewPage.TAB_GUIDELINE
@@ -534,14 +581,20 @@ ${middle}
       return `<${tag} class="line">${ReviewPage.escape(line.text)}</${tag}>`
     }).join('')
     const next = (current?.version ?? 0) + 1
+    const data = `data-project="${ReviewPage.escape(open.project)}" data-job="${ReviewPage.escape(open.job_id)}" data-ts="${ReviewPage.escape(open.ts)}" data-base="${current?.version ?? ''}"`
     return `<h2>Proposed change · from the review talk on ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}</h2>
 <p class="meta">Proposed ${ReviewPage.escape(ReviewPage.when(open.ts))}</p>
-<p>${ReviewPage.NOTHING_SAVED}</p>
+<div id="answer-notice" class="notice" role="status" hidden></div>
+<p class="answer"><button type="button" id="accept-proposal" class="primary" ${data}>${ReviewPage.accept(next)}</button> \
+<button type="button" id="reject-proposal" class="plain">${ReviewPage.REJECT}</button> <span>${ReviewPage.NOTHING_SAVED}</span></p>
 <div class="halves">
 <section aria-label="Current version"><h3>${current === null ? ReviewPage.escape(ReviewPage.NO_GUIDELINE) : `Guideline v${current.version} · current`}</h3><pre class="diff">${lines(before)}</pre></section>
 <section aria-label="Proposed version"><h3>Proposed v${next}</h3><pre class="diff">${lines(after)}</pre></section>
 </div>`
   }
+
+  /** The Accept button's label. The number is the one the page reads now; the save numbers the version from the remote's main at the time. */
+  static accept(version: number): string { return `Accept as v${version}` }
 
   /** The day and time of a moment, on this machine's clock. */
   private static when(ts: string): string {
@@ -765,8 +818,11 @@ interface AnonymousRoute {
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   auth: 'anonymous'
 }
-/** Which of the page's four addresses a request is for. */
-type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal'
+/** Which of the page's five addresses a request is for. */
+type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal' | 'answer'
+
+/** What the page's Accept runs: saves a proposal as the next guideline version (`GuidelineSaver`), one save at a time. */
+export interface GuidelineAnswerer { readonly busy: boolean; accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> }
 
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
@@ -785,6 +841,10 @@ type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal'
  * `x-factory-token`, and its 200 answer sends the token back. The text is kept in memory as the newest proposal of that job, which must be a listed job
  * whose talk was started: 400 for a bad body or a text equal to the current version, 404 for an unknown job, 409 for a job with no talk, 413 over 64 KiB.
  * `GET /review/proposal` tells the page, signed in to DSH, what waits, newest first, so its notice appears without a reload.
+ * `POST /review/answer` takes the owner's answer to a waiting proposal, `{ project, job_id, ts, answer: 'accept' | 'reject', base }`, where `ts` is the time
+ * of the proposal the page showed and `base` the version it was shown against (`null`: none), which Accept refuses to save over a newer one. Reject drops it and saves nothing. Accept saves it as the next guideline version through `saver` and then drops it;
+ * when the save fails the proposal stays and the answer is 503 with `{ error, mr? }`, the error naming the step that failed. 400 for a bad body, 404 for
+ * a proposal not waiting, 409 when a newer proposal replaced the one shown or a save is running, 503 without a saver: nothing is saved by default.
  * `ReviewAccess.admit` runs first on every request (403), then DSH's sign-in (`ReviewSignIn`: 401, 403, or 503 without DSH's connection service),
  * then the method is checked (405); a body is read only after all three. The one exception is `POST /review/proposal`, where `ReviewAccess.admitTool`
  * takes the place of all three.
@@ -795,6 +855,7 @@ export class ReviewRoute {
   static readonly COMMENT_PATH = '/review/comment'
   static readonly TALK_PATH = '/review/talk'
   static readonly PROPOSAL_PATH = '/review/proposal'
+  static readonly ANSWER_PATH = '/review/answer'
   static readonly MAX_BODY_BYTES = 64 * 1024
   private readonly projects: readonly string[]
   private readonly access: ReviewAccess
@@ -807,9 +868,10 @@ export class ReviewRoute {
   /**
    * `talks` prepares the review talks; by default under `TalkFolder.ROOT`, with the token file of `tokens` (when it is a `SharedTokenFile`) and the
    * propose server next to the records module's built file, and with no `orca` program, so the default refuses every start; the plugin passes its own.
+   * `saver` saves an accepted proposal; without one, Accept is refused and nothing is saved, so no default ever runs git.
    */
   constructor(projects: readonly string[], tokens: ReviewTokenSource = new SharedTokenFile(), private readonly records: RecordsSource = new FactoryRecordsModule(),
-    private readonly now: () => Date = () => new Date(), talks?: ReviewTalks) {
+    private readonly now: () => Date = () => new Date(), talks?: ReviewTalks, private readonly saver?: GuidelineAnswerer) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     this.projects = [...new Set(projects.map(project => resolve(project)))]
@@ -819,11 +881,11 @@ export class ReviewRoute {
       orca: new OrcaLauncher({ program: undefined }) })
   }
 
-  /** Adds the page's four addresses to the web server and returns the function that removes them. */
+  /** Adds the page's five addresses to the web server and returns the function that removes them. */
   register(ctx: Context): () => void {
     if (ctx.webServer.host !== '127.0.0.1') throw new Error('The factory /review page requires a loopback Web server')
     const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.COMMENT_PATH, 'comment'],
-      [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal']]
+      [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal'], [ReviewRoute.ANSWER_PATH, 'answer']]
     // Anonymous to DSH's web server, so the page answers a browser that is not signed in with its own line; DSH's sign-in is asked in `handle`.
     const disposers = targets.map(([path, target]) => {
       const route: AnonymousRoute = { kind: 'exact', path, auth: 'anonymous', handler: (req, res) => this.handle(req, res, ctx.webServer.port, target) }
@@ -849,6 +911,7 @@ export class ReviewRoute {
       if (req.method !== method) throw Object.assign(new ReviewRefusal(405, `Only ${allow} is allowed`), { allow })
       if (target === 'comment') await this.comment(req, res, state)
       else if (target === 'talk') await this.talk(req, res, port, state)
+      else if (target === 'answer') await this.answer(req, res, state)
       else if (target === 'proposal') ReviewRoute.sendJson(res, 200, { waiting: this.waiting() })
       else await this.show(req, res, page)
     } catch (error) {
@@ -860,7 +923,7 @@ export class ReviewRoute {
       // Any other error's own text is left out: it could quote a record or a path.
       const status = refusal?.status ?? 500, message = refusal?.message ?? 'The review page failed'
       const headers: Record<string, string> = status === 405 ? { allow: (error as { allow?: string }).allow ?? 'GET' } : {}
-      if (target === 'comment' || target === 'talk' || target === 'proposal') ReviewRoute.sendJson(res, status, { error: message }, headers)
+      if (target === 'comment' || target === 'talk' || target === 'proposal' || target === 'answer') ReviewRoute.sendJson(res, status, { error: message }, headers)
       // Not signed in to DSH, the page is the one line `ReviewSignIn.SIGNED_OUT`, and nothing else: no record content, no token form.
       else if (status === 401) ReviewRoute.sendPage(res, status, page.signedOut(), page, headers)
       else ReviewRoute.sendPage(res, status, page.notice(message), page, headers)
@@ -971,6 +1034,31 @@ export class ReviewRoute {
     this.proposals.put({ project: job.project, job_id, number: job.number, text, ts: this.now().toISOString() })
     ReviewRoute.sendJson(res, 200, { kept: true, message: `The proposal for ${TalkTexts.nameOf(job.project)} job ${job.number} is on the review page. Nothing is saved until the owner accepts it.` },
       { [SharedTokenFile.HEADER]: token })
+  }
+
+  /** `POST /review/answer` for a signed-in owner: Accept or Reject of the proposal the page showed. */
+  private async answer(req: IncomingMessage, res: ServerResponse, state: { bodyRead: boolean }): Promise<void> {
+    state.bodyRead = true
+    const { project, job_id, ts, answer, base } = await ReviewRoute.objectOf(req) as { project?: unknown; job_id?: unknown; ts?: unknown; answer?: unknown; base?: unknown }
+    if (typeof project !== 'string' || project === '') throw new ReviewRefusal(400, 'project must be non-empty text')
+    if (typeof job_id !== 'string' || job_id === '') throw new ReviewRefusal(400, 'job_id must be non-empty text')
+    if (typeof ts !== 'string' || ts === '') throw new ReviewRefusal(400, 'ts must be the time of the proposal shown')
+    if (answer !== 'accept' && answer !== 'reject') throw new ReviewRefusal(400, 'answer must be accept or reject')
+    if (answer === 'accept' && base !== null && !(typeof base === 'number' && Number.isInteger(base) && base > 0)) throw new ReviewRefusal(400, 'base must be the version the proposal was shown against, or null')
+    const open = this.proposals.of(project, job_id)
+    if (open === undefined) throw new ReviewRefusal(404, 'That proposal is not waiting')
+    if (open.ts !== ts) throw new ReviewRefusal(409, 'A newer proposal for this job replaced the one shown, so nothing was answered. Reload the page to see it.')
+    if (answer === 'reject') {
+      this.proposals.remove(project, job_id, ts)
+      ReviewRoute.sendJson(res, 200, { answered: 'rejected', href: ReviewRoute.guidelineAddress() })
+      return
+    }
+    if (this.saver === undefined) throw new ReviewRefusal(503, 'Not saved: saving a guideline version is not set up here')
+    if (this.saver.busy) throw new ReviewRefusal(409, 'Not saved: a guideline version is being saved; try again when it is done')
+    const saved = await this.saver.accept(open, base as number | null)
+    if (!saved.saved) { ReviewRoute.sendJson(res, 503, { error: saved.reason, ...(saved.mr === undefined ? {} : { mr: saved.mr }) }); return }
+    this.proposals.remove(project, job_id, ts)
+    ReviewRoute.sendJson(res, 200, { answered: 'accepted', version: saved.version, href: ReviewRoute.guidelineAddress(saved.version), ...(saved.mr === undefined ? {} : { mr: saved.mr }) })
   }
 
   /** The request body as a JSON object: 400 when it is not JSON or not an object, 413 over the limit. */

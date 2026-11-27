@@ -1,8 +1,8 @@
 /**
  * Factory plugin entry: mounts the `/assess` route the factory's hooks ask for a decision, and keeps the read-only judge Sessions that `ModelJudge` asks for each one.
  * Each run of the plugin is one job in the job log: its start, each permission answer, each message into or out of the main session, and its stop
- * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`, whose "Start review talk" prepares a job's review talk in Claude
- * Desktop (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back. The page has no sign-in of its own: DSH's connection
+ * (`job.ts`, `mainsession.ts`). It also mounts the owner's review page at `/review`, whose "Start review talk" prepares a job's review talk and opens
+ * it in Orca (`talk.ts`) and whose `/review/proposal` takes the talk's proposed guideline text back. The page has no sign-in of its own: DSH's connection
  * service lets the owner's browser in with DSH's own sign-in, and while DSH has no connection service the page refuses every browser request.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`).
@@ -25,7 +25,7 @@ import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
 import { FactoryRecordsModule, JobRecorder } from './records.ts'
 import { ReviewPage, ReviewRoute } from './review.ts'
-import { ReviewTalks } from './talk.ts'
+import { OrcaLauncher, ReviewTalks } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 import { ModelJudge } from './verdict.ts'
 
@@ -43,6 +43,10 @@ export const Config = s.object({
     .description('The factory\'s built judge guard file, lib/dist/judgeGuard.js in the factory\'s folder. Absolute path, no default; every tool call of a judge Session is checked with it, and without it no judge Session is opened and the route answers 503.'),
   recordsModule: s.string().pattern(/^\//)
     .description('The factory\'s built job log file, lib/dist/jobLog.js in the factory\'s folder. Absolute path, no default; every job log line and every comment of the review page is masked with it before it is written, and the review page reads the records and the decision guideline\'s versions with it. A review talk\'s files are masked with it too, and its tool server is lib/dist/proposeServer.js next to it. Without it no job log line or comment is written and the review page answers 503.'),
+  review: s.object({
+    orca: s.string().pattern(/^\//)
+      .description('The orca program that opens a review talk in Orca. Absolute path, optional; when set, only this file is used. Without it DSH looks for orca on PATH, then at /opt/homebrew/bin/orca, once when it starts. With none found, "Start review talk" is refused.'),
+  }).default({}).description('The review page\'s review talk.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -66,7 +70,7 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   ctx.effect(() => route.register(ctx), 'factory: assess route')
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
   // A review talk's folder is outside every repository; its propose server is the factory's `lib/dist/proposeServer.js`, next to the job log file.
-  const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage })
+  const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage, orca: new OrcaLauncher({ program: OrcaLauncher.find(config.review?.orca) }) })
   const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks)
   ctx.effect(() => review.register(ctx), 'factory: review page')
   // Optional, so `/assess` and the job log work without it: the review page asks DSH's connection service while DSH has it.
@@ -87,7 +91,8 @@ export {
 export { TextDiff, type DiffLine, type DiffMark, type DiffSides } from './diff.ts'
 export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, ReviewSignIn, type ReviewConnection, type ReviewTokenSource, type ReviewView } from './review.ts'
 export {
-  GuidelineProposals, ReviewTalks, TalkComments, TalkFolder, TalkLink, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type ReviewTalksOptions, type StepWords,
+  ExecFileRunner, GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type OrcaRun, type OrcaRunner,
+  type ReviewTalksOptions, type StepWords,
   type TalkServer, type TalkStart, type TalkState,
 } from './talk.ts'
 export { SharedTokenFile } from './token.ts'

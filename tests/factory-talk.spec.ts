@@ -1,12 +1,12 @@
-/** The review talk: its folder and pinned files, its opening message and link, starting it once per job, and the proposals it sends back. */
+/** The review talk: its folder and pinned files, its opening message, opening it in Orca once per job, and the proposals it sends back. */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { FactoryRecordsModule, type GuidelineRead, type JobLogLine, type RecordedJob, type RecordsMasker, type RecordsSource, type ReviewLine, type StepDetail, type TimelineStep } from '../src/factory/records.ts'
 import { ReviewPage } from '../src/factory/review.ts'
-import { GuidelineProposals, ReviewTalks, TalkFolder, TalkLink, TalkOpening, TalkRefusal, TalkTexts } from '../src/factory/talk.ts'
+import { ExecFileRunner, GuidelineProposals, OrcaLauncher, ReviewTalks, TalkFolder, TalkOpening, TalkRefusal, TalkTexts, type OrcaRun, type OrcaRunner } from '../src/factory/talk.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
 const NOW = '2026-11-26T12:00:00.000Z'
@@ -47,7 +47,7 @@ const guideline = (text: string | null): GuidelineRead => text === null
 
 /**
  * A stand-in records module: its mask replaces the planted value and writes down every text it was given and gave back, so a test can show that every
- * file and the link's message went through it.
+ * file went through it.
  */
 class StandInRecords implements RecordsSource {
   readonly masked: string[] = []
@@ -61,8 +61,30 @@ class StandInRecords implements RecordsSource {
   async stepReader() { return { read: (_project: string, picked: TimelineStep) => picked.automatic === false && picked.line.step_id === 'step-2' ? DETAIL : NONE } }
   async guidelineReader() { return { read: () => this.read } }
 }
+const ORCA = '/opt/homebrew/bin/orca'
+/**
+ * A stand-in for running Orca: it runs nothing, writes down every program and argument list it was given, and answers `repo list` with `listed` and
+ * any other command by `answers`, keyed by the command's first two words (a step not named succeeds).
+ */
+class FakeRunner implements OrcaRunner {
+  readonly calls: { program: string; args: string[]; timeoutMs: number }[] = []
+  constructor(private readonly listed: string[] = [], private readonly answers: Record<string, OrcaRun> = {}) {}
+  async run(program: string, args: readonly string[], timeoutMs: number): Promise<OrcaRun> {
+    this.calls.push({ program, args: [...args], timeoutMs })
+    const step = args.slice(0, 2).join(' ')
+    if (this.answers[step] !== undefined) return this.answers[step]
+    if (step === 'repo list') return { ok: true, stdout: JSON.stringify({ id: 'x', ok: true, result: { repos: this.listed.map(path => ({ id: path, path, kind: 'git' })) } }) }
+    return { ok: true, stdout: '' }
+  }
+  /** The argument lists of the commands that change Orca's state, `repo list` left out. */
+  changes(): string[][] { return this.calls.filter(call => call.args.slice(0, 2).join(' ') !== 'repo list').map(call => call.args) }
+}
+let runner = new FakeRunner()
+beforeEach(() => { runner = new FakeRunner() })
+const orcaOf = (fake: FakeRunner = runner) => new OrcaLauncher({ program: ORCA, root: talks, runner: fake })
 const talksOf = (records: RecordsSource, fields: Partial<ConstructorParameters<typeof ReviewTalks>[0]> = {}) =>
-  new ReviewTalks({ records, tokenFile: join(root, 'superagent-token'), words: ReviewPage, root: talks, serverFile: server, node: '/usr/local/bin/node', home: '/Users/jex', now: () => new Date(NOW), ...fields })
+  new ReviewTalks({ records, tokenFile: join(root, 'superagent-token'), words: ReviewPage, root: talks, serverFile: server, node: '/usr/local/bin/node', home: '/Users/jex',
+    now: () => new Date(NOW), orca: orcaOf(), ...fields })
 const ADDRESS = 'http://127.0.0.1:3083/review/proposal'
 /** Every file under a folder, as paths below it, sorted. */
 function filesOf(folder: string): string[] {
@@ -70,8 +92,6 @@ function filesOf(folder: string): string[] {
   return readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => relative(folder, join(entry.parentPath, entry.name)))
     .filter(name => !name.startsWith('.git/')).sort()
 }
-const messageOf = (link: string) => decodeURIComponent(/[?&]q=([^&]*)/.exec(link)![1]!)
-const folderOf = (link: string) => decodeURIComponent(/[?&]folder=([^&]*)/.exec(link)![1]!)
 
 describe('TalkFolder', () => {
   it('pins the settings to four deny rules and nothing else, byte for byte', () => {
@@ -120,22 +140,24 @@ describe('TalkOpening', () => {
     const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('Good pace.'), guideline('Keep it small.\n'))
     expect(message.split('\n')[0]).toBe('Review talk · shop job 3')
     for (const part of [TalkOpening.LOOKUP_RULE, 'propose_guideline_change with job_id "job-1"', 'Good pace.', 'The job.', 'Keep it small.', 'version 2']) expect(message).toContain(part)
-    // The folder check comes right after the title line, before anything about the job, and names this talk's own folder.
+    // The folder guard comes right after the title line, before anything about the job, names this talk's own folder and accepts only that folder.
     expect(message.split('\n').slice(0, 3)).toEqual(['Review talk · shop job 3', '', 'Before anything else, check your working folder, as your environment states it. '
-      + 'It must be the talk folder shop-job-3-0123abcd, under ~/.config/zees-factory/review-talks/, or a git worktree of it inside that folder\'s own '
-      + '.claude/worktrees/. If it is any other folder, reply only: "This review talk opened in the wrong folder, so it is stopping here. Close this session, '
-      + 'choose no project in Claude Desktop\'s Code tab, then start the talk again from the review page.", then add your working folder\'s path, and do '
-      + 'nothing else: read no file, call no tool and do not '
-      + 'discuss the job.'])
+      + 'It must be the talk folder shop-job-3-0123abcd, under ~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "This review '
+      + 'talk opened in the wrong folder, so it is stopping here. Close this session and start the talk again from the review page." and do nothing else: '
+      + 'read no file, call no tool and do not discuss the job.'])
+    expect(message).not.toContain('worktree')
+    // In the order of AD-18: what the talk is for, the lookup rule, the job, the comments, the guideline.
+    const at = ['This review talk is about', TalkOpening.LOOKUP_RULE, '## The job', '## The owner\'s comments', '## The current guideline'].map(part => message.indexOf(part))
+    expect(at.every((place, index) => place > 0 && (index === 0 || place > at[index - 1]!))).toBe(true)
   })
 
-  it('past 14,000 characters keeps the title line, the comments and the lookup rule, and names the files that hold the rest', () => {
-    const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('Good pace.', 'x'.repeat(20_000)), guideline('Keep it small.\n'))
-    expect(message.length).toBeLessThanOrEqual(TalkOpening.MAX_CHARS)
-    for (const part of ['Review talk · shop job 3', TalkOpening.folderCheck('shop-job-3-0123abcd'), TalkOpening.LOOKUP_RULE, 'Good pace.', 'job.md', 'guideline.md']) expect(message).toContain(part)
-    expect(message).not.toContain('xxxxxxxxxx')
-    const long = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('y'.repeat(20_000)), guideline('Keep it small.\n'))
-    expect([long.length <= TalkOpening.MAX_CHARS, long.includes(TalkOpening.CUT), long.includes(TalkOpening.LOOKUP_RULE), long.includes(TalkOpening.folderCheck('shop-job-3-0123abcd'))]).toEqual([true, true, true, true])
+  it('has no length cut: a long job and long comments are there in full', () => {
+    const message = TalkOpening.build(job(), 'shop-job-3-0123abcd', texts('y'.repeat(20_000), 'x'.repeat(20_000)), guideline('Keep it small.\n'))
+    expect([message.includes('x'.repeat(20_000)), message.includes('y'.repeat(20_000))]).toEqual([true, true])
+  })
+
+  it('the wrong-folder text is the one AD-18 gives', () => {
+    expect(TalkOpening.WRONG_FOLDER).toBe('This review talk opened in the wrong folder, so it is stopping here. Close this session and start the talk again from the review page.')
   })
 
   it('says there is no guideline yet and that a proposal would be version 1', () => {
@@ -145,22 +167,14 @@ describe('TalkOpening', () => {
   })
 })
 
-describe('TalkLink', () => {
-  it('encodes the folder and the message, a space as %20', () => {
-    const link = TalkLink.of('/a b/talk', 'Review talk · shop job 3\n&q=x')
-    expect(link).toBe('claude://code/new?folder=%2Fa%20b%2Ftalk&q=Review%20talk%20%C2%B7%20shop%20job%203%0A%26q%3Dx')
-    expect([folderOf(link), messageOf(link)]).toEqual(['/a b/talk', 'Review talk · shop job 3\n&q=x'])
-  })
-})
-
 describe('ReviewTalks', () => {
-  it('starts a talk: the folder holds exactly the pinned files and the job\'s files, and the link opens it with the opening message', async () => {
+  it('starts a talk: the folder holds exactly the pinned files and the job\'s files, and opening.md holds the opening message', async () => {
     const records = new StandInRecords()
     const started = await talksOf(records).start(job(), ADDRESS, false)
     expect(started.opened).toBe(true)
     if (!started.opened) return
     const folder = TalkFolder.of(talks, job()).path
-    expect(filesOf(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json'])
+    expect(filesOf(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'opening.md', 'talk.json'])
     expect(readFileSync(join(folder, '.claude', 'settings.json'), 'utf8')).toBe(TalkFolder.SETTINGS)
     expect(readFileSync(join(folder, '.mcp.json'), 'utf8')).toBe(TalkFolder.mcpOf({ node: '/usr/local/bin/node', server, url: ADDRESS, tokenFile: join(root, 'superagent-token') }, '/Users/jex'))
     expect(JSON.parse(readFileSync(join(folder, 'talk.json'), 'utf8'))).toEqual({ project, job_id: 'job-1', number: 3, title: 'Review talk · shop job 3', started: NOW })
@@ -172,13 +186,14 @@ describe('ReviewTalks', () => {
       'What it looked at: stories/4-2.md (used)', 'What happened next: Ran and succeeded · 12 pass', 'Cost: 980 tokens · 2.2 s', 'Why: Not recorded']) expect(jobText).toContain(part)
     expect(readFileSync(join(folder, 'comments.md'), 'utf8')).toBe('# The owner\'s comments on shop job 3\n\n## On the whole job\nGood pace.\n\n## On step 2 · 2026-11-26T08:30:00.000Z · Permission answered\nReject this at this stage.\n')
     expect(readFileSync(join(folder, 'guideline.md'), 'utf8')).toBe('# Guideline\nKeep it small.\n')
-    expect([folderOf(started.link), started.link.startsWith('claude://code/new?folder=')]).toEqual([folder, true])
-    const message = messageOf(started.link)
+    // The opening message is the folder's opening.md, whole, and Orca was asked to start Claude Code there.
+    const message = readFileSync(join(folder, 'opening.md'), 'utf8')
     for (const part of ['Good pace.', 'Reject this at this stage.', 'Keep it small.', TalkOpening.LOOKUP_RULE, TalkOpening.folderCheck(basename(folder))]) expect(message).toContain(part)
     expect(message.split('\n')[0]).toBe('Review talk · shop job 3')
+    expect(runner.changes().map(args => args.slice(0, 2).join(' '))).toEqual(['repo add', 'agent launch'])
   })
 
-  it('writes every file and the link\'s message only through the mask, so a planted secret is in none of them', async () => {
+  it('writes every file, opening.md included, only through the mask, so a planted secret is in none of them', async () => {
     const records = new StandInRecords(guideline(`Never print ${PLANTED}.\n`))
     const planted = job({ steps: [step({ summary: `Started with ${PLANTED}.` })], reviews: [review({ comment: `Do not print ${PLANTED}.` })] })
     const started = await talksOf(records).start(planted, ADDRESS, false)
@@ -190,8 +205,8 @@ describe('ReviewTalks', () => {
       // Each file's whole text is one the mask gave back.
       expect([name, records.masked.includes(text)]).toEqual([name, true])
     }
-    expect(records.masked).toContain(messageOf(started.link))
-    expect(started.link).not.toContain(encodeURIComponent(PLANTED))
+    expect(readFileSync(join(folder, 'opening.md'), 'utf8')).toContain(`Do not print ${REDACTED}.`)
+    for (const call of runner.calls) expect(call.args.join(' ')).not.toContain(PLANTED)
     expect(readFileSync(join(folder, 'comments.md'), 'utf8')).toContain(`Do not print ${REDACTED}.`)
   })
 
@@ -215,7 +230,7 @@ describe('ReviewTalks', () => {
   /** Asks git about the talk folder, reading none of the owner's git settings. */
   const git = (folder: string, ...args: string[]) => execFileSync('git', ['-C', folder, ...args], { encoding: 'utf8',
     env: { ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_'))), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).trim()
-  const TALK_FILES = ['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json']
+  const TALK_FILES = ['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'opening.md', 'talk.json']
 
   it('makes the talk folder its own git repository: one commit by the factory holding exactly the files written, on main, with no remote', async () => {
     await talksOf(new StandInRecords()).start(job(), ADDRESS, false)
@@ -317,7 +332,86 @@ describe('ReviewTalks', () => {
     const started = await talksOf(new StandInRecords(guideline(null))).start(job(), ADDRESS, false)
     if (!started.opened) throw new Error('not opened')
     expect(readFileSync(join(TalkFolder.of(talks, job()).path, 'guideline.md'), 'utf8')).toBe('There is no guideline yet. A proposal would be version 1.\n')
-    expect(messageOf(started.link)).toContain('a proposal would be version 1')
+    expect(readFileSync(join(TalkFolder.of(talks, job()).path, 'opening.md'), 'utf8')).toContain('a proposal would be version 1')
+  })
+})
+
+describe('OrcaLauncher', () => {
+  const PROMPT = 'Review talk · shop job 3. Read opening.md in this folder and follow it.'
+  const refusalOf = (promise: Promise<unknown>) => promise.then(() => { throw new Error('the talk started') }, (error: unknown) => error as TalkRefusal)
+
+  it('pins both Orca commands, as argument lists: repo add for the talk folder, then agent launch with the fixed line, within 15 and 60 seconds', async () => {
+    await talksOf(new StandInRecords()).start(job(), ADDRESS, false)
+    const folder = TalkFolder.of(talks, job()).path
+    expect(runner.calls).toEqual([
+      { program: ORCA, args: ['repo', 'list', '--json'], timeoutMs: 15_000 },
+      { program: ORCA, args: ['repo', 'add', '--path', folder, '--kind', 'git'], timeoutMs: 15_000 },
+      { program: ORCA, args: ['agent', 'launch', '--agent', 'claude', '--worktree', `path:${folder}`, '--surface', 'terminal', '--focus', '--prompt', PROMPT], timeoutMs: 60_000 },
+    ])
+    expect(OrcaLauncher.promptOf('Review talk · shop job 3')).toBe(PROMPT)
+  })
+
+  it('skips repo add when Orca already lists the talk folder, and a second click without fresh runs nothing at all', async () => {
+    const folder = TalkFolder.of(talks, job()).path
+    const fake = new FakeRunner([folder])
+    const talk = talksOf(new StandInRecords(), { orca: orcaOf(fake) })
+    await talk.start(job(), ADDRESS, false)
+    expect(fake.changes()).toEqual([['agent', 'launch', '--agent', 'claude', '--worktree', `path:${folder}`, '--surface', 'terminal', '--focus', '--prompt', PROMPT]])
+    await talk.start(job(), ADDRESS, false)
+    expect(fake.calls).toHaveLength(2)
+    expect([OrcaLauncher.lists('not json', folder), OrcaLauncher.lists(JSON.stringify({ result: { repos: [{ path: `${folder}/` }] } }), folder),
+      OrcaLauncher.lists(JSON.stringify({ result: { repos: [{ path: `${folder}-other` }] } }), folder)]).toEqual([false, true, false])
+  })
+
+  it('refuses a folder that is not a plain folder directly under the review talks folder, and runs nothing', async () => {
+    for (const folder of [join(root, 'elsewhere'), join(talks, 'a', 'b'), join(talks, 'bad name'), join(talks, '..', 'review-talks-x'), `${talks}/x/../y`]) {
+      const fake = new FakeRunner()
+      const refused = await refusalOf(orcaOf(fake).launch(folder, 'Review talk · shop job 3'))
+      expect([folder, refused.status, refused.message]).toEqual([folder, 503, 'Orca could not start the talk: the talk folder is not a plain folder directly under the review talks folder'])
+      expect(fake.calls).toEqual([])
+    }
+    // By default only ~/.config/zees-factory/review-talks/ is the review talks folder.
+    const fake = new FakeRunner()
+    expect((await refusalOf(new OrcaLauncher({ program: ORCA, runner: fake }).launch(join(talks, 'shop-job-3-0123abcd'), 'x'))).status).toBe(503)
+    expect(fake.calls).toEqual([])
+  })
+
+  it('names the failed step and the first line of Orca\'s error; talk.json is removed so the talk is not started, and the other files stay', async () => {
+    for (const [step, expected] of [['repo list', ['repo list']], ['repo add', ['repo list', 'repo add']], ['agent launch', ['repo list', 'repo add', 'agent launch']]] as const) {
+      const fake = new FakeRunner([], { [step]: { ok: false, error: `Orca is not running\nmore detail` } })
+      const talk = talksOf(new StandInRecords(), { orca: orcaOf(fake) })
+      const refused = await refusalOf(talk.start(job(), ADDRESS, false))
+      expect([refused.status, refused.message]).toEqual([503, `Orca could not start the talk (${step}: Orca is not running)`])
+      expect(fake.calls.map(call => call.args.slice(0, 2).join(' '))).toEqual(expected)
+      const folder = TalkFolder.of(talks, job()).path
+      expect([talk.stateOf(job()), filesOf(folder)]).toEqual([undefined, ['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'opening.md']])
+      rmSync(folder, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses every start with the plain reason when no orca program was found, before anything is written or run', async () => {
+    const fake = new FakeRunner()
+    const refused = await refusalOf(talksOf(new StandInRecords(), { orca: new OrcaLauncher({ program: undefined, root: talks, runner: fake }) }).start(job(), ADDRESS, false))
+    expect([refused.status, refused.message]).toEqual([503, 'Orca\'s command-line tool was not found'])
+    expect([existsSync(TalkFolder.of(talks, job()).path), fake.calls]).toEqual([false, []])
+  })
+
+  it('finds orca from the review.orca setting alone when it is set, else on PATH, then at /opt/homebrew/bin/orca; a missing or non-runnable file does not count', () => {
+    const make = (folder: string, mode: number) => { mkdirSync(folder, { recursive: true }); const file = join(folder, 'orca'); writeFileSync(file, '#!/bin/sh\n'); chmodSync(file, mode); return file }
+    const setting = make(join(root, 'setting'), 0o755), onPath = make(join(root, 'path'), 0o755), notRunnable = make(join(root, 'plain'), 0o644)
+    const PATH = [join(root, 'nothing'), 'relative/bin', join(root, 'plain'), join(root, 'path')].join(':')
+    expect(OrcaLauncher.find(setting, PATH)).toBe(setting)
+    expect(OrcaLauncher.find(undefined, PATH)).toBe(onPath)
+    // A wrong setting is refused, never replaced by another orca.
+    expect([OrcaLauncher.find(join(root, 'missing', 'orca'), PATH), OrcaLauncher.find(notRunnable, PATH), OrcaLauncher.find('relative/orca', PATH)]).toEqual([undefined, undefined, undefined])
+    expect(OrcaLauncher.find(undefined, '')).toBe(existsSync(OrcaLauncher.HOMEBREW) ? OrcaLauncher.HOMEBREW : undefined)
+  })
+
+  it('runs a program with plain arguments and no shell; a failure gives its error output, and a hung program stops at its time limit', async () => {
+    const real = new ExecFileRunner()
+    expect(await real.run(process.execPath, ['-e', 'console.log(process.argv[1])', '$(echo no shell) ; x'], 10_000)).toEqual({ ok: true, stdout: '$(echo no shell) ; x\n' })
+    expect(await real.run(process.execPath, ['-e', 'console.error("first line\\nsecond"); process.exit(2)'], 10_000)).toEqual({ ok: false, error: 'first line\nsecond' })
+    expect(await real.run(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], 300)).toEqual({ ok: false, error: 'no answer within 0.3 seconds' })
   })
 })
 

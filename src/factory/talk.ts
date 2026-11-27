@@ -1,26 +1,28 @@
 /**
- * The review talk: a Claude Desktop session in which the owner and Claude talk one job and its comments through, and which can propose a change to the
- * super agent's decision guideline (epic R8, architecture AD-18). The review page's "Start review talk" button starts it; the talk itself runs in Claude
- * Desktop, not here and not in DSH.
- * On the owner's click this file prepares a talk folder for the job and the page hands the browser a `claude://code/new?folder=…&q=…` link, the first
- * message already written. Claude Desktop asks the owner to confirm the folder, and nothing is sent until the owner presses send. This code starts no
- * session, and writes nothing to the job log, to a project's `.factory/` folder or to the guideline folder.
+ * The review talk: a Claude Code session in Orca in which the owner and Claude talk one job and its comments through, and which can propose a change
+ * to the super agent's decision guideline (epic R8, architecture AD-18). The review page's "Start review talk" button starts it; the talk itself runs
+ * in Orca, not here and not in DSH.
+ * On the owner's click this file prepares a talk folder for the job, writes the whole opening message into it as `opening.md`, and then runs exactly
+ * two Orca commands (`OrcaLauncher`, AD-7's review-talk exception): `orca repo add` for the folder, skipped when Orca has it already, and
+ * `orca agent launch`, which starts Claude Code in that folder with one fixed line as its first message. Nothing is typed into the session afterwards.
+ * This code writes nothing to the job log, to a project's `.factory/` folder or to the guideline folder.
  * The folder, `~/.config/zees-factory/review-talks/<project>-job-<n>-<short hash>/`, holds:
  *   .claude/settings.json  deny rules only, so the talk can read and look things up but not write, edit or run a command (`TalkFolder.SETTINGS`)
  *   .mcp.json              the one factory tool server, `propose_guideline_change` (`TalkFolder.mcpOf`)
  *   job.md                 the job as the page shows it: each step's line and its detail
  *   comments.md            the owner's comments on the job and its steps
  *   guideline.md           the current guideline, or a note that there is none yet
+ *   opening.md             the opening message: the title, the folder guard, what the talk is for, the lookup rule, the job, the comments, the guideline
  *   talk.json              the project, the job and the start date: the only state, and the sign that the talk was started
- * Every file, and the link's message, goes through the factory's own mask first (PRD NFR-3, the review talk's path): the talk folder holds masked
- * copies only, also when a record on disk was already masked. Without a working mask nothing is written.
+ * Every file goes through the factory's own mask first (PRD NFR-3, the review talk's path): the talk folder holds masked copies only, also when a
+ * record on disk was already masked. Without a working mask nothing is written.
  * Proposals the talk sends back (`POST /review/proposal`, in `review.ts`) are kept here in memory, the newest per job, until a newer one replaces it.
  */
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from 'node:fs'
+import { accessSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import {
   FactoryRecordsModule, RecordsRefusal, type AutomaticAnswer, type GuidelineRead, type JobLogLine, type RecordedJob, type RecordsSource, type StepDetail, type StepOutcome, type StepSource,
   type StepWhy, type TimelineStep,
@@ -76,7 +78,7 @@ export class TalkTexts {
 
   /** The project's folder name, which is what the owner calls it. */
   static nameOf(project: string): string { return basename(project) || project }
-  /** The first line of the opening message, and the talk's name in Claude Desktop. */
+  /** The first line of the opening message, and the talk's name: the first line of its Orca tab's first message. */
   static title(job: RecordedJob): string { return `Review talk · ${TalkTexts.nameOf(job.project)} job ${job.number}` }
 
   /** `job.md`: the job's facts, then each step's line and its detail, in timeline order. */
@@ -150,63 +152,39 @@ export class TalkTexts {
 }
 
 /**
- * The talk's opening message, the `q` of its link: the title line, the folder check, what the talk is for, the lookup rule, the comments, the job
- * and the guideline. The folder check comes first because Claude Desktop can start the session somewhere other than the talk folder (it was seen
- * starting from the project selected in its Code tab, in a worktree of that repository): there the deny rules and the propose server do not apply,
- * so Claude stops at once with a plain message instead of talking the job through.
- * Claude Desktop cuts a longer `q` at about 14,000 characters, so a message that would pass `MAX_CHARS` keeps the title line, what the talk is for, the
- * lookup rule and the comments, and names the files that hold the rest; comments longer than that are cut and point to their file too.
- * Its parts are the masked texts of the files, and the whole message goes through the mask once more when it is done (`ReviewTalks.start`).
+ * The talk's opening message, written to the talk folder as `opening.md`, with no length cut: the title line, the folder guard, what the talk is for,
+ * the lookup rule, the job, the owner's comments and the guideline (AD-18). The folder guard comes first: in any folder but the talk folder the deny
+ * rules and the propose server do not apply, so Claude stops at once with a plain message instead of talking the job through.
+ * Its parts are the masked texts of the files, and the whole message goes through the mask once more as a file of its own (`TalkFolder.write`).
  */
 export class TalkOpening {
-  static readonly MAX_CHARS = 14_000
   static readonly LOOKUP_RULE = 'Lookups: you may look things up, such as a library\'s documentation. A lookup sends out only a tool or library name and a general question, '
     + 'never job text, comments, project code or a file path.'
-  static readonly CUT = '… (the rest is in comments.md)'
 
   /**
-   * The folder check for the talk folder named `folder`: Claude reads its working folder from its own environment, so the check needs no tool. A
-   * worktree Claude Desktop makes of the talk folder's own repository (its Worktree switch) passes: it sits in the folder's `.claude/worktrees/` and holds
-   * the same committed files, deny rules and propose server.
+   * The folder guard for the talk folder named `folder`: Claude reads its working folder from its own environment, so the guard needs no tool. Only
+   * the talk folder itself passes; any other folder, a git worktree of it included, stops the talk.
    */
   static folderCheck(folder: string): string {
     return `Before anything else, check your working folder, as your environment states it. It must be the talk folder ${folder}, under `
-      + `~/.config/zees-factory/review-talks/, or a git worktree of it inside that folder's own .claude/worktrees/. If it is any other folder, reply only: `
-      + `"${TalkOpening.WRONG_FOLDER}", then add your working folder's path, `
+      + `~/.config/zees-factory/review-talks/. If it is any other folder, reply only: "${TalkOpening.WRONG_FOLDER}" `
       + 'and do nothing else: read no file, call no tool and do not discuss the job.'
   }
 
-  static readonly WRONG_FOLDER = 'This review talk opened in the wrong folder, so it is stopping here. Close this session, choose no project in Claude '
-    + 'Desktop\'s Code tab, then start the talk again from the review page.'
+  static readonly WRONG_FOLDER = 'This review talk opened in the wrong folder, so it is stopping here. Close this session and start the talk again from the review page.'
 
-  /** The message for a job whose files hold `texts`, each already masked, written to the talk folder named `folder`. */
+  /** The whole opening message, with no length cut, for a job whose files hold `texts`, each already masked, written to the talk folder named `folder`. */
   static build(job: RecordedJob, folder: string, texts: { title: string; job: string; comments: string; guideline: string }, read: GuidelineRead): string {
     const version = read.current === null ? 'there is none yet, so a proposal would be version 1' : `version ${read.current.version}`
-    const head = [texts.title, '', TalkOpening.folderCheck(folder), '',
+    return [texts.title, '', TalkOpening.folderCheck(folder), '',
       `This review talk is about job ${job.number} of ${TalkTexts.nameOf(job.project)} (job id ${job.job_id}), which the super agent led. The owner has commented on it. `
       + `Talk the comments through with the owner. When you both agree on a change to the super agent's decision guideline (${version}), call the tool `
       + `propose_guideline_change with job_id "${job.job_id}" and the whole new guideline text. The owner then sees it on the review page beside the current `
       + 'version, and nothing is saved until the owner accepts it there. In this talk you can read and look things up, but not write, edit or run a command.',
-      '', TalkOpening.LOOKUP_RULE, '', 'This folder holds the same texts as files: job.md (the job), comments.md (the owner\'s comments) and guideline.md (the current guideline).']
-    const comments = ['', '## The owner\'s comments', '', texts.comments.trimEnd()]
-    const rest = ['', '## The job', '', texts.job.trimEnd(), '', read.current === null ? '## The guideline' : `## The current guideline, version ${read.current.version}`, '',
-      texts.guideline.trimEnd()]
-    const whole = [...head, ...comments, ...rest].join('\n')
-    if (whole.length <= TalkOpening.MAX_CHARS) return whole
-    const short = [...head, '', 'The job and the guideline are too long for this message: read job.md and guideline.md in this folder.'].join('\n')
-    const withComments = [short, ...comments].join('\n')
-    if (withComments.length <= TalkOpening.MAX_CHARS) return withComments
-    const room = TalkOpening.MAX_CHARS - short.length - TalkOpening.CUT.length - 40
-    return [short, '', '## The owner\'s comments', '', `${texts.comments.slice(0, Math.max(0, room)).trimEnd()}${TalkOpening.CUT}`].join('\n')
-  }
-}
-
-/** The link that opens Claude Desktop on the talk folder with the opening message written: `claude://code/new?folder=…&q=…`, every value URL-encoded. */
-export class TalkLink {
-  static readonly BASE = 'claude://code/new'
-  static of(folder: string, message: string): string {
-    // `encodeURIComponent`, not `URLSearchParams`: the latter writes a space as `+`, which the link's reader may not read back as a space.
-    return `${TalkLink.BASE}?folder=${encodeURIComponent(folder)}&q=${encodeURIComponent(message)}`
+      '', TalkOpening.LOOKUP_RULE, '', 'This folder holds the same texts as files: job.md (the job), comments.md (the owner\'s comments) and guideline.md (the current guideline).',
+      '', '## The job', '', texts.job.trimEnd(), '', '## The owner\'s comments', '', texts.comments.trimEnd(),
+      '', read.current === null ? '## The guideline' : `## The current guideline, version ${read.current.version}`, '',
+      texts.guideline.trimEnd(), ''].join('\n')
   }
 }
 
@@ -219,9 +197,10 @@ export class TalkFolder {
   static readonly ROOT = join(homedir(), '.config', 'zees-factory', 'review-talks')
   /** The talk's Claude Code settings: deny rules only, nothing else. A deny rule wins over any allow rule. */
   static readonly SETTINGS = `${JSON.stringify({ permissions: { deny: ['Write', 'Edit', 'NotebookEdit', 'Bash'] } }, null, 2)}\n`
-  /** The name of the talk's one MCP server, as Claude Desktop lists it. */
+  /** The name of the talk's one MCP server, as Claude Code lists it. */
   static readonly SERVER_NAME = 'zees-factory-propose'
-  static readonly FILES = { settings: join('.claude', 'settings.json'), mcp: '.mcp.json', job: 'job.md', comments: 'comments.md', guideline: 'guideline.md', state: 'talk.json' } as const
+  static readonly FILES = { settings: join('.claude', 'settings.json'), mcp: '.mcp.json', job: 'job.md', comments: 'comments.md', guideline: 'guideline.md', opening: 'opening.md',
+    state: 'talk.json' } as const
   /**
    * The git settings of the talk folder's own repository, given on every call so nothing comes from the owner's own git setup: a fixed author, no
    * signing, no hooks, `main` as the first branch. The owner's global and system config files are not read at all (`GIT_CONFIG_GLOBAL`,
@@ -274,14 +253,13 @@ export class TalkFolder {
    * Writes the talk's files. `mask` cleans one text and throws when it cannot. Every text is masked before the first byte is written, so a mask that
    * fails leaves no folder behind. The two pinned files must come through the mask unchanged, since a changed one would no longer start the tool or
    * deny anything; if not, nothing is written. `talk.json` is written last: until it is there, the talk does not count as started.
-   * Then the folder is made its own git repository (once) and every file written is committed, a fresh talk as a new commit on top. Claude Desktop
-   * then takes the folder itself as the project, not a repository above it (the owner's home folder can be one), so a session it starts in a git
-   * worktree still holds the talk's files, its deny rules and its propose server. No remote is set; nothing is pushed. When git fails the start is
-   * refused and `talk.json` is removed again, so the talk does not count as started.
+   * Then the folder is made its own git repository (once) and every file written is committed, a fresh talk as a new commit on top. Orca adds the
+   * folder with `--kind git`, and as its own repository it is the project itself, not a repository above it (the owner's home folder can be one).
+   * No remote is set; nothing is pushed. When git fails the start is refused and `talk.json` is removed again, so the talk does not count as started.
    */
-  write(files: { mcp: string; job: string; comments: string; guideline: string; state: TalkState }, mask: (text: string) => string): void {
+  write(files: { mcp: string; job: string; comments: string; guideline: string; opening: string; state: TalkState }, mask: (text: string) => string): void {
     const plain: [string, string][] = [[TalkFolder.FILES.settings, TalkFolder.SETTINGS], [TalkFolder.FILES.mcp, files.mcp], [TalkFolder.FILES.job, files.job],
-      [TalkFolder.FILES.comments, files.comments], [TalkFolder.FILES.guideline, files.guideline], [TalkFolder.FILES.state, `${JSON.stringify(files.state, null, 2)}\n`]]
+      [TalkFolder.FILES.comments, files.comments], [TalkFolder.FILES.guideline, files.guideline], [TalkFolder.FILES.opening, files.opening], [TalkFolder.FILES.state, `${JSON.stringify(files.state, null, 2)}\n`]]
     const masked = plain.map(([name, text]) => [name, mask(text)] as const)
     for (const [name, text] of masked.slice(0, 2)) {
       if (text !== plain.find(([each]) => each === name)![1]) throw new TalkRefusal(503, `The review talk could not be prepared: the mask changed ${name}`)
@@ -302,10 +280,13 @@ export class TalkFolder {
       this.git('add', '--', ...masked.map(([name]) => name))
       this.git('commit', '--quiet', '--no-verify', '--allow-empty', '-m', `Review talk files, started ${files.state.started}`)
     } catch {
-      rmSync(join(this.path, TalkFolder.FILES.state), { force: true })
+      this.unstart()
       throw new TalkRefusal(503, 'The review talk could not be prepared: the talk folder could not be committed to its own git repository')
     }
   }
+
+  /** Removes `talk.json`, so the talk no longer counts as started. Every other file stays. */
+  unstart(): void { rmSync(join(this.path, TalkFolder.FILES.state), { force: true }) }
 
   /** Runs one git command inside the talk folder, with `GIT_CONFIG` and an environment that holds none of the owner's git settings. */
   private git(...args: string[]): void {
@@ -324,8 +305,111 @@ export class TalkFolder {
   }
 }
 
-/** What `ReviewTalks.start` did: opened a talk (with the link to hand the browser), or found one already started and opened nothing. */
-export type TalkStart = { opened: true; link: string; state: TalkState } | { opened: false; state: TalkState }
+/** How one program ended: its output, or the reason it failed. */
+export type OrcaRun = { ok: true; stdout: string } | { ok: false; error: string }
+
+/** Runs one program with plain arguments, never through a shell, within a time limit. `OrcaLauncher` runs Orca through it; tests give a fake. */
+export interface OrcaRunner {
+  run(program: string, args: readonly string[], timeoutMs: number): Promise<OrcaRun>
+}
+
+/** The real runner: `execFile`, so the arguments reach the program as they are and nothing is read by a shell. It never blocks DSH while it waits. */
+export class ExecFileRunner implements OrcaRunner {
+  run(program: string, args: readonly string[], timeoutMs: number): Promise<OrcaRun> {
+    return new Promise(done => {
+      execFile(program, [...args], { timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' }, (error, stdout, stderr) => {
+        if (error === null) { done({ ok: true, stdout }); return }
+        const timedOut = (error as { killed?: boolean }).killed === true && (error as { signal?: string | null }).signal === 'SIGKILL'
+        const said = [stderr, stdout].map(text => text.trim()).find(text => text !== '')
+        done({ ok: false, error: timedOut ? `no answer within ${timeoutMs / 1000} seconds` : said ?? error.message })
+      })
+    })
+  }
+}
+
+/**
+ * Opens a prepared talk folder in Orca with exactly the two commands AD-7's review-talk exception allows, and nothing else:
+ *   orca repo add --path <talk folder> --kind git          (skipped when `orca repo list --json` already lists the folder)
+ *   orca agent launch --agent claude --worktree path:<talk folder> --surface terminal --focus --prompt <fixed line>
+ * The only variable parts are the talk folder, which must sit directly under the talk root with a plain name, and the title line in the prompt.
+ * Nothing is typed into the session afterwards.
+ */
+export class OrcaLauncher {
+  /** What the owner's click is refused with when no `orca` program was found (AD-18, "Finding Orca"). */
+  static readonly NOT_FOUND = 'Orca\'s command-line tool was not found'
+  /** The fixed text after the title line in the talk's first message (AD-18). */
+  static readonly PROMPT = 'Read opening.md in this folder and follow it.'
+  /** The last place `find` looks, where Homebrew puts Orca on a Mac. */
+  static readonly HOMEBREW = '/opt/homebrew/bin/orca'
+  static readonly NAME = /^[A-Za-z0-9._-]+$/
+  static readonly ADD_MS = 15_000
+  static readonly LAUNCH_MS = 60_000
+  /** The `orca` program, or `undefined` when none was found. */
+  readonly program: string | undefined
+  private readonly root: string
+  private readonly runner: OrcaRunner
+
+  constructor(options: { program: string | undefined; root?: string; runner?: OrcaRunner }) {
+    this.program = options.program
+    this.root = resolve(options.root ?? TalkFolder.ROOT)
+    this.runner = options.runner ?? new ExecFileRunner()
+  }
+
+  /**
+   * The `orca` program, looked up once when DSH starts: the profile's `review.orca` setting, then each folder on `PATH`, then `HOMEBREW`. Only an
+   * absolute path to an executable file counts. A setting that is given is the only place looked at, so a wrong one is refused, never replaced by
+   * another `orca`. `undefined` when there is none.
+   */
+  static find(setting: string | undefined, path: string | undefined = process.env.PATH): string | undefined {
+    if (setting !== undefined && setting !== '') return OrcaLauncher.runnable(setting) ? setting : undefined
+    const onPath = (path ?? '').split(delimiter).filter(folder => isAbsolute(folder)).map(folder => join(folder, 'orca'))
+    return [...onPath, OrcaLauncher.HOMEBREW].find(OrcaLauncher.runnable)
+  }
+
+  private static runnable(file: string): boolean {
+    try { return isAbsolute(file) && statSync(file).isFile() && (accessSync(file, constants.X_OK), true) } catch { return false }
+  }
+
+  /** The talk's first message: its title line and the fixed text, on one line. */
+  static promptOf(title: string): string { return `${title.replace(/\s+/g, ' ').trim()}. ${OrcaLauncher.PROMPT}` }
+
+  /** Refuses with 503 when there is no `orca` program, so a start is refused before anything is written. */
+  check(): void { if (this.program === undefined) throw new TalkRefusal(503, OrcaLauncher.NOT_FOUND) }
+
+  /** Opens the talk folder `folder`, whose talk is called `title`, in Orca. A failed step is a 503 that names the step and Orca's first line. */
+  async launch(folder: string, title: string): Promise<void> {
+    this.check()
+    const program = this.program!
+    const name = basename(folder)
+    if (resolve(dirname(folder)) !== this.root || !OrcaLauncher.NAME.test(name) || resolve(folder) !== folder) {
+      throw new TalkRefusal(503, 'Orca could not start the talk: the talk folder is not a plain folder directly under the review talks folder')
+    }
+    const failed = (step: string, error: string) => new TalkRefusal(503, `Orca could not start the talk (${step}: ${error.split(/\r?\n/)[0]!.trim()})`)
+    const listed = await this.runner.run(program, ['repo', 'list', '--json'], OrcaLauncher.ADD_MS)
+    if (!listed.ok) throw failed('repo list', listed.error)
+    if (!OrcaLauncher.lists(listed.stdout, folder)) {
+      const added = await this.runner.run(program, ['repo', 'add', '--path', folder, '--kind', 'git'], OrcaLauncher.ADD_MS)
+      if (!added.ok) throw failed('repo add', added.error)
+    }
+    const launched = await this.runner.run(program,
+      ['agent', 'launch', '--agent', 'claude', '--worktree', `path:${folder}`, '--surface', 'terminal', '--focus', '--prompt', OrcaLauncher.promptOf(title)], OrcaLauncher.LAUNCH_MS)
+    if (!launched.ok) throw failed('agent launch', launched.error)
+  }
+
+  /** Whether the answer of `orca repo list --json` (`{ result: { repos: [{ path }] } }`) holds `folder`, by its path as given or as resolved on disk. */
+  static lists(answer: string, folder: string): boolean {
+    let repos: unknown
+    try { repos = (JSON.parse(answer) as { result?: { repos?: unknown } } | null)?.result?.repos } catch { return false }
+    if (!Array.isArray(repos)) return false
+    const real = (path: string) => { try { return realpathSync(path) } catch { return resolve(path) } }
+    const wanted = new Set([resolve(folder), real(folder)])
+    return repos.some(repo => typeof (repo as { path?: unknown } | null)?.path === 'string' && (wanted.has(resolve((repo as { path: string }).path))
+      || wanted.has(real((repo as { path: string }).path))))
+  }
+}
+
+/** What `ReviewTalks.start` did: opened a talk in Orca, or found one already started and opened nothing. */
+export type TalkStart = { opened: true; state: TalkState } | { opened: false; state: TalkState }
 
 export interface ReviewTalksOptions {
   /** The factory's records module: the mask, the step reader and the guideline reader. */
@@ -334,6 +418,8 @@ export interface ReviewTalksOptions {
   tokenFile: string
   /** How the page names a step. */
   words: StepWords
+  /** Opens a prepared talk folder in Orca. Required, so nothing starts a real session by default. */
+  orca: OrcaLauncher
   /** Where talk folders go. Defaults to `TalkFolder.ROOT`. */
   root?: string
   /** The built propose server. Defaults to `proposeServer.js` next to the records module's built file. */
@@ -350,6 +436,7 @@ export class ReviewTalks {
   private readonly records: RecordsSource
   private readonly tokenFile: string
   private readonly texts: TalkTexts
+  private readonly orca: OrcaLauncher
   private readonly serverFile: string | undefined
   private readonly node: string
   private readonly home: string
@@ -358,6 +445,7 @@ export class ReviewTalks {
     this.records = options.records
     this.tokenFile = options.tokenFile
     this.texts = new TalkTexts(options.words)
+    this.orca = options.orca
     this.root = options.root ?? TalkFolder.ROOT
     const recordsPath = options.records instanceof FactoryRecordsModule ? options.records.path : undefined
     this.serverFile = options.serverFile ?? (recordsPath === undefined || recordsPath === '' ? undefined : join(recordsPath, '..', 'proposeServer.js'))
@@ -370,10 +458,10 @@ export class ReviewTalks {
   stateOf(job: RecordedJob): TalkState | undefined { return TalkFolder.of(this.root, job).state() }
 
   /**
-   * Prepares the talk of `job`, whose propose tool will post to `address`, and returns the link that opens it. A job whose talk was started already gets
-   * nothing new unless `fresh` is set: then its files are written again from the records of now, with a new date.
-   * Refuses with 409 when the owner has not commented on the job, and with 503 when it cannot be prepared (no mask, no propose server, no folder); then
-   * nothing is marked as started.
+   * Prepares the talk of `job`, whose propose tool will post to `address`, and opens it in Orca. A job whose talk was started already gets nothing new
+   * unless `fresh` is set: then its files are written again from the records of now, with a new date, and the talk is opened again.
+   * Refuses with 409 when the owner has not commented on the job, and with 503 when Orca was not found, when the talk cannot be prepared (no mask, no
+   * propose server, no folder) or when an Orca step fails; then nothing is marked as started, and after a failed Orca step the other files stay.
    */
   async start(job: RecordedJob, address: string, fresh: boolean): Promise<TalkStart> {
     const comments = new TalkComments(job)
@@ -381,6 +469,7 @@ export class ReviewTalks {
     const folder = TalkFolder.of(this.root, job)
     const existing = folder.state()
     if (existing !== undefined && !fresh) return { opened: false, state: existing }
+    this.orca.check()
     const cannot = (why: string) => new TalkRefusal(503, `The review talk could not be prepared: ${why}`)
     if (this.serverFile === undefined || !existsSync(this.serverFile)) throw cannot('the propose server\'s built file is not next to the job log file')
     const mask = await this.maskFor(job.project, cannot)
@@ -393,8 +482,13 @@ export class ReviewTalks {
     const texts = { title, job: mask(this.texts.job(job, details)), comments: mask(this.texts.comments(job, comments)), guideline: mask(TalkTexts.guideline(read)) }
     const state: TalkState = { project: job.project, job_id: job.job_id, number: job.number, title, started: this.now().toISOString() }
     const mcp = TalkFolder.mcpOf({ node: this.node, server: this.serverFile, url: address, tokenFile: this.tokenFile }, this.home)
-    folder.write({ mcp, job: texts.job, comments: texts.comments, guideline: texts.guideline, state }, mask)
-    return { opened: true, link: TalkLink.of(folder.path, mask(TalkOpening.build(job, basename(folder.path), texts, read))), state: folder.state() ?? { ...state, title } }
+    const opening = TalkOpening.build(job, basename(folder.path), texts, read)
+    folder.write({ mcp, job: texts.job, comments: texts.comments, guideline: texts.guideline, opening, state }, mask)
+    try { await this.orca.launch(folder.path, title) } catch (error) {
+      folder.unstart()
+      throw error instanceof TalkRefusal ? error : new TalkRefusal(503, 'Orca could not start the talk')
+    }
+    return { opened: true, state: folder.state() ?? state }
   }
 
   /** The project's mask over one plain text, from the factory's records module. Any failure is a 503 that repeats nothing of the text. */

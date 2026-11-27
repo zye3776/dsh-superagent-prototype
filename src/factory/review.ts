@@ -7,8 +7,8 @@
  * `GuidelineReader` reads them from the factory repository.
  * The factory's `JobsReader` builds the jobs from each project's `.factory/` records and its `StepDetailReader` reads a step's detail through the step's
  * pointers (`records.ts`); this page groups and copies nothing itself. It writes only comment lines, each masked with the factory's own mask first.
- * A job's header has "Start review talk": it prepares the job's review talk folder outside every repository and hands the browser a link that opens
- * Claude Desktop on it (`talk.ts`). The talk's one tool posts a proposed guideline text back to `POST /review/proposal`, with the shared token; the page
+ * A job's header has "Start review talk": it prepares the job's review talk folder outside every repository and opens it as a Claude Code session in
+ * Orca (`talk.ts`). The talk's one tool posts a proposed guideline text back to `POST /review/proposal`, with the shared token; the page
  * shows the newest proposal per job as before → after on the Guideline tab (`diff.ts`) and saves nothing.
  * Only the owner's browser on this machine is answered: every request must come over loopback, name a loopback Host and carry no foreign Origin, and
  * DSH's own connection service must let it in: the page has no sign-in of its own and uses the one DSH's chat window uses (`ReviewSignIn`), so an
@@ -27,7 +27,7 @@ import {
   type StepOutcome, type StepWhy, type TimelineStep,
 } from './records.ts'
 import { TextDiff, type DiffLine } from './diff.ts'
-import { GuidelineProposals, ReviewTalks, TalkComments, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
+import { GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkRefusal, TalkTexts, type GuidelineProposal, type TalkState } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 
 /** Where the page gets the shared token from, on every request. `undefined` means there is no usable token. */
@@ -180,8 +180,7 @@ export class ReviewPage {
   static readonly NO_GUIDELINE = 'No guideline yet. The first review talk writes version 1.'
   static readonly NO_GUIDELINE_FOLDER = 'The guideline folder was not found, so the super agent is running without a guideline.'
   static readonly START_TALK = 'Start review talk'
-  static readonly TALK_OPENED = 'Review talk opened in Claude Desktop. Confirm the folder there and press send.'
-  static readonly OPEN_AGAIN = 'Open Claude Desktop again'
+  static readonly TALK_OPENED = 'Review talk opened in Orca. Trust the folder there and approve the zees-factory-propose server if asked.'
   static readonly FRESH_TALK = 'Start a fresh talk instead'
   static readonly CANNOT_PREPARE = 'The review talk could not be prepared: '
   /** The event the comment field's script sends on the page once a comment is saved. */
@@ -309,9 +308,8 @@ export class ReviewPage {
   }
 
   /**
-   * The review talk button's part of the script. A click posts the job to the talk address; the answer says what to show. When a talk was prepared it
-   * shows the notice with "Open Claude Desktop again" and opens the answer's `claude://` link, which hands it to Claude Desktop: the page does not
-   * navigate away. When the talk was started before, it shows the notice that names it, with "Start a fresh talk instead", which posts again with
+   * The review talk button's part of the script. A click posts the job to the talk address; the answer says what to show. When a talk was opened in
+   * Orca it shows the notice that says so: the page does not navigate away. When the talk was started before, it shows the notice that names it, with "Start a fresh talk instead", which posts again with
    * `fresh`. A refusal, or any other answer that is not OK, shows its reason (the answer's `error`, else the HTTP status) in the notice, marked as a
    * refusal. Every text is set as text, never as markup. The button is disabled while a start runs, and a click then, on it or on the fresh link, is
    * ignored. A job with no comment yet gets the button disabled, with the hint beside it; the first comment saved on the page enables it and removes the
@@ -328,12 +326,10 @@ export class ReviewPage {
     ready = true; sync()
     const hint = document.getElementById('talk-hint'); if (hint) hint.remove()
   })
-  const openLink = link => { const anchor = document.createElement('a'); anchor.href = link; anchor.click() }
-  const show = (text, again, fresh, refused) => {
+  const show = (text, fresh, refused) => {
     notice.replaceChildren()
     notice.classList.toggle('refused', refused === true)
     const words = document.createElement('span'); words.textContent = text; notice.append(words)
-    if (again) { const link = document.createElement('a'); link.href = again.link; link.textContent = again.label; notice.append(' ', link) }
     if (fresh) {
       const link = document.createElement('a'); link.href = '#'; link.id = 'fresh-talk'; link.className = 'small'; link.textContent = fresh
       link.addEventListener('click', event => { event.preventDefault(); void start(true) })
@@ -353,13 +349,13 @@ export class ReviewPage {
       answer = await fetch(${JSON.stringify(ReviewRoute.TALK_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ project: button.dataset.project, job_id: button.dataset.job, fresh }) })
       body = await answer.json().catch(() => ({}))
-    } catch { show(${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}, undefined, undefined, true); return }
+    } catch { show(${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page did not answer`)}, undefined, true); return }
     if (!answer.ok) {
       const reason = typeof body.error === 'string' && body.error !== '' ? body.error : ${JSON.stringify(`${ReviewPage.CANNOT_PREPARE}the review page answered HTTP `)} + answer.status
-      show(reason, undefined, undefined, true); return
+      show(reason, undefined, true); return
     }
-    if (body.opened === true && typeof body.link === 'string') { show(body.notice, { link: body.link, label: body.again }); openLink(body.link) }
-    else show(body.notice, undefined, body.fresh)
+    if (body.opened === true) show(body.notice)
+    else show(body.notice, body.fresh)
   }
   button.addEventListener('click', () => { void start(false) })
   const fresh = document.getElementById('fresh-talk')
@@ -470,10 +466,10 @@ ${panel}
     return `${button}\n<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>`
   }
 
-  /** The review talk notice for a talk that was started before: its date, and its name to find it by in Claude Desktop. */
+  /** The review talk notice for a talk that was started before: its date, and its name to find its tab by in Orca. */
   static talkStarted(talk: TalkState): string {
     const day = new Date(talk.started).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-    return `A review talk for this job was started on ${day}. Continue it in Claude Desktop: '${talk.title}'.`
+    return `A review talk for this job was started on ${day}. Continue it in Orca: '${talk.title}'.`
   }
 
   /**
@@ -782,8 +778,9 @@ type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal'
  * object, an automatic answer's step or the job's start or stop row as `step_id`, 404 for a job no listed project holds or a step not in that job, 413 for a
  * body over 64 KiB, and 401 without DSH's sign-in. It is the page's only address that writes a record, and it writes nothing but a comment line.
  * `POST /review/talk` takes `{ project, job_id, fresh? }` from the page's button and prepares the job's review talk folder (`ReviewTalks`, outside every
- * repository and every project): 200 with the `claude://` link and the notice, or, for a job whose talk was started before, 200 with the notice that
- * names it and no link, unless `fresh` is true. 409 for a job with no comment, 503 when the talk cannot be prepared, 404 for an unknown job.
+ * repository and every project) and opens it in Orca: 200 with the notice, or, for a job whose talk was started before, 200 with the notice that
+ * names it and opens nothing, unless `fresh` is true. 409 for a job with no comment, 503 when Orca was not found, when the talk cannot be prepared or
+ * when an Orca step fails, naming the step; 404 for an unknown job.
  * `POST /review/proposal` is the review talk's tool posting `{ job_id, text }`: like `/assess` it takes no sign-in and no Origin but the shared token in
  * `x-factory-token`, and its 200 answer sends the token back. The text is kept in memory as the newest proposal of that job, which must be a listed job
  * whose talk was started: 400 for a bad body or a text equal to the current version, 404 for an unknown job, 409 for a job with no talk, 413 over 64 KiB.
@@ -809,7 +806,7 @@ export class ReviewRoute {
   readonly proposals = new GuidelineProposals()
   /**
    * `talks` prepares the review talks; by default under `TalkFolder.ROOT`, with the token file of `tokens` (when it is a `SharedTokenFile`) and the
-   * propose server next to the records module's built file.
+   * propose server next to the records module's built file, and with no `orca` program, so the default refuses every start; the plugin passes its own.
    */
   constructor(projects: readonly string[], tokens: ReviewTokenSource = new SharedTokenFile(), private readonly records: RecordsSource = new FactoryRecordsModule(),
     private readonly now: () => Date = () => new Date(), talks?: ReviewTalks) {
@@ -818,7 +815,8 @@ export class ReviewRoute {
     this.projects = [...new Set(projects.map(project => resolve(project)))]
     this.access = new ReviewAccess(tokens)
     this.writer = new ReviewWriter(records)
-    this.talks = talks ?? new ReviewTalks({ records, tokenFile: tokens instanceof SharedTokenFile ? tokens.path : SharedTokenFile.DEFAULT_PATH, words: ReviewPage, now })
+    this.talks = talks ?? new ReviewTalks({ records, tokenFile: tokens instanceof SharedTokenFile ? tokens.path : SharedTokenFile.DEFAULT_PATH, words: ReviewPage, now,
+      orca: new OrcaLauncher({ program: undefined }) })
   }
 
   /** Adds the page's four addresses to the web server and returns the function that removes them. */
@@ -946,7 +944,7 @@ export class ReviewRoute {
     if (job === undefined) throw new ReviewRefusal(404, 'No listed project holds that job')
     // The address the talk's tool posts to: this web server, on loopback.
     const started = await this.talks.start(job, `http://127.0.0.1:${port}${ReviewRoute.PROPOSAL_PATH}`, fresh === true)
-    if (started.opened) ReviewRoute.sendJson(res, 200, { opened: true, link: started.link, notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN })
+    if (started.opened) ReviewRoute.sendJson(res, 200, { opened: true, notice: ReviewPage.TALK_OPENED })
     else ReviewRoute.sendJson(res, 200, { opened: false, notice: ReviewPage.talkStarted(started.state), fresh: ReviewPage.FRESH_TALK })
   }
 

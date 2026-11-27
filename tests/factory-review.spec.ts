@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
 import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn } from '../src/factory/review.ts'
-import { ReviewTalks, TalkComments, TalkFolder } from '../src/factory/talk.ts'
+import { OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, type OrcaRun } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
@@ -41,9 +41,17 @@ const origin = () => `http://127.0.0.1:${port}`
 /** Where the tests' review talks go, and the stand-in for the built propose server that a talk's `.mcp.json` names. */
 const talkRoot = () => join(root, 'review-talks')
 const proposeServer = () => join(root, 'proposeServer.js')
-/** The review talks of the test's page: under the test's folder, never under the owner's home. */
+/** Every Orca command the test's review talks ran, as argument lists. Nothing is really run: the stand-in only writes each one down. */
+let orcaCalls: string[][] = []
+beforeEach(() => { orcaCalls = [] })
+const orcaRunner = { run: async (_program: string, args: readonly string[]): Promise<OrcaRun> => {
+  orcaCalls.push([...args])
+  return { ok: true, stdout: args[1] === 'list' ? JSON.stringify({ result: { repos: [] } }) : '' }
+} }
+/** The review talks of the test's page: under the test's folder, never under the owner's home, and opened in a stand-in for Orca. */
 const talksFor = (records: FactoryRecordsModule, serverFile: string = proposeServer()) =>
-  new ReviewTalks({ records, tokenFile: tokenPath(), words: ReviewPage, root: talkRoot(), serverFile, now: () => new Date(NOW) })
+  new ReviewTalks({ records, tokenFile: tokenPath(), words: ReviewPage, root: talkRoot(), serverFile, now: () => new Date(NOW),
+    orca: new OrcaLauncher({ program: '/opt/homebrew/bin/orca', root: talkRoot(), runner: orcaRunner }) })
 let reviewRoute: ReviewRoute | undefined
 /**
  * The `Cookie` header of a browser signed in to DSH at 127.0.0.1: DSH names its cookie after the address, `dsh-auth-<hash>`, and signs its value
@@ -761,7 +769,12 @@ it('is wired into the plugin for the review talk: a start writes .mcp.json with 
   // The plugin's talks go under `TalkFolder.ROOT`, read when it is applied: pointed at the test's folder here, so nothing lands in the owner's home.
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
-  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  // A stand-in orca, named by the review.orca setting: it writes down its arguments and runs nothing, so no real Orca is ever called from here.
+  const orca = join(root, 'fake-orca'), orcaLog = join(root, 'fake-orca.log')
+  writeFileSync(orca, `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> '${orcaLog}'; done\nprintf -- '--\\n' >> '${orcaLog}'\n`
+    + `[ "$2" = list ] && printf '%s' '{"result":{"repos":[]}}'\nexit 0\n`)
+  chmodSync(orca, 0o755)
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, review: { orca } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
   const cookie = DSH_COOKIE
   const started = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie }, JSON.stringify({ project, job_id: 'job-1' }))
@@ -771,6 +784,10 @@ it('is wired into the plugin for the review talk: a start writes .mcp.json with 
   const mcp = JSON.parse(readFileSync(join(folder, '.mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args: string[] }> }
   const { args } = mcp.mcpServers[TalkFolder.SERVER_NAME]!
   expect([args[0], args[2], args[4]]).toEqual([join(dist, 'proposeServer.js'), 'http://127.0.0.1:3083/review/proposal', tokenPath()])
+  // The configured orca was the one run, with the pinned commands.
+  expect(readFileSync(orcaLog, 'utf8').split('--\n').filter(Boolean).map(call => call.trimEnd().split('\n'))).toEqual([['repo', 'list', '--json'],
+    ['repo', 'add', '--path', folder, '--kind', 'git'],
+    ['agent', 'launch', '--agent', 'claude', '--worktree', `path:${folder}`, '--surface', 'terminal', '--focus', '--prompt', 'Review talk · project job 1. Read opening.md in this folder and follow it.']])
 })
 
 /** An answer of the fixed checks, as the factory's `JobsReader` gives it. */
@@ -1162,24 +1179,26 @@ describe('the review talk and its proposals', () => {
   const filesOf = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
     .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).filter(name => !name.startsWith('.git/')).sort()
 
-  it('starts a talk on a signed-in click: the folder holds the pinned files and the job\'s files, and the answer carries the link and the notice', async () => {
+  it('starts a talk on a signed-in click: the folder holds the pinned files, the job\'s files and opening.md, Orca opens it, and the answer carries the notice', async () => {
     await serve()
     sample()
     const cookie = await signIn()
     const answer = await startTalk(cookie)
-    const body = JSON.parse(answer.text) as { opened: boolean; link: string; notice: string; again: string }
-    expect([answer.status, body.opened, body.notice, body.again]).toEqual([200, true, ReviewPage.TALK_OPENED, ReviewPage.OPEN_AGAIN])
+    const body = JSON.parse(answer.text) as Record<string, unknown>
+    expect([answer.status, body]).toEqual([200, { opened: true, notice: ReviewPage.TALK_OPENED }])
+    expect(ReviewPage.TALK_OPENED).toBe('Review talk opened in Orca. Trust the folder there and approve the zees-factory-propose server if asked.')
     const folder = talkFolder()
-    expect(filesOf(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json'])
+    expect(filesOf(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'opening.md', 'talk.json'])
     expect(readFileSync(join(folder, '.mcp.json'), 'utf8')).toContain(`"http://127.0.0.1:${port}/review/proposal"`)
-    expect(body.link.startsWith(`claude://code/new?folder=${encodeURIComponent(folder)}&q=`)).toBe(true)
-    const message = decodeURIComponent(body.link.split('&q=')[1]!)
+    expect(orcaCalls).toEqual([['repo', 'list', '--json'], ['repo', 'add', '--path', folder, '--kind', 'git'],
+      ['agent', 'launch', '--agent', 'claude', '--worktree', `path:${folder}`, '--surface', 'terminal', '--focus', '--prompt', 'Review talk · project job 1. Read opening.md in this folder and follow it.']])
+    const message = readFileSync(join(folder, 'opening.md'), 'utf8')
     for (const part of ['Review talk · project job 1', 'Good pace.', 'Reject this at this stage.', 'Keep it small.', 'never job text, comments, project code or a file path']) {
       expect(message).toContain(part)
     }
     // Opened later, the job shows the notice that names the talk, with the link that starts a fresh one.
     const page = dom((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie })).text)
-    expect(page.querySelector('#talk-notice span')!.textContent).toBe('A review talk for this job was started on 26 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.')
+    expect(page.querySelector('#talk-notice span')!.textContent).toBe('A review talk for this job was started on 26 Nov 2026. Continue it in Orca: \'Review talk · project job 1\'.')
     expect([page.querySelector('#talk-notice')!.hasAttribute('hidden'), page.querySelector('#fresh-talk')!.textContent]).toEqual([false, ReviewPage.FRESH_TALK])
     const button = page.querySelector<HTMLButtonElement>('#start-talk')!
     expect([button.textContent, button.dataset.project, button.dataset.job, button.closest('.head') !== null]).toEqual([ReviewPage.START_TALK, project, 'job-1', true])
@@ -1195,8 +1214,10 @@ describe('the review talk and its proposals', () => {
     const again = JSON.parse((await startTalk(cookie)).text) as Record<string, unknown>
     expect(again).toEqual({ opened: false, notice: expect.stringContaining('was started on 26 Nov 2026'), fresh: ReviewPage.FRESH_TALK })
     expect(filesOf(folder).map(name => readFileSync(join(folder, name), 'utf8'))).toEqual(before)
+    expect(orcaCalls.filter(args => args[1] === 'launch')).toHaveLength(1)
     put('reviews.jsonl', [review({ comment: 'Changed my mind.' })])
-    const fresh = JSON.parse((await startTalk(cookie, { project, job_id: 'job-1', fresh: true })).text) as { opened: boolean; link: string }
+    const fresh = JSON.parse((await startTalk(cookie, { project, job_id: 'job-1', fresh: true })).text) as { opened: boolean }
+    expect(orcaCalls.filter(args => args[1] === 'launch')).toHaveLength(2)
     expect([fresh.opened, readFileSync(join(folder, 'comments.md'), 'utf8').includes('Changed my mind.')]).toEqual([true, true])
   })
 
@@ -1367,7 +1388,7 @@ describe('the review talk and its proposals', () => {
         sent.push({ url, method: init.method ?? 'GET', body: init.body === undefined ? undefined : JSON.parse(init.body) })
         return answers(url, init)
       }
-      // A click on a link is where the browser would hand `claude://` to Claude Desktop; the stand-in writes it down instead.
+      // A click on a link would hand its address to the browser; the stand-in writes it down instead, so a test can show the page opens no link.
       view.HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) { opened.push(this.href) }
     } }).window
     const notice = () => window.document.querySelector('#talk-notice')!
@@ -1377,34 +1398,32 @@ describe('the review talk and its proposals', () => {
   }
   const json = (ok: boolean, body: unknown) => Promise.resolve({ ok, json: () => Promise.resolve(body) })
 
-  it('the button posts the job, shows the notice with "Open Claude Desktop again" and opens the link, without leaving the page', async () => {
-    const link = 'claude://code/new?folder=%2Ftalk&q=Review%20talk'
-    const page = talkBrowser({}, () => json(true, { opened: true, link, notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
+  it('the button posts the job and shows the notice that the talk opened in Orca, with no link, without leaving the page', async () => {
+    const page = talkBrowser({}, () => json(true, { opened: true, notice: ReviewPage.TALK_OPENED }))
     expect(page.notice().hasAttribute('hidden')).toBe(true)
     page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
     await settle(); await settle()
     expect(page.sent).toEqual([{ url: ReviewRoute.TALK_PATH, method: 'POST', body: { project, job_id: 'job-1', fresh: false } }])
     expect([page.notice().hasAttribute('hidden'), page.notice().querySelector('span')!.textContent]).toEqual([false, ReviewPage.TALK_OPENED])
-    expect([page.notice().querySelector('a')!.textContent, page.notice().querySelector('a')!.getAttribute('href')]).toEqual([ReviewPage.OPEN_AGAIN, link])
-    expect([page.opened, page.window.location.href]).toEqual([[link], 'http://127.0.0.1:3083/review'])
+    expect([page.notice().querySelector('a'), page.opened, page.window.location.href]).toEqual([null, [], 'http://127.0.0.1:3083/review'])
     page.window.close()
   })
 
   it('a second click shows the notice that names the talk; "Start a fresh talk instead" posts again with fresh; a refusal shows its reason', async () => {
     const answers = [
-      { ok: true, body: { opened: false, notice: 'A review talk for this job was started on 26 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.', fresh: ReviewPage.FRESH_TALK } },
-      { ok: true, body: { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN } },
+      { ok: true, body: { opened: false, notice: 'A review talk for this job was started on 26 Nov 2026. Continue it in Orca: \'Review talk · project job 1\'.', fresh: ReviewPage.FRESH_TALK } },
+      { ok: true, body: { opened: true, notice: ReviewPage.TALK_OPENED } },
       { ok: false, body: { error: 'The review talk could not be prepared: the factory\'s mask cannot be had' } },
     ]
     const page = talkBrowser({}, () => { const next = answers.shift()!; return json(next.ok, next.body) })
     page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
     await settle(); await settle()
-    expect(page.notice().querySelector('span')!.textContent).toContain('Continue it in Claude Desktop')
+    expect(page.notice().querySelector('span')!.textContent).toContain('Continue it in Orca')
     expect(page.opened).toEqual([])
     page.press(page.notice().querySelector('#fresh-talk')!)
     await settle(); await settle()
     expect(page.sent.map(each => (each.body as { fresh: boolean }).fresh)).toEqual([false, true])
-    expect(page.opened).toEqual(['claude://code/new?folder=x&q=y'])
+    expect([page.notice().querySelector('span')!.textContent, page.opened]).toEqual([ReviewPage.TALK_OPENED, []])
     page.window.document.querySelector<HTMLButtonElement>('#start-talk')!.click()
     await settle(); await settle()
     expect(page.notice().textContent).toBe('The review talk could not be prepared: the factory\'s mask cannot be had')
@@ -1414,7 +1433,7 @@ describe('the review talk and its proposals', () => {
   it('ignores a second click, on the button or the fresh link, while a start runs, and takes clicks again once it is answered', async () => {
     let answer: () => void = () => {}
     const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z' }, () => new Promise(resolve => {
-      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }) }) }
+      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, notice: ReviewPage.TALK_OPENED }) }) }
     }))
     const button = page.window.document.querySelector<HTMLButtonElement>('#start-talk')!
     button.click()
@@ -1423,7 +1442,7 @@ describe('the review talk and its proposals', () => {
     expect([page.sent.length, button.disabled]).toEqual([1, true])
     answer()
     await settle(); await settle()
-    expect([button.disabled, page.notice().querySelector('a')!.textContent, page.opened]).toEqual([false, ReviewPage.OPEN_AGAIN, ['claude://code/new?folder=x&q=y']])
+    expect([button.disabled, page.notice().querySelector('span')!.textContent, page.opened]).toEqual([false, ReviewPage.TALK_OPENED, []])
     button.click()
     expect(page.sent.length).toBe(2)
     page.window.close()
@@ -1432,7 +1451,7 @@ describe('the review talk and its proposals', () => {
   it('a job with no comment shows the button disabled with the hint; a comment saved on the page enables it and removes the hint, without a reload', async () => {
     const saves = [false, true]
     const page = talkBrowser({ reviews: [] }, url => url === ReviewRoute.COMMENT_PATH ? json(saves.shift()!, {})
-      : json(true, { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
+      : json(true, { opened: true, notice: ReviewPage.TALK_OPENED }))
     const document = page.window.document
     const button = document.querySelector<HTMLButtonElement>('#start-talk')!
     const hint = () => document.querySelector('#talk-hint')
@@ -1450,7 +1469,7 @@ describe('the review talk and its proposals', () => {
     expect([page.sent.map(each => each.url), button.disabled, hint()]).toEqual([[ReviewRoute.COMMENT_PATH, ReviewRoute.COMMENT_PATH], false, null])
     button.click()
     await settle(); await settle()
-    expect([page.sent[2]!.url, page.opened]).toEqual([ReviewRoute.TALK_PATH, ['claude://code/new?folder=x&q=y']])
+    expect([page.sent[2]!.url, page.notice().querySelector('span')!.textContent]).toEqual([ReviewRoute.TALK_PATH, ReviewPage.TALK_OPENED])
     page.window.close()
   })
 
@@ -1476,7 +1495,7 @@ describe('the review talk and its proposals', () => {
     expect([button.disabled, page.notice().textContent]).toEqual([true, TalkComments.NONE])
     // Again, with a comment saved while the start runs: the button is pressable once the start is answered, not before.
     const fresh = talkBrowser({ started: '2026-11-25T10:00:00.000Z', reviews: [] }, url => url === ReviewRoute.COMMENT_PATH ? json(true, {}) : new Promise(resolve => {
-      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }) }) }
+      answer = () => { resolve({ ok: true, json: () => Promise.resolve({ opened: true, notice: ReviewPage.TALK_OPENED }) }) }
     }))
     const again = fresh.window.document.querySelector<HTMLButtonElement>('#start-talk')!
     fresh.press(fresh.notice().querySelector('#fresh-talk')!)
@@ -1509,8 +1528,8 @@ describe('the review talk and its proposals', () => {
   })
 
   it('a job whose talk was started shows its notice on opening, and its fresh link posts with fresh', async () => {
-    const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z' }, () => json(true, { opened: true, link: 'claude://code/new?folder=x&q=y', notice: ReviewPage.TALK_OPENED, again: ReviewPage.OPEN_AGAIN }))
-    expect(page.notice().querySelector('span')!.textContent).toBe('A review talk for this job was started on 25 Nov 2026. Continue it in Claude Desktop: \'Review talk · project job 1\'.')
+    const page = talkBrowser({ started: '2026-11-25T10:00:00.000Z' }, () => json(true, { opened: true, notice: ReviewPage.TALK_OPENED }))
+    expect(page.notice().querySelector('span')!.textContent).toBe('A review talk for this job was started on 25 Nov 2026. Continue it in Orca: \'Review talk · project job 1\'.')
     page.press(page.notice().querySelector('#fresh-talk')!)
     await settle(); await settle()
     expect(page.sent).toEqual([{ url: ReviewRoute.TALK_PATH, method: 'POST', body: { project, job_id: 'job-1', fresh: true } }])
@@ -1686,15 +1705,15 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
   const filesUnder = (folder: string) => readdirSync(folder, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
     .map(entry => join(entry.parentPath, entry.name).slice(folder.length + 1)).filter(name => !name.startsWith('.git/')).sort()
   /** Starts the talk of the sample's job-a1, which has the whole job's comment, after a second comment on its permission answer. */
-  async function startSampleTalk(a: string, cookie: string): Promise<{ folder: string; link: string }> {
+  async function startSampleTalk(a: string, cookie: string): Promise<{ folder: string }> {
     expect((await comment(cookie, { project: a, job_id: 'job-a1', step_id: 'a1-2', comment: 'Keep to the minimum feature.' })).status).toBe(200)
     const answer = await call('POST', ReviewRoute.TALK_PATH, { origin: origin(), cookie, 'content-type': 'application/json' }, JSON.stringify({ project: a, job_id: 'job-a1' }))
-    const body = JSON.parse(answer.text) as { opened: boolean; link: string }
+    const body = JSON.parse(answer.text) as { opened: boolean }
     expect([answer.status, body.opened]).toEqual([200, true])
     const folder = readdirSync(talkRoot()).map(name => join(talkRoot(), name))[0]!
-    return { folder, link: body.link }
+    return { folder }
   }
-  /** Starts the server `.mcp.json` names as Claude Desktop would, `${HOME}` expanded, and calls its tool over standard input and output once per text. */
+  /** Starts the server `.mcp.json` names as Claude Code would, `${HOME}` expanded, and calls its tool over standard input and output once per text. */
   async function proposeOverStdio(folder: string, texts: readonly string[]): Promise<{ isError?: boolean; content: { text: string }[] }[]> {
     const mcp = JSON.parse(readFileSync(join(folder, '.mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args: string[] }> }
     const { command, args } = mcp.mcpServers[TalkFolder.SERVER_NAME]!
@@ -1728,11 +1747,11 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     const { a, cookie } = await serveSample()
     const recordsBefore = () => ({ actions: readFileSync(file('actions.jsonl', a), 'utf8'), reviews: readFileSync(file('reviews.jsonl', a), 'utf8'),
       guideline: Object.fromEntries(readdirSync(join(root, 'factory', 'guideline')).map(name => [name, readFileSync(join(root, 'factory', 'guideline', name), 'utf8')])) })
-    const { folder, link } = await startSampleTalk(a, cookie)
+    const { folder } = await startSampleTalk(a, cookie)
     const before = recordsBefore()
-    expect(filesUnder(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'talk.json'])
+    expect(filesUnder(folder)).toEqual(['.claude/settings.json', '.mcp.json', 'comments.md', 'guideline.md', 'job.md', 'opening.md', 'talk.json'])
     expect(readFileSync(join(folder, '.claude', 'settings.json'), 'utf8')).toBe(TalkFolder.SETTINGS)
-    const message = decodeURIComponent(link.split('&q=')[1]!)
+    const message = readFileSync(join(folder, 'opening.md'), 'utf8')
     for (const part of ['Review talk · project-a job 1', 'Good pace.', 'Keep to the minimum feature.', 'Reject a feature for an edge case', 'never job text, comments, project code or a file path']) {
       expect(message).toContain(part)
     }
@@ -1746,7 +1765,7 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect(readdirSync(join(a, FactoryRecordFile.FOLDER)).sort()).toEqual(['actions.jsonl', 'decisions.jsonl', 'requests.jsonl', 'reviews.jsonl'])
   })
 
-  it('writes masked copies only: a secret and the owner\'s home path planted raw in the job log, the comments and the guideline are in no talk file and no part of the link', async () => {
+  it('writes masked copies only: a secret and the owner\'s home path planted raw in the job log, the comments and the guideline are in no talk file and no Orca argument', async () => {
     const { a, cookie } = await serveSample()
     const secret = 'sk-made-up-0000000000000000', home = `${homedir()}/private-notes.md`
     // Planted raw, past every mask: straight into the files on disk.
@@ -1755,7 +1774,7 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     put('reviews.jsonl', [...lines('reviews.jsonl', a), JSON.stringify({ ts: '2026-11-22T12:30:00.000Z', project: a, job_id: 'job-a1', comment: `Never print ${secret}; see ${home}.` })], a)
     const v2 = join(root, 'factory', 'guideline', 'v2.md')
     writeFileSync(v2, `${readFileSync(v2, 'utf8')}- Keep ${secret} out of ${home}.\n`)
-    const { folder, link } = await startSampleTalk(a, cookie)
+    const { folder } = await startSampleTalk(a, cookie)
     for (const name of filesUnder(folder)) {
       const text = readFileSync(join(folder, name), 'utf8')
       expect([name, text.includes(secret), text.includes(homedir())]).toEqual([name, false, false])
@@ -1764,7 +1783,8 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect(readFileSync(join(folder, 'comments.md'), 'utf8')).toContain('~/private-notes.md')
     expect(readFileSync(join(folder, 'guideline.md'), 'utf8')).toContain('~/private-notes.md')
     expect(readFileSync(join(folder, 'job.md'), 'utf8')).toContain('~/private-notes.md')
-    const decoded = decodeURIComponent(link.split('&q=')[1]!)
-    expect([decoded.includes(secret), decoded.includes(homedir()), link.includes(encodeURIComponent(secret)), link.includes(encodeURIComponent(homedir()))]).toEqual([false, false, false, false])
+    expect(readFileSync(join(folder, 'opening.md'), 'utf8')).toContain('~/private-notes.md')
+    const argv = orcaCalls.flat().join('\n')
+    expect([orcaCalls.length > 0, argv.includes(secret), argv.includes('private-notes')]).toEqual([true, false, false])
   })
 })

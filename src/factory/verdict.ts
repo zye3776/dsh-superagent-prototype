@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto'
 import type { AssessRequest, Judge, Verdict } from './assess.ts'
 import { AssessRefusal, type Decision, type DecisionRead } from './decisions.ts'
-import type { AskedJudge, JudgeOpener } from './judge.ts'
+import type { AskedJudge, ConsultOptions, JudgeOpener } from './judge.ts'
 import { TempRule, type TempListed } from './temprule.ts'
 
 /** Thrown when the judge's answer is not one usable JSON object. The message says what is wrong, in words the judge can act on. */
@@ -306,9 +306,12 @@ export class ModelJudge implements Judge {
   static readonly UNUSABLE = 'The judge gave no usable answer, so no decision is written'
   static readonly NOT_OPENED = 'The judge session could not be opened, so no decision is written'
   static readonly NOT_ASKED = 'The judge could not be asked, so no decision is written'
-  constructor(private readonly judges: JudgeOpener, private readonly timeoutMs: number = ModelJudge.TIMEOUT_MS) {}
+  /** @param now - the clock the request's arrival is read from, so the judge's helper windows count from it; tests set it. */
+  constructor(private readonly judges: JudgeOpener, private readonly timeoutMs: number = ModelJudge.TIMEOUT_MS, private readonly now: () => number = Date.now) {}
 
   async decide(request: AssessRequest): Promise<Verdict> {
+    // The helper windows count from here: a question that waits behind another one, or a repair question, gets no fresh 30-second budget.
+    const arrived = this.now()
     const signal = AbortSignal.timeout(this.timeoutMs)
     const judge = await ModelJudge.opened(this.judges.open(request.project, request.session_id), signal)
     const question = new JudgeQuestion(request)
@@ -319,7 +322,8 @@ export class ModelJudge implements Judge {
     // The brief is taken when the question is sent, so a question that waits behind another one names the files as they are then.
     let text: string | (() => string) = () => question.text(judge.brief())
     for (let attempt = 1; ; attempt++) {
-      const reply = await ModelJudge.asked(judge, text, signal)
+      // The repair question uses no helpers: the first question's helpers already had the request's whole window.
+      const reply = await ModelJudge.asked(judge, text, signal, attempt === 1 ? { arrived } : { arrived, helpers: false })
       for (const path of reply.reads) if (!reads.includes(path)) reads.push(path)
       for (const path of reply.helperReads ?? []) if (!helperReads.includes(path)) helperReads.push(path)
       tokens += reply.tokens
@@ -349,8 +353,8 @@ export class ModelJudge implements Judge {
     }
   }
 
-  private static async asked(judge: AskedJudge, text: string | (() => string), signal: AbortSignal) {
-    try { return await judge.consult(text, signal) }
+  private static async asked(judge: AskedJudge, text: string | (() => string), signal: AbortSignal, options: ConsultOptions) {
+    try { return await judge.consult(text, signal, options) }
     catch { throw new AssessRefusal(503, signal.aborted ? ModelJudge.TOO_SLOW : ModelJudge.NOT_ASKED) }
   }
 }

@@ -379,6 +379,17 @@ describe('ModelJudge', () => {
     const broken: AskedJudge = { brief: () => 'brief', consult: () => Promise.reject(new Error('planted-detail')), readPath: () => undefined, pathOf: (path: string) => path }
     expect(await refusalOf(new ModelJudge({ open: async () => broken }).decide(requests.plain()))).toEqual({ status: 503, message: ModelJudge.NOT_ASKED })
   })
+
+  it('carries the request\'s arrival into both questions, read before the judge is opened, and lets the repair question use no helpers', async () => {
+    const seen: unknown[] = []
+    const replies = ['no JSON here', JSON.stringify(answer())]
+    const recording: AskedJudge = { brief: () => 'brief', readPath: () => undefined, pathOf: (path: string) => path,
+      consult: async (_text, _signal, options) => { seen.push(options); return { text: replies.shift() ?? '', reads: [], tokens: 0 } } }
+    let clock = 5_000
+    const judge = new ModelJudge({ open: async () => { clock = 7_000; return recording } }, undefined, () => clock)
+    expect((await judge.decide(requests.plain())).decision).toBe('approve')
+    expect(seen).toEqual([{ arrived: 5_000 }, { arrived: 5_000, helpers: false }])
+  })
 })
 
 describe('the temp-folder rule', () => {
@@ -665,7 +676,10 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     })
     const judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD), { spawner: fake.spawner })
     const verdict = await new ModelJudge(judges).decide(requests.editedScript())
-    expect(texts).toEqual(['Both are plain source files.'])
+    // The answer reaches the judge in the frame that marks it an untrusted summary, after the real factory's redaction.
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('untrusted summary of the project files it read')
+    expect(texts[0]!.split('\n').at(-2)).toBe('Both are plain source files.')
     expect(verdict.reads).toEqual([
       { path: inProject(RecordedRequests.SCRIPT), used: true },
       { path: inProject(RecordedRequests.SOURCE), used: true, by: 'helper' },

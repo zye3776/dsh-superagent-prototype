@@ -14,6 +14,7 @@ const COMMAND: HelperCommandBuilder = {
   mcpNames: stdout => { try { const parsed = JSON.parse(stdout) as unknown; return Array.isArray(parsed) ? parsed.map(item => String((item as { name: unknown }).name)) : null } catch { return null } },
   codex: names => ['codex', 'exec', ...names, '-'],
   prompt: (question, text) => text === undefined ? question : `${question}\n${text}`,
+  redact: text => text.replaceAll('sk-fake-secret', '[redacted-secret]'),
 }
 
 let project = ''
@@ -83,6 +84,55 @@ describe('HelperRunner', () => {
       expect(result.text, JSON.stringify(run)).toMatch(why)
       expect([result.reads, result.evidence]).toEqual([[], false])
     }
+  })
+
+  it('checks every file a Grep or Glob returned as a read, and gives no evidence when one is on the secret list', async () => {
+    /** Refuses any path whose last part is `.env`, as the factory guard does. */
+    const noEnv = (call: { name: string; arguments: Record<string, unknown> }) => !/(^|\/)\.env$/.test(String(call.arguments.file_path ?? call.arguments.path))
+    const leaks: { name: string; input: Record<string, unknown>; result: { content: unknown; structured?: Record<string, unknown> } }[] = [
+      // Glob, with the structured result Claude Code prints beside the text.
+      { name: 'Glob', input: { pattern: '**/.*' }, result: { content: 'config/.env', structured: { filenames: ['config/.env'], numFiles: 1 } } },
+      // Grep's default mode, text only.
+      { name: 'Grep', input: { pattern: 'KEY' }, result: { content: 'Found 1 file\nconfig/.env' } },
+      // Grep's content mode: the file's own lines, each after its path and line number, as a list of text blocks.
+      { name: 'Grep', input: { pattern: 'KEY', output_mode: 'content' }, result: { content: [{ type: 'text', text: 'config/.env:1:KEY=planted' }],
+        structured: { mode: 'content', filenames: [], content: 'config/.env:1:KEY=planted' } } },
+      // Grep's count mode.
+      { name: 'Grep', input: { pattern: 'KEY', output_mode: 'count' }, result: { content: 'config/.env:1' } },
+    ]
+    for (const leak of leaks) {
+      const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput('KEY is planted.', [leak]) }))
+      const result = await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000, noEnv))
+      expect(result, JSON.stringify(leak)).toEqual({ text: 'The helper gave no evidence (a search it ran returned a file on the secret list). Decide without it.', reads: [], evidence: false })
+    }
+    // A content line that only mentions a secret file in its own text is no read of it; each returned path is checked as a read of that file.
+    const checked: unknown[] = []
+    const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput('src/a-b.ts names it.', [
+      { name: 'Grep', input: { pattern: 'env', output_mode: 'content' }, result: { content: 'src/a-b.ts:3:load("config/.env")' } },
+      { name: 'Glob', input: { pattern: '*.md' }, result: { content: 'docs/x.md', structured: { filenames: ['docs/x.md'] } } }]) }))
+    const result = await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000, call => { checked.push(call); return noEnv(call) }))
+    expect([result.text, result.evidence]).toEqual(['src/a-b.ts names it.', true])
+    expect(checked).toEqual(expect.arrayContaining([{ name: 'read', arguments: { file_path: 'src/a-b.ts' } }, { name: 'read', arguments: { file_path: 'docs/x.md' } }]))
+    expect(checked).not.toContainEqual({ name: 'read', arguments: { file_path: 'src/a-b.ts:3:load("config/.env")' } })
+  })
+
+  it('reads the paths of a search result: a whole line each, or the starts of a Grep content or count line up to its first colon', () => {
+    expect(HelperRunner.foundPaths('Found 2 files\nsub/b.md\n\na.txt', 'whole')).toEqual(['Found 2 files', 'sub/b.md', 'a.txt'])
+    expect(HelperRunner.foundPaths('a-b.txt:3:x - y: z\nsrc/c.ts-4-context', 'prefixed')).toEqual(['a', 'a-b.txt', 'src/c.ts', 'src/c.ts-4'])
+  })
+
+  it('gives no evidence when a tool result belongs to no tool call the helper made', async () => {
+    const stdout = JSON.stringify([{ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'nobody', content: 'x' }] } },
+      { type: 'result', subtype: 'success', is_error: false, result: 'a' }])
+    const { runner: helpers } = runner(() => ({ code: 0, stdout }))
+    expect((await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000))).text).toMatch(/could not be read/)
+  })
+
+  it('redacts the secrets in a Claude or Codex helper\'s answer before the judge sees it', async () => {
+    const claude = runner(() => ({ code: 0, stdout: claudeOutput('The key is sk-fake-secret.') }))
+    expect((await claude.runner.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000))).text).toBe('The key is [redacted-secret].')
+    const codex = runner(argv => argv[1] === 'mcp' ? { code: 0, stdout: '[]' } : { code: 0, stdout: codexOutput('It sets sk-fake-secret.') })
+    expect((await codex.runner.run(job({ engine: 'codex', question: 'q', text: 't' }, Date.now() + 5_000))).text).toBe('It sets [redacted-secret].')
   })
 
   it('gives no evidence for a lone result object, whose reads cannot be checked, and caps an answer at 6000 characters', async () => {

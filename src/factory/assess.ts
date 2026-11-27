@@ -18,6 +18,9 @@
  * without the right key for the body's `session_id` is refused with 401 before any judge is asked, so no caller can put questions into another
  * session's judge thread. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
  * approve replaces it.
+ * A decision `/assess` writes for a request drops the approval held for that request's `request_key` (same session and project): the real call
+ * has now been decided, so the same call sent again is judged again and not allowed on the older approval. An ask that was still with the judge
+ * when `/assess` decided holds nothing when its approve comes back. Only `/assess` does this, never an ask, and never a refused request.
  * `POST /claim` is for the factory's hook (shared token, as `/assess`): when the same call reaches the hook, it posts the call's key and gets the held
  * approval's `decision_id`, once, with no model call. With nothing to claim the hook posts to `/assess` as before.
  */
@@ -164,9 +167,20 @@ export class AssessRoute {
     return () => { for (const remove of removers) remove() }
   }
 
-  /** Answers one `/assess` request: 200 with the decision line and the shared token in its header, or the status of the refusal with `{ error }`. */
+  /**
+   * Answers one `/assess` request: 200 with the decision line and the shared token in its header, or the status of the refusal with `{ error }`.
+   * Once the decision is written, whatever it is, the approval held for the request's `request_key` is dropped (`PendingApprovals.settle`): this is
+   * the decision on the real call. A refused request wrote no decision and drops nothing, and so does a body without a text `request_key`.
+   * It is done here and not in `assess()`, which `/ask` runs too: an ask never cancels an approval.
+   */
   handle(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
-    return this.answer(req, res, port, true, async body => this.assess(AssessRoute.requestOf(body)))
+    return this.answer(req, res, port, true, async body => {
+      const request = AssessRoute.requestOf(body)
+      const line = await this.assess(request)
+      const key = request.request_key
+      if (typeof key === 'string' && key !== '') this.approvals.settle({ request_key: key, session_id: request.session_id, project: request.project })
+      return line
+    })
   }
 
   /**
@@ -255,6 +269,8 @@ export class AssessRoute {
    * `{ decision, pending_until }`, where `decision` is the decision line as written and `pending_until` the moment the held approval expires
    * (ISO-8601, UTC), or `null` when the judge did not approve: then nothing new is held, and an approve held earlier for the same call stays
    * claimable until it expires (a weak ask cannot cancel it; a newer approve of the same call replaces it).
+   * `pending_until` is also `null` for an approve when `/assess` decided the same call while this ask was with the judge: the real call is
+   * already over, so nothing is held for it. The ask notes where the settlements stood before the judge is asked (`mark`) to tell.
    * The key is computed first, on the raw values, with the factory's own key function: the hook computes the same key for the real call. Then the
    * fields are masked with the factory's mask, as the hook masks a request, so the judge sees no secret and not who the owner is. Without the key
    * function or the mask the ask is refused with 503 before any judge is asked. The judged request has the shape of an `/assess` request, with a new
@@ -270,11 +286,12 @@ export class AssessRoute {
     // The masked session id names the judge Session, as it does for `/assess`, where the hook's masked record brings it.
     if (typeof session !== 'string' || session === '') throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
     if (ask.context !== undefined && typeof context !== 'string') throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
+    const since = this.approvals.mark()
     const line = await this.assess({ request_id: randomUUID(), request_key: key, project: ask.project, session_id: session, tool_name: masked.tool_name,
       tool_input: masked.tool_input, reason: masked.reason, ...(typeof context === 'string' ? { context } : {}) })
     const decision = JSON.parse(line) as DecisionLine
     const until = decision.decision === 'approve'
-      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }).toISOString()
+      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }, since)?.toISOString() ?? null
       : null
     // The line is put in as written, so the reply holds exactly what the decisions file holds.
     return `{"decision":${line},"pending_until":${JSON.stringify(until)}}`

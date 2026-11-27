@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { PendingApprovals } from '../src/factory/approvals.ts'
-import { AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type Verdict } from '../src/factory/assess.ts'
+import { AssessRefusal, AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type Verdict } from '../src/factory/assess.ts'
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
@@ -757,4 +757,149 @@ it('computes the ask key as the factory does: the pinned test vector', () => {
   // The token is trimmed first, so a line break after it changes nothing.
   expect(AskKey.compute(`${TOKEN}\n`, 'session-0001')).toBe(AskKey.compute(TOKEN, 'session-0001'))
   expect(AskKey.compute(TOKEN, 'session-0002')).not.toBe(AskKey.compute(TOKEN, 'session-0001'))
+})
+
+/**
+ * A judge a test steers while the route runs: `next` is the decision it gives from now on, `refusal` (when set) is thrown in its place, and
+ * `holdAsks()` makes every ask wait until the function it returns is called. An ask is told from the hook's request by its `request_id`:
+ * the route gives an ask a new random one, and the hook's requests in these tests are all named `hook-…`.
+ */
+class SteeredJudge implements Judge {
+  readonly seen: AssessRequest[] = []
+  next: Verdict['decision'] = 'approve'
+  refusal: AssessRefusal | undefined
+  private gate: Promise<void> | undefined
+  /** Makes asks wait from now on, and returns the function that lets them go on. */
+  holdAsks(): () => void {
+    let release = () => {}
+    this.gate = new Promise<void>(resolve => { release = resolve })
+    return () => { this.gate = undefined; release() }
+  }
+  async decide(asked: AssessRequest): Promise<Verdict> {
+    this.seen.push(asked)
+    const id = `d-${this.seen.length}`
+    if (!asked.request_id.startsWith('hook-') && this.gate) await this.gate
+    if (this.refusal) throw this.refusal
+    const decision = this.next
+    return { decision_id: id, request_id: asked.request_id, kind: 'permission', decision, choice: null, risk: 'low', tier: 3, tier_set_by: 'judge', reason: JUDGED,
+      alternative: decision === 'deny' ? 'Do it another way.' : '', cites: 'Ticket 26', reads: [], tokens: 7 }
+  }
+}
+/** What the hook posts to `/assess` for the real call `asking()` describes: the same key, session and project as `claiming()`. */
+const realCall = (fields: Record<string, unknown> = {}) => sample({ request_id: 'hook-real-1', request_key: claiming().request_key, session_id: 's1',
+  tool_input: { masked: asking().tool_input }, ...fields })
+const assessing = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = {}) => call('POST', realCall(fields), headers)
+const claimed = async (fields: Record<string, unknown> = {}) => (await claim(fields)).body.claimed
+
+it('drops the approval held for a call once /assess decides that call, whatever the decision', async () => {
+  for (const decision of ['approve', 'deny', 'ask_owner'] as const) {
+    const judge = new SteeredJudge()
+    await serve([project], writer(), judge)
+    // The ask was slow: the hook's claim missed, so the hook asked `/assess` for the real call while the approve was held.
+    expect((await ask()).body.pending_until, decision).not.toBeNull()
+    judge.next = decision
+    const assessed = await assessing()
+    expect([assessed.status, assessed.body.decision], decision).toEqual([200, decision])
+    // The same call sent again finds nothing to claim, so it is judged again.
+    expect(await claim().then(answer => [answer.status, answer.body.claimed, answer.body.decision_id]), decision).toEqual([200, false, null])
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+    server = undefined
+  }
+})
+
+it('holds nothing for an ask whose approve comes back after /assess decided the same call', async () => {
+  const judge = new SteeredJudge()
+  await serve([project], writer(), judge)
+  const release = judge.holdAsks()
+  const pending = ask()
+  // The ask is with the judge now; the real call arrives and is decided before the judge answers the ask.
+  await vi.waitFor(() => { expect(judge.seen).toHaveLength(1) })
+  expect((await assessing()).status).toBe(200)
+  release()
+  const asked = await pending
+  expect(asked.status).toBe(200)
+  expect((asked.body.decision as Record<string, unknown>).decision).toBe('approve')
+  expect(Object.keys(asked.body)).toEqual(['decision', 'pending_until'])
+  expect(asked.body.pending_until).toBeNull()
+  expect(await claimed()).toBe(false)
+  // Both decisions were written all the same.
+  expect(lines()).toHaveLength(2)
+})
+
+it('holds the approve of an ask that starts after /assess decided its call', async () => {
+  await serve([project], writer(), new SteeredJudge())
+  expect((await assessing()).status).toBe(200)
+  // A new ask is for a new call: the earlier decision does not stand in its way.
+  expect((await ask()).body.pending_until).toBe(new Date(Date.parse(NOW) + 120_000).toISOString())
+  expect(await claimed()).toBe(true)
+  expect(await claimed()).toBe(false)
+})
+
+it('leaves a held approval alone when /assess decides another key or another session, or names no key', async () => {
+  await serve([project], writer(), new SteeredJudge())
+  expect((await ask()).body.pending_until).not.toBeNull()
+  const others: Record<string, unknown>[] = [
+    { request_key: keyOf('s1', 'Bash', { command: 'ls' }) }, { session_id: 's2' }, { request_key: 123 }, { request_key: '' }, { request_key: undefined },
+  ]
+  for (const other of others) expect((await assessing(other)).status, JSON.stringify(other)).toBe(200)
+  expect(await claimed()).toBe(true)
+  expect(await claimed()).toBe(false)
+})
+
+it('leaves a held approval alone when /assess decides the same key for another project', async () => {
+  const second = join(root, 'second')
+  mkdirSync(join(second, DecisionsFile.FOLDER), { recursive: true })
+  await serve([project, second], writer(), new SteeredJudge())
+  expect((await ask()).body.pending_until).not.toBeNull()
+  expect((await assessing({ project: second })).status).toBe(200)
+  expect(await claimed()).toBe(true)
+})
+
+it('leaves a held approval alone when /assess refuses the request', async () => {
+  const judge = new SteeredJudge()
+  await serve([project], writer(), judge)
+  expect((await ask()).body.pending_until).not.toBeNull()
+  // Each of these is the real call's key, session and project, refused before or by the judge: nothing was decided, so nothing is settled.
+  expect((await assessing({ request_id: '' })).status).toBe(400)
+  expect((await assessing({}, { [SharedTokenFile.HEADER]: OTHER_TOKEN })).status).toBe(401)
+  expect((await assessing({}, { origin: 'http://example.com' })).status).toBe(403)
+  expect((await assessing({ reason: 'x'.repeat(AssessRoute.MAX_BODY_BYTES) })).status).toBe(413)
+  judge.refusal = new AssessRefusal(503, 'The judge gave no usable answer')
+  expect((await assessing()).status).toBe(503)
+  expect(lines()).toHaveLength(1)
+  expect(await claimed()).toBe(true)
+})
+
+it('leaves a held approval alone when /assess is refused for a project that is not listed', async () => {
+  await serve([project], writer(), new SteeredJudge())
+  expect((await ask()).body.pending_until).not.toBeNull()
+  // The key and session are the held approval's own; the project is not one the route serves.
+  expect((await assessing({ project: join(root, 'unlisted') })).status).toBe(403)
+  expect(await claimed()).toBe(true)
+})
+
+it('leaves a held approval alone when a later ask for the same call is denied', async () => {
+  const judge = new SteeredJudge()
+  await serve([project], writer(), judge)
+  expect((await ask()).body.pending_until).not.toBeNull()
+  for (const decision of ['deny', 'ask_owner'] as const) {
+    judge.next = decision
+    const again = await ask()
+    expect([(again.body.decision as Record<string, unknown>).decision, again.body.pending_until], decision).toEqual([decision, null])
+  }
+  // Ask A's approval is still there, once.
+  expect(await claimed()).toBe(true)
+  expect(await claimed()).toBe(false)
+})
+
+it('leaves a held approval alone when another session\'s ask is refused or denied', async () => {
+  const judge = new SteeredJudge()
+  await serve([project], writer(), judge)
+  expect((await ask()).body.pending_until).not.toBeNull()
+  // Session s2 asks about the same tool call with the wrong ask key (s1's), and is refused before any judge is asked.
+  expect((await ask({ session_id: 's2' }, { [AskKey.HEADER]: keyFor('s1') })).status).toBe(401)
+  judge.next = 'deny'
+  const denied = await ask({ session_id: 's2' })
+  expect([denied.status, denied.body.pending_until]).toEqual([200, null])
+  expect(await claimed()).toBe(true)
 })

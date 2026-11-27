@@ -1,5 +1,5 @@
 /**
- * The owner's decision guideline in the factory repository: read from the remote's `main`, and a new version saved there when the owner accepts a
+ * The owner's decision guideline in the factory repository: read from the remote's `main` (the save branch while one is set), and a new version saved on the save branch when the owner accepts a
  * review talk's proposal (architecture AD-18).
  *
  * Reading never uses a checkout, because a checkout may be another session's working folder: the fork reads `guideline/` from the factory
@@ -18,12 +18,14 @@
  * When a step fails the save stops there and says which step failed; nothing done before is undone, so a merge request that was opened stays open.
  * The worktree is removed in every case. git and glab run only through the runner they are given; tests give one that reaches no real remote.
  *
- * Until Epic 3 moves to main, the repository saved to is not the factory's: it is the save repository the `review.saveRepo` setting names, a clone
- * of a throwaway repository with its own remote (owner, 2026-11-27: "Throwaway repo for now"). Every step above runs there, and the version number
- * and the "main moved on" check come from that repository's `main`. While the setting is set the guideline is read from there too, so an accepted
- * version reaches the next session; the factory's own guideline is not read and not changed. Unset, nothing is saved.
+ * Until Epic 3 moves to main, the branch saved to is not `main`: it is the save branch the `review.saveBranch` setting names, a trial branch on
+ * the factory repository's remote (owner, 2026-11-27: "Factory repo, trial branch"). Every step above runs on that branch instead of `main`: the
+ * fetch, the commit the worktree is made from, the "moved on" check, the version number, the merge request's target and the merge. While it is set
+ * the guideline is read from that branch too, so an accepted version reaches the next session. Unset, nothing is saved and the guideline is read
+ * from `main`. It is switched to `main` only when the owner moves Epic 3 to `main`; until then `TrialBranchGuard` refuses a save branch that is
+ * `main` or the remote's default branch.
  */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, posix, resolve } from 'node:path'
 import { FactoryRecordsModule, RecordsRefusal, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobsSource, type RecordsMasker, type TrendReport } from './records.ts'
@@ -74,7 +76,7 @@ export class GuidelineFile {
   }
 }
 
-/** The factory repository and its remote's `main`, which the fork reads the guideline from and saves it to. */
+/** The factory repository and one branch of its remote (`main`, or the save branch), which the fork reads the guideline from and saves it to. */
 export class FactoryRemote {
   static readonly LOCAL_MS = 15_000
   static readonly NETWORK_MS = 60_000
@@ -83,13 +85,10 @@ export class FactoryRemote {
   readonly remote: string
   readonly branch: string
   readonly runner: OrcaRunner
-  /** How messages name the repository: "the factory repository", or "the save repository" for the `review.saveRepo` one. */
-  readonly name: string
   private cached: { commit: string; read: GuidelineRead } | undefined
   private repository: true | undefined
-  constructor(options: { repo: string; runner: OrcaRunner; remote?: string; branch?: string; name?: string }) {
+  constructor(options: { repo: string; runner: OrcaRunner; remote?: string; branch?: string }) {
     this.repo = resolve(options.repo)
-    this.name = options.name ?? 'the factory repository'
     this.runner = options.runner
     this.remote = options.remote ?? 'origin'
     this.branch = options.branch ?? 'main'
@@ -138,7 +137,7 @@ export class FactoryRemote {
   async read(at?: string): Promise<GuidelineRead> {
     const folder = join(this.repo, GuidelineFile.FOLDER)
     const commit = at ?? await this.head()
-    if (commit === undefined) return { folder, versions: [], current: null, reason: `The guideline could not be read: ${this.name} has no ${this.remote}/${this.branch} yet` }
+    if (commit === undefined) return { folder, versions: [], current: null, reason: `The guideline could not be read: the factory repository has no ${this.remote}/${this.branch} yet` }
     if (this.cached?.commit === commit) return this.cached.read
     const listed = await this.git(['ls-tree', '-z', commit, '--', `${GuidelineFile.FOLDER}/`])
     if (!listed.ok) return { folder, versions: [], current: null, reason: `The guideline could not be read from ${this.remote}/${this.branch}` }
@@ -170,83 +169,90 @@ export class FactoryRemote {
 }
 
 /**
- * The factory's records module, but with the decision guideline read from the factory repository's remote `main` instead of a checkout.
+ * A plain branch name for `review.saveBranch`: letters, digits, `.`, `_`, `-` and `/`, starting with a letter or digit; no `..`, no empty or
+ * dot-led part, no part ending in `.lock`, no `/` or `.` at the end, and not `HEAD`. It does not start with `refs/`, `heads/`, `remotes/` or `tags/`,
+ * so it never reads as another ref, and it is not `zees-factory` or under it, where each save pushes its own branch. A stricter subset of `git check-ref-format --branch`, so the
+ * name is safe in a refspec (no `:`, `+`, `*`, `^`, `~`, space or `@{`).
+ */
+export class SaveBranchName {
+  static readonly PATTERN = /^(?!HEAD$)(?!(?:refs|heads|remotes|tags)\/)(?!zees-factory(?:\/|$))(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\.lock(?:\/|$))[A-Za-z0-9][A-Za-z0-9._/-]*(?<![./])$/
+  static isPlain(name: string): boolean { return SaveBranchName.PATTERN.test(name) }
+}
+
+/**
+ * Until Epic 3 moves to main only: the save branch is never `main` and never the remote's default branch, so no save pushes to or merges into
+ * `main` while the epic is built (owner: "never push or merge to main"). It asks the remote which branch its default is (`git ls-remote --symref`);
+ * when that cannot be told, the save is refused too.
+ * At the move to main, delete this class and its one call in `RemoteGuidelineRecords.saveTarget`, then set `review.saveBranch` to `main`.
+ */
+export class TrialBranchGuard {
+  static readonly IS_MAIN = 'the save branch (review.saveBranch) is main or the remote\'s default branch; until Epic 3 moves to main, saves go only to a trial branch'
+  static readonly NO_DEFAULT = 'the remote\'s default branch could not be told, so the save branch could not be checked against it'
+  /** Rejects with `RecordsRefusal(503)` when `remote`'s branch is `main`, `master`, `<remote>/…` or the remote's default branch (any case), or when the default cannot be told. */
+  static async check(remote: FactoryRemote): Promise<void> {
+    // Compared without case: on a file system that ignores case, `Main` would share the local copy of `main`.
+    const branch = remote.branch.toLowerCase()
+    if (branch === 'main' || branch === 'master' || branch.startsWith(`${remote.remote.toLowerCase()}/`)) throw new RecordsRefusal(503, TrialBranchGuard.IS_MAIN)
+    const listed = await remote.git(['ls-remote', '--symref', '--', remote.remote, 'HEAD'], FactoryRemote.NETWORK_MS)
+    // `ref: refs/heads/<default>\tHEAD`
+    const found = listed.ok ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(listed.stdout) : null
+    if (found === null) throw new RecordsRefusal(503, TrialBranchGuard.NO_DEFAULT)
+    if (found[1]!.toLowerCase() === branch) throw new RecordsRefusal(503, TrialBranchGuard.IS_MAIN)
+  }
+}
+
+/**
+ * The factory's records module, but with the decision guideline read from the factory repository's remote `main` (its save branch while one is set) instead of a checkout.
  * The factory's own guideline reader is still asked first, only to find the repository (its `folder` is `<repository>/guideline`); with no repository
  * found, its answer and reason are kept. A factory folder that is not a git repository at all is no checkout of the factory repository and has no
  * remote: its own `guideline/` folder is read, as the factory's reader reads it (design default).
  *
- * The save repository (`saveRepo`, the `review.saveRepo` setting; owner, 2026-11-27: "Throwaway repo for now") is where Accept and "Write trend
- * report" save. One setting decides both sides: while it is set, the guideline is also read from that repository's remote `main`, never from the
- * factory, so the sessions, the review page, the trend report's input and the start-up fetch all see what was saved. While it is unset, the guideline
- * is read from the factory as before and nothing can be saved.
+ * The save branch (`saveBranch`, the `review.saveBranch` setting; owner, 2026-11-27: "Factory repo, trial branch") is the branch of the factory
+ * repository's remote that Accept and "Write trend report" save to. One setting decides both sides: while it is set, the guideline is also read from
+ * that branch, so the sessions, the review page, the trend report's input and the start-up fetch all see what was saved. While it is unset, the
+ * guideline is read from `main` and nothing can be saved.
  */
 export class RemoteGuidelineRecords extends FactoryRecordsModule {
-  static readonly NOT_A_REPOSITORY = 'the save repository (review.saveRepo) is not a git repository'
-  static readonly IS_FACTORY = 'the save repository (review.saveRepo) is the factory repository or shares a remote with it; until Epic 3 moves to main, saves go only to a throwaway repository'
+  static readonly NOT_PLAIN = 'the save branch (review.saveBranch) is not a plain branch name'
+  static readonly NOT_A_REPOSITORY = 'the factory folder is not a git repository, so there is no remote to save to'
+  /** The branch the save path runs on, or `undefined` while none is set; then nothing is saved and the guideline is read from `main`. */
+  readonly saveBranch: string | undefined
   private readonly runner: OrcaRunner
   private readonly remoteName: string | undefined
-  private readonly branch: string | undefined
   private readonly remotes = new Map<string, FactoryRemote>()
-  private readonly target: FactoryRemote | undefined
-  constructor(path: string | undefined, options: { runner: OrcaRunner; remote?: string; branch?: string; saveRepo?: string | undefined }) {
+  /** Throws a `TypeError` for a `saveBranch` that is not a plain branch name (`SaveBranchName`), so no odd name reaches a git call. */
+  constructor(path: string | undefined, options: { runner: OrcaRunner; remote?: string; saveBranch?: string | undefined }) {
     super(path)
+    if (options.saveBranch !== undefined && !SaveBranchName.isPlain(options.saveBranch)) throw new TypeError(RemoteGuidelineRecords.NOT_PLAIN)
     this.runner = options.runner
     this.remoteName = options.remote
-    this.branch = options.branch
-    this.target = options.saveRepo === undefined ? undefined : this.remoteOf(options.saveRepo, 'the save repository')
+    this.saveBranch = options.saveBranch
   }
-  /** The save repository's remote, or `undefined` while no save repository is set; then nothing is saved. */
-  saveRemote(): FactoryRemote | undefined { return this.target }
   /**
-   * The save repository's remote for a save, checked: rejects with `RecordsRefusal(503)` while none is set, and while it is the factory repository
-   * or shares a remote address with it (a worktree of the factory, a clone with the factory as a remote), so no save reaches the factory until
-   * Epic 3 moves to main. This check goes when the setting is meant to point at the factory.
+   * The factory repository's remote for a save, on the save branch, checked: rejects with `RecordsRefusal(503)` while no save branch is set, and
+   * while `TrialBranchGuard` refuses it, before any save step runs.
    */
   async saveTarget(): Promise<FactoryRemote> {
-    const target = this.target
-    if (target === undefined) throw new RecordsRefusal(503, GuidelineSaver.NO_SAVE_REPO)
-    const local = (await super.guidelineReader()).read()
-    // No factory repository found: there is nothing a save could reach.
-    if (local.folder === null) return target
-    const factory = await this.factoryRemote()
-    if (RemoteGuidelineRecords.realOf(target.repo) === RemoteGuidelineRecords.realOf(factory.repo)) throw new RecordsRefusal(503, RemoteGuidelineRecords.IS_FACTORY)
-    if (await factory.isRepository()) {
-      const ours = new Set(await RemoteGuidelineRecords.addressesOf(factory))
-      if ((await RemoteGuidelineRecords.addressesOf(target)).some(address => ours.has(address))) throw new RecordsRefusal(503, RemoteGuidelineRecords.IS_FACTORY)
-    }
-    return target
+    if (this.saveBranch === undefined) throw new RecordsRefusal(503, GuidelineSaver.NO_SAVE_BRANCH)
+    const remote = await this.factoryRemote()
+    if (!await remote.isRepository()) throw new RecordsRefusal(503, RemoteGuidelineRecords.NOT_A_REPOSITORY)
+    // Until Epic 3 moves to main only; drop this line with the guard then.
+    await TrialBranchGuard.check(remote)
+    return remote
   }
-  /** Every fetch and push address of a repository's remotes, as `git remote -v` gives them; none when git cannot say. */
-  private static async addressesOf(remote: FactoryRemote): Promise<string[]> {
-    const listed = await remote.git(['remote', '-v'])
-    if (!listed.ok) return []
-    return listed.stdout.split('\n').flatMap(line => { const found = /^\S+\t(.+) \((?:fetch|push)\)$/.exec(line.trim()); return found === null ? [] : [found[1]!.replace(/\/+$/, '')] })
-  }
-  private static realOf(path: string): string { try { return realpathSync(path) } catch { return resolve(path) } }
-  /** Where the guideline is read from: the save repository while one is set, else the factory repository. Rejects as `factoryRemote` does. */
-  async guidelineRemote(): Promise<FactoryRemote> { return this.target ?? await this.factoryRemote() }
-  private remoteOf(repo: string, name?: string): FactoryRemote {
-    return new FactoryRemote({ repo, runner: this.runner, ...(name === undefined ? {} : { name }), ...(this.remoteName === undefined ? {} : { remote: this.remoteName }), ...(this.branch === undefined ? {} : { branch: this.branch }) })
-  }
-  /** The factory repository's remote. Rejects with `RecordsRefusal(503)` when the repository was not found. */
+  /** The factory repository's remote, on the save branch while one is set, else on `main`. Rejects with `RecordsRefusal(503)` when the repository was not found. */
   async factoryRemote(): Promise<FactoryRemote> {
     const local = (await super.guidelineReader()).read()
     if (local.folder === null) throw new RecordsRefusal(503, local.reason ?? 'The factory repository was not found')
     const repo = dirname(resolve(local.folder))
     let remote = this.remotes.get(repo)
     if (remote === undefined) {
-      remote = this.remoteOf(repo)
+      remote = new FactoryRemote({ repo, runner: this.runner, ...(this.remoteName === undefined ? {} : { remote: this.remoteName }), ...(this.saveBranch === undefined ? {} : { branch: this.saveBranch }) })
       this.remotes.set(repo, remote)
     }
     return remote
   }
   override async guidelineReader(): Promise<GuidelineSource> {
-    if (this.target !== undefined) {
-      const target = this.target
-      const read: GuidelineRead = await target.isRepository() ? await target.read()
-        : { folder: join(target.repo, GuidelineFile.FOLDER), versions: [], current: null, reason: `The guideline could not be read: ${RemoteGuidelineRecords.NOT_A_REPOSITORY}`, reports: [] }
-      return { read: () => read }
-    }
     const local = (await super.guidelineReader()).read()
     if (local.folder === null) return { read: () => local }
     const remote = await this.factoryRemote()
@@ -313,7 +319,7 @@ export class FactoryRepoSave {
     const fetched = await remote.fetch()
     if (!fetched.ok) return FactoryRepoSave.failed('fetch', fetched.error)
     const commitOf = await remote.head()
-    if (commitOf === undefined) return FactoryRepoSave.failed('read', `${remote.name} has no ${remote.remote}/${remote.branch}`)
+    if (commitOf === undefined) return FactoryRepoSave.failed('read', `the factory repository has no ${remote.remote}/${remote.branch}`)
     let change: RepoChange
     try { change = prepare(await remote.read(commitOf)) } catch (error) {
       return FactoryRepoSave.failed('write', error instanceof RecordsRefusal ? error.message : 'the files could not be made')
@@ -322,6 +328,8 @@ export class FactoryRepoSave {
     const outside = paths.find(path => !FactoryRepoSave.inFolder(path))
     if (outside !== undefined || paths.length === 0) return FactoryRepoSave.failed('write', 'a save writes only files in the guideline folder')
     if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(change.branch) || change.branch.includes('..')) return FactoryRepoSave.failed('start', 'the branch name is not plain')
+    // The new branch is pushed on its own and merged by its merge request, so it is never the branch it is merged into.
+    if (change.branch === remote.branch) return FactoryRepoSave.failed('start', 'the new branch is the branch it would be merged into')
     let worktree: string | undefined
     try {
       try { worktree = mkdtempSync(join(this.root, 'zees-factory-save-')) } catch { return FactoryRepoSave.failed('worktree', 'the temporary folder for the worktree could not be made') }
@@ -415,7 +423,7 @@ export class TrendReports {
    */
   async file(version: number, read: GuidelineRead, written: 'accepted' | 'asked', now: Date): Promise<SaveFile> {
     const of = read.versions.find(each => each.version === version)
-    if (of === undefined) throw new RecordsRefusal(503, `v${version} is not on the save repository's main`)
+    if (of === undefined) throw new RecordsRefusal(503, `v${version} is not on the save branch`)
     // The version before it: the highest number below it.
     const before = read.versions.filter(each => each.version < version).sort((left, right) => right.version - left.version)[0] ?? null
     let jobs
@@ -438,13 +446,13 @@ export class TrendReports {
 export class GuidelineSaver {
   static readonly NOT_SAVED = 'Not saved: '
   static readonly NO_REPORTS = 'writing a trend report is not set up here'
-  /** Until Epic 3 moves to main, saves go only to a throwaway repository the owner names; with none named, nothing is saved (AD-18). */
-  static readonly NO_SAVE_REPO = 'no save repository is set (review.saveRepo)'
-  private readonly records: Pick<RemoteGuidelineRecords, 'saveRemote' | 'saveTarget' | 'maskerFor'>
+  /** Saves go only to the save branch the owner names, a trial branch until Epic 3 moves to main; with none named, nothing is saved (AD-18). */
+  static readonly NO_SAVE_BRANCH = 'no save branch is set (review.saveBranch)'
+  private readonly records: Pick<RemoteGuidelineRecords, 'saveBranch' | 'saveTarget' | 'maskerFor'>
   private readonly repo: FactoryRepoSave
   private readonly now: () => Date
   private readonly reports: TrendReports | undefined
-  constructor(options: { records: Pick<RemoteGuidelineRecords, 'saveRemote' | 'saveTarget' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date; reports?: TrendReports }) {
+  constructor(options: { records: Pick<RemoteGuidelineRecords, 'saveBranch' | 'saveTarget' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date; reports?: TrendReports }) {
     this.records = options.records
     this.repo = options.repo
     this.now = options.now ?? (() => new Date())
@@ -456,12 +464,12 @@ export class GuidelineSaver {
 
   /**
    * Saves `proposal` as the version after the remote's current one. `base` is the version the owner saw it against (`null`: none): when the
-   * remote's main moved on since, nothing is saved, so an Accept never silently undoes a version the owner did not see. With `reports` and a version
+   * save branch moved on since, nothing is saved, so an Accept never silently undoes a version the owner did not see. With `reports` and a version
    * before it, that version's trend report is written first and saved in the same commit; when it cannot be written, nothing is saved. It never throws.
    */
   async accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> {
-    // First of all, so with no save repository nothing runs: no mask, no fetch, no worktree, no git, no glab, no thread.
-    if (this.records.saveRemote() === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_REPO)
+    // First of all, so with no save branch nothing runs: no mask, no fetch, no worktree, no git, no glab, no thread.
+    if (this.records.saveBranch === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_BRANCH)
     if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
     this.running = true
     try { return await this.save(proposal, base) } catch { return GuidelineSaver.not('the save failed') } finally { this.running = false }
@@ -472,7 +480,7 @@ export class GuidelineSaver {
    * fork merges, replacing a report written before. It never throws.
    */
   async report(version: number): Promise<GuidelineSaved> {
-    if (this.records.saveRemote() === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_REPO)
+    if (this.records.saveBranch === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_BRANCH)
     if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
     if (this.reports === undefined) return GuidelineSaver.not(GuidelineSaver.NO_REPORTS)
     this.running = true
@@ -490,7 +498,7 @@ export class GuidelineSaver {
     if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
     try { remote = await this.saveRemote() } catch (error) { return not(GuidelineSaver.reasonOf(error, mask)) }
     const now = this.now()
-    // The report of the version being replaced is written before the save, from the remote's main as it is now; the save checks again after its fetch.
+    // The report of the version being replaced is written before the save, from the save branch as it is now; the save checks again after its fetch.
     let report: SaveFile | undefined
     if (base !== null && this.reports !== undefined) {
       // A fetch that fails stops here, before any thread is asked: the save's own fetch would fail the same way.
@@ -565,8 +573,8 @@ export class GuidelineSaver {
   }
 
   /**
-   * The save repository's remote, which every save step uses. Rejects with `RecordsRefusal(503)` when it is unset or is the factory's. A folder
-   * that is not a git repository fails at the fetch step, as git says (git never looks above it).
+   * The factory repository's remote on the save branch, which every save step uses. Rejects with `RecordsRefusal(503)` when no save branch is set
+   * or the guard refuses it, or the factory folder is not a git repository (git never looks above it).
    */
   private saveRemote(): Promise<FactoryRemote> { return this.records.saveTarget() }
 

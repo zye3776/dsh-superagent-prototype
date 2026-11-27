@@ -190,7 +190,7 @@ export class ReviewPage {
   static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
   static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
   static readonly REJECT = 'Reject'
-  static readonly SAVING_VERSION = 'Saving: a merge request into the save repository\'s main branch is opened and merged…'
+  static readonly SAVING_VERSION = 'Saving: a merge request into the factory\'s save branch is opened and merged…'
   static readonly NOT_ANSWERED = 'Not answered: the review page did not answer'
   static readonly OPEN_MR = 'Open the merge request'
   static readonly NO_REPORT_YET = 'No trend report yet'
@@ -201,7 +201,7 @@ export class ReviewPage {
   static writingTrend(version: number): string { return `Writing the trend report for v${version}…` }
   static replaceTrend(day: string): string { return `Replace the report written on ${day}?` }
   static readonly REPLACE_UNDATED = 'Replace the report written before?'
-  static savingWithReport(version: number): string { return `Saving: the trend report for v${version} is written first, then a merge request into the save repository's main branch is opened and merged…` }
+  static savingWithReport(version: number): string { return `Saving: the trend report for v${version} is written first, then a merge request into the factory's save branch is opened and merged…` }
   /** How often the page asks whether a proposal is waiting, in milliseconds; it also asks when its window gets focus. */
   static readonly POLL_MS = 5000
   /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */

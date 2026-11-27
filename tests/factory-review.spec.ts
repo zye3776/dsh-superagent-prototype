@@ -762,30 +762,28 @@ it('is wired into the plugin without DSH\'s connection service: the page refuses
   expect(proposed.answer.status).toBe(409)
 })
 
-it('is wired into the plugin for Accept and the guideline: with review.saveRepo set, sessions read the save repository\'s main after the start fetch, and Accept merges the new version and the old one\'s trend report there through the configured glab, leaving the factory untouched', async () => {
+it('is wired into the plugin for Accept and the guideline: with review.saveBranch set, sessions read that branch after the start fetch, and Accept merges the new version and the old one\'s trend report into it through the configured glab, leaving main untouched', async () => {
   const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
   const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
+  const TRIAL = 'zty3776/epic-3-guideline-trial'
   // A throwaway factory: a bare remote and a clone, the clone holding the records module so its guideline reader names the clone's folder.
-  const factoryBare = join(root, 'factory-remote.git'), factory = join(root, 'factory')
-  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', factoryBare)
-  git(root, 'clone', '--quiet', factoryBare, factory)
-  mkdirSync(join(factory, 'guideline'))
-  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nFactory only.\n')
-  git(factory, 'add', '.'); git(factory, '-c', 'user.name=Factory', '-c', 'user.email=f@example.invalid', 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
-  const factoryMain = git(factoryBare, 'rev-parse', 'main')
-  // The save repository (review.saveRepo): another bare remote and its clone, `target`.
-  const bare = join(root, 'remote.git'), target = join(root, 'target'), other = join(root, 'other')
+  const bare = join(root, 'remote.git'), factory = join(root, 'factory'), other = join(root, 'other')
   git(root, 'init', '--bare', '--quiet', '--initial-branch=main', bare)
-  git(root, 'clone', '--quiet', bare, target)
+  git(root, 'clone', '--quiet', bare, factory)
   // The plugin's git reads the owner's global config: the clone's own settings decide identity and signing here.
-  for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', '/dev/null']]) git(target, 'config', name!, value!)
-  mkdirSync(join(target, 'guideline'))
-  writeFileSync(join(target, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\n')
-  git(target, 'add', '.'); git(target, 'commit', '--quiet', '-m', 'v1'); git(target, 'push', '--quiet', 'origin', 'main')
-  // Another session merged v2 on the save repository's remote; the clone has not fetched it, and its checkout keeps v1.
+  for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', '/dev/null']]) git(factory, 'config', name!, value!)
+  mkdirSync(join(factory, 'guideline'))
+  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\n')
+  git(factory, 'add', 'guideline'); git(factory, 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main', `main:refs/heads/${TRIAL}`)
+  // Another session merged v2 on the trial branch, and main moved to a v5 of its own; the clone has not fetched them, and its checkout keeps v1.
   git(root, 'clone', '--quiet', bare, other)
+  git(other, 'checkout', '--quiet', '-b', 'trial', `origin/${TRIAL}`)
   writeFileSync(join(other, 'guideline', 'v2.md'), '# Guideline\nKeep to the minimum feature.\n')
-  git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(other, 'push', '--quiet', 'origin', 'main')
+  git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(other, 'push', '--quiet', 'origin', `HEAD:refs/heads/${TRIAL}`)
+  git(other, 'checkout', '--quiet', '-b', 'later', 'origin/main')
+  writeFileSync(join(other, 'guideline', 'v5.md'), '# Guideline\nMain only.\n')
+  git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v5'); git(other, 'push', '--quiet', 'origin', 'HEAD:refs/heads/main')
+  const main = git(bare, 'rev-parse', 'main')
   const records = recordsModule(factory)
   writeFileSync(join(factory, 'proposeServer.js'), '// stand-in for the built propose server\n')
   put('actions.jsonl', [action({ guideline_version: 'v2' })])
@@ -794,12 +792,14 @@ it('is wired into the plugin for Accept and the guideline: with review.saveRepo 
   const guardModule = join(root, 'guard.mjs')
   writeFileSync(guardModule, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
   const threads = fakeDsh(() => 'Fewer wide approvals under v2.')
-  // Stand-ins for orca and glab, named by the settings: glab's merge moves the bare remote's main to the commit it is given, as GitLab would.
+  // Stand-ins for orca and glab, named by the settings: glab's merge moves the merge request's target branch on the bare remote to the commit it
+  // is given, as GitLab would.
   const orca = join(root, 'fake-orca')
   writeFileSync(orca, `#!/bin/sh\n[ "$2" = list ] && printf '%s' '{"result":{"repos":[]}}'\nexit 0\n`)
-  const glab = join(root, 'fake-glab'), glabLog = join(root, 'fake-glab.log')
-  writeFileSync(glab, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${glabLog}'\nif [ "$2" = create ]; then echo 'https://gitlab.example/factory/-/merge_requests/9'; exit 0; fi\n`
-    + `while [ $# -gt 0 ]; do if [ "$1" = --sha ]; then git --git-dir='${bare}' update-ref refs/heads/main "$2"; exit $?; fi; shift; done\nexit 1\n`)
+  const glab = join(root, 'fake-glab'), glabLog = join(root, 'fake-glab.log'), glabTarget = join(root, 'fake-glab.target')
+  writeFileSync(glab, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${glabLog}'\n`
+    + `if [ "$2" = create ]; then while [ $# -gt 0 ]; do if [ "$1" = --target-branch ]; then printf '%s' "$2" > '${glabTarget}'; fi; shift; done; echo 'https://gitlab.example/factory/-/merge_requests/9'; exit 0; fi\n`
+    + `while [ $# -gt 0 ]; do if [ "$1" = --sha ]; then git --git-dir='${bare}' update-ref "refs/heads/$(cat '${glabTarget}')" "$2"; exit $?; fi; shift; done\nexit 1\n`)
   chmodSync(orca, 0o755); chmodSync(glab, 0o755)
   const registered: Route[] = []
   const { ctx } = pluginContext(registered, dsh)
@@ -808,9 +808,9 @@ it('is wired into the plugin for Accept and the guideline: with review.saveRepo 
   Object.assign(ctx, { on: (name: string, listener: (payload: { agent: unknown }) => Promise<unknown>) => { listeners[name] = listener; return () => {} } })
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
-  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab, saveRepo: target } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
-  // The start fetch runs in the background, in the save repository: wait for the clone's copy of main to reach v2.
-  for (let tries = 0; git(target, 'rev-parse', 'refs/remotes/origin/main') !== git(bare, 'rev-parse', 'main'); tries++) {
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab, saveBranch: TRIAL } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  // The start fetch runs in the background and brings the trial branch: wait for the clone's copy of it to reach v2.
+  for (let tries = 0; git(factory, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${TRIAL}`) !== git(bare, 'rev-parse', TRIAL); tries++) {
     if (tries > 200) throw new Error('the start fetch never landed')
     await new Promise(resolve => { setTimeout(resolve, 25) })
   }
@@ -823,6 +823,7 @@ it('is wired into the plugin for Accept and the guideline: with review.saveRepo 
     } finally { await session.fiber.dispose() }
   }
   expect(await sectionOf('main-1')).toContain('version 2')
+  expect(await sectionOf('main-1')).not.toContain('Main only.')
   // A talk, a proposal, then the owner's Accept through the plugin's own routes.
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
   const talk = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1' }))
@@ -837,23 +838,26 @@ it('is wired into the plugin for Accept and the guideline: with review.saveRepo 
   const accepted = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1', ts, answer: 'accept', base: 2 }))
   await handler('/review/answer')(accepted.req, accepted.res)
   expect([accepted.answer.status, JSON.parse(accepted.answer.text)]).toMatchObject([200, { answered: 'accepted', version: 3, mr: 'https://gitlab.example/factory/-/merge_requests/9' }])
-  expect(git(bare, 'show', 'main:guideline/v3.md')).toContain('Three.')
+  expect(git(bare, 'show', `${TRIAL}:guideline/v3.md`)).toContain('Three.')
   // The trend report of v2, the version Accept replaced, is in the same commit, written by one fresh thread that was asked about v2's job.
-  expect(git(bare, 'show', '--name-only', '--format=', 'main').split('\n').sort()).toEqual(['guideline/v2-trends.md', 'guideline/v3.md'])
-  const report = git(bare, 'show', 'main:guideline/v2-trends.md')
+  expect(git(bare, 'show', '--name-only', '--format=', TRIAL).split('\n').sort()).toEqual(['guideline/v2-trends.md', 'guideline/v3.md'])
+  const report = git(bare, 'show', `${TRIAL}:guideline/v2-trends.md`)
   expect(report).toMatch(/^---\nversion: 2\ndate: \d{4}-\d{2}-\d{2}\njobs: 1\ncompared_with: 1\nwritten: accepted\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n\nFewer wide approvals under v2\.\n/)
   expect([threads.agents.size, [...threads.agents.values()][0]!.asked[0]]).toMatchObject([1, expect.stringContaining('## Jobs under v2 (1)')])
-  expect(readFileSync(glabLog, 'utf8')).toContain('mr merge 9 --yes --auto-merge=false --sha')
-  expect(readdirSync(join(target, 'guideline'))).toEqual(['v1.md'])
+  // The merge request went into the trial branch, and was merged at the pushed commit.
+  const glabLines = readFileSync(glabLog, 'utf8')
+  expect(glabLines).toContain(`--target-branch ${TRIAL} `)
+  expect(glabLines).not.toContain('--target-branch main')
+  expect(glabLines).toContain('mr merge 9 --yes --auto-merge=false --sha')
+  expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
   expect(await sectionOf('main-2')).toContain('version 3')
-  // The factory repository: its remote's main, branches and guideline are as they were, and no session read its guideline.
-  expect([git(factoryBare, 'rev-parse', 'main'), git(factoryBare, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/')]).toEqual([factoryMain, 'main'])
-  expect(await sectionOf('main-3')).not.toContain('Factory only.')
-  expect([git(factory, 'worktree', 'list').split('\n').length, git(factory, 'rev-parse', 'refs/remotes/origin/main'), git(factory, 'status', '--porcelain')])
-    .toEqual([1, factoryMain, expect.not.stringContaining('guideline')])
+  // main: its commit and its guideline are as they were.
+  expect([git(bare, 'rev-parse', 'main'), git(bare, 'ls-tree', '--name-only', 'main', 'guideline/').split('\n')]).toEqual([main, ['guideline/v1.md', 'guideline/v5.md']])
+  expect([git(factory, 'worktree', 'list').split('\n').length, git(factory, 'branch', '--show-current'), git(factory, 'status', '--porcelain')])
+    .toEqual([1, 'main', expect.not.stringContaining('guideline')])
 })
 
-it('is wired into the plugin with review.saveRepo unset: the guideline is read from the factory, and "Write trend report" and Accept refuse before any thread, git or glab', async () => {
+it('is wired into the plugin with review.saveBranch unset: the guideline is read from main, and "Write trend report" and Accept refuse before any thread, git or glab', async () => {
   const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
   const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
   const bare = join(root, 'remote.git'), factory = join(root, 'factory')
@@ -862,6 +866,11 @@ it('is wired into the plugin with review.saveRepo unset: the guideline is read f
   mkdirSync(join(factory, 'guideline'))
   writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nFactory only.\n')
   git(factory, 'add', '.'); git(factory, '-c', 'user.name=Factory', '-c', 'user.email=f@example.invalid', 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
+  // A trial branch with a v2 of its own, which is not read while no save branch is set.
+  git(factory, 'checkout', '--quiet', '-b', 'trial')
+  writeFileSync(join(factory, 'guideline', 'v2.md'), '# Guideline\nTrial only.\n')
+  git(factory, 'add', '.'); git(factory, '-c', 'user.name=Factory', '-c', 'user.email=f@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(factory, 'push', '--quiet', 'origin', 'HEAD:refs/heads/zty3776/epic-3-guideline-trial')
+  git(factory, 'checkout', '--quiet', 'main')
   const before = git(bare, 'rev-parse', 'main')
   const records = recordsModule(factory)
   put('actions.jsonl', [action({ guideline_version: 'v1' })])
@@ -883,15 +892,16 @@ it('is wired into the plugin with review.saveRepo unset: the guideline is read f
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
   try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
-  // Sessions start with the factory's guideline, as before.
+  // Sessions start with main's guideline, as before.
   const session = new Context()
   try {
     await session.plugin(SystemPrompt)
     await listeners['agent/created']!({ agent: { id: 'main-1', ctx: session } })
-    expect((await session.systemPrompt.assemble()).sections.find(section => section.name === plugin.GuidelineSection.NAME)?.text).toContain('Factory only.')
+    const text = (await session.systemPrompt.assemble()).sections.find(section => section.name === plugin.GuidelineSection.NAME)?.text
+    expect([text, text]).toEqual([expect.stringContaining('Factory only.'), expect.not.stringContaining('Trial only.')])
   } finally { await session.fiber.dispose() }
   const handler = (path: string) => registered.find(route => route.path === path)!.handler
-  const refused = { error: 'Not saved: no save repository is set (review.saveRepo)' }
+  const refused = { error: 'Not saved: no save branch is set (review.saveBranch)' }
   const asked = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ version: 1 }))
   await handler('/review/trends')(asked.req, asked.res)
   expect([asked.answer.status, JSON.parse(asked.answer.text)]).toEqual([503, refused])

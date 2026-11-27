@@ -1,7 +1,7 @@
 /**
- * The guideline's save path and its reading from the remote's main, on a throwaway factory repository: a bare repository in a temporary folder
+ * The guideline's save path and its reading from the remote's save branch (or main), on a throwaway factory repository: a bare repository in a temporary folder
  * stands for the factory's remote, and a clone of it for the factory repository. git runs for real on them, with an empty global config so nothing of
- * the owner's git setup is read; glab is a stand-in whose merge moves the bare repository's main, so no test reaches GitLab or any real remote.
+ * the owner's git setup is read; glab is a stand-in whose merge moves the bare repository's target branch, so no test reaches GitLab or any real remote.
  * A last block reads a saved version back with the factory's real `GuidelineReader` when `ZEES_FACTORY_DIR` says where the factory is.
  */
 import { Context } from '@deepseek-ai/cordis'
@@ -16,14 +16,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { GuidelineSection, type GuidelineAgent } from '../src/factory/guideline.ts'
 import { FactoryRecordsModule, RecordsRefusal, type GuidelineSource } from '../src/factory/records.ts'
 import { ReviewPage } from '../src/factory/review.ts'
-import { FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, TrendReports } from '../src/factory/save.ts'
+import { FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, SaveBranchName, TrendReports, TrialBranchGuard } from '../src/factory/save.ts'
 import { ExecFileRunner, type GuidelineProposal, type OrcaRun, type OrcaRunner, type RunOptions } from '../src/factory/talk.ts'
 import { TrendPrompt, TrendReportFile, TrendWriter, type TrendAuthor, type TrendInput, type WrittenTrend } from '../src/factory/trends.ts'
 import { FAKE_RECORDS, PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
 const GLAB = '/stand-in/glab'
 const NOW = new Date('2026-11-27T10:15:30.000Z')
-let root = '', bare = '', factory = '', home = '', saves = '', emptyConfig = ''
+let root = '', bare = '', factory = '', saves = '', emptyConfig = ''
 const contexts: Context[] = []
 
 /** git on the test's own repositories, with no global or system config. */
@@ -31,14 +31,17 @@ function git(cwd: string, ...args: string[]): string {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'GIT_DIR' && name !== 'GIT_WORK_TREE'))
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
 }
+/** The save branch, the `review.saveBranch` setting the tests run with: a trial branch of the bare repository, next to its `main`. */
+const SAVE = 'zty3776/epic-3-guideline-trial'
+const tipOf = () => git(bare, 'rev-parse', `refs/heads/${SAVE}`)
 const mainOf = () => git(bare, 'rev-parse', 'refs/heads/main')
-const fileOnMain = (path: string) => git(bare, 'show', `main:${path}`)
-const filesOnMain = () => git(bare, 'ls-tree', '--name-only', 'main', 'guideline/').split('\n').filter(Boolean)
+const fileOnTip = (path: string) => git(bare, 'show', `${SAVE}:${path}`)
+const filesOnTip = () => git(bare, 'ls-tree', '--name-only', SAVE, 'guideline/').split('\n').filter(Boolean)
 const branchesOf = () => git(bare, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/').split('\n').filter(Boolean).sort()
 
 /**
  * The runner the tests give the save path: git runs for real, but only with the empty global config; glab is a stand-in that writes each call down.
- * Its `mr create` prints a merge request's address; its `mr merge` moves the bare repository's main to the merge request's branch, as GitLab would.
+ * Its `mr create` prints a merge request's address; its `mr merge` moves the merge request's target branch to its source branch, as GitLab would.
  */
 class TestRunner implements OrcaRunner {
   readonly calls: { program: string; args: string[]; cwd: string | undefined }[] = []
@@ -47,6 +50,7 @@ class TestRunner implements OrcaRunner {
   created = 'Creating merge request for zees-factory into main in factory\n\n!7 guideline\n https://gitlab.example/factory/-/merge_requests/7\n'
   private readonly real = new ExecFileRunner()
   private branch = ''
+  private target = ''
   async run(program: string, args: readonly string[], timeoutMs: number, options: RunOptions = {}): Promise<OrcaRun> {
     this.calls.push({ program, args: [...args], cwd: options.cwd })
     if (program === 'git') return this.real.run(program, args, timeoutMs, { ...options, env: { ...options.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } })
@@ -54,15 +58,16 @@ class TestRunner implements OrcaRunner {
     if (args[0] === 'mr' && args[1] === 'create') {
       if (this.fail.create !== undefined) return { ok: false, error: this.fail.create }
       this.branch = args[args.indexOf('--source-branch') + 1]!
+      this.target = args[args.indexOf('--target-branch') + 1]!
       return { ok: true, stdout: this.created }
     }
     if (args[0] === 'mr' && args[1] === 'merge') {
       if (this.fail.merge !== undefined) return { ok: false, error: this.fail.merge }
       const sha = args[args.indexOf('--sha') + 1]!
-      // The bare repository of the worktree glab runs in: the save repository's own remote, as GitLab would merge in that project.
+      // The bare repository of the worktree glab runs in, as GitLab would merge in that project, into the merge request's target branch.
       const remote = git(options.cwd!, 'remote', 'get-url', 'origin')
       if (git(remote, 'rev-parse', `refs/heads/${this.branch}`) !== sha) return { ok: false, error: 'the branch is not at that commit' }
-      git(remote, 'update-ref', 'refs/heads/main', sha)
+      git(remote, 'update-ref', `refs/heads/${this.target}`, sha)
       return { ok: true, stdout: 'Merged!' }
     }
     return { ok: false, error: 'unknown glab call' }
@@ -72,12 +77,11 @@ class TestRunner implements OrcaRunner {
 
 let runner = new TestRunner()
 /**
- * The factory's records stand-in, written into `factoryAt`, so its guideline reader names that folder's `guideline/`. `saveRepo` is the
- * `review.saveRepo` setting. By default the clone `factory` (of `bare`) is the save repository, and the factory is `home`, a repository of its own
- * with another remote, so the save tests run on one throwaway repository. `null` leaves the setting unset, and the clone is the factory then.
+ * The factory's records stand-in, written into the clone `factory`, so its guideline reader names that folder's `guideline/`. `saveBranch` is the
+ * `review.saveBranch` setting: by default the trial branch `SAVE`; `null` leaves it unset, so the guideline is read from `main` and nothing is saved.
  */
-const records = (saveRepo: string | null = factory, factoryAt: string = saveRepo === null ? factory : home) =>
-  new RemoteGuidelineRecords(recordsModule(factoryAt), { runner, saveRepo: saveRepo ?? undefined })
+const records = (saveBranch: string | null = SAVE) =>
+  new RemoteGuidelineRecords(recordsModule(factory), { runner, saveBranch: saveBranch ?? undefined })
 const saverOf = (of: RemoteGuidelineRecords = records(), glab: string | null = GLAB) =>
   new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: glab ?? undefined, root: saves }), now: () => NOW })
 const proposal = (text: string, fields: Partial<GuidelineProposal> = {}): GuidelineProposal =>
@@ -103,10 +107,8 @@ beforeEach(() => {
   git(factory, 'add', 'guideline/v1.md', 'README.md')
   git(factory, 'commit', '--quiet', '-m', 'v1')
   git(factory, 'push', '--quiet', 'origin', 'main')
-  // The factory when the clone above is the save repository: a repository whose remote is another one, never fetched.
-  home = join(root, 'home')
-  git(root, 'init', '--quiet', '--initial-branch=main', home)
-  git(home, 'remote', 'add', 'origin', join(root, 'home.git'))
+  // The trial branch saves go to, at main's commit; the push also gives the clone its copy, origin/<branch>.
+  git(factory, 'push', '--quiet', 'origin', `main:refs/heads/${SAVE}`)
   runner = new TestRunner()
 })
 afterEach(async () => {
@@ -115,72 +117,72 @@ afterEach(async () => {
 })
 
 describe('Accept saves the next version through a merge request', () => {
-  it('creates v2 on the remote\'s main from one pushed commit, merged at once, with v1 unchanged and no worktree left', async () => {
-    const before = mainOf()
-    const v1 = fileOnMain('guideline/v1.md')
+  it('creates v2 on the save branch from one pushed commit, merged at once, with v1 unchanged and no worktree left', async () => {
+    const before = tipOf()
+    const v1 = fileOnTip('guideline/v1.md')
     const saved = await saverOf().accept(proposal('# Guideline\nKeep to the minimum feature.\n'), 1)
     expect(saved).toEqual({ saved: true, version: 2, mr: 'https://gitlab.example/factory/-/merge_requests/7' })
-    expect(git(bare, 'rev-list', '--count', `${before}..main`)).toBe('1')
-    expect(filesOnMain()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
-    expect(fileOnMain('guideline/v1.md')).toBe(v1)
-    expect(fileOnMain('guideline/v2.md')).toBe('---\nversion: 2\ndate: 2026-11-27\nfrom_job: job-a1\nfrom_version: 1\n---\n# Guideline\nKeep to the minimum feature.')
+    expect(git(bare, 'rev-list', '--count', `${before}..${SAVE}`)).toBe('1')
+    expect(filesOnTip()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
+    expect(fileOnTip('guideline/v1.md')).toBe(v1)
+    expect(fileOnTip('guideline/v2.md')).toBe('---\nversion: 2\ndate: 2026-11-27\nfrom_job: job-a1\nfrom_version: 1\n---\n# Guideline\nKeep to the minimum feature.')
     // Only the version file changed, by the owner's own identity.
-    expect(git(bare, 'show', '--name-only', '--format=%an', 'main').split('\n').filter(Boolean)).toEqual(['Test Owner', 'guideline/v2.md'])
+    expect(git(bare, 'show', '--name-only', '--format=%an', SAVE).split('\n').filter(Boolean)).toEqual(['Test Owner', 'guideline/v2.md'])
     // The merge request: from a new branch into main, deleting no branch; merged at once and only at the pushed commit.
     const branch = 'zees-factory/guideline-v2-20261127T101530Z'
     expect(runner.glabCalls).toEqual([
-      ['mr', 'create', '--source-branch', branch, '--target-branch', 'main', '--title', 'guideline v2, from the review of factory-testbed job 3',
+      ['mr', 'create', '--source-branch', branch, '--target-branch', SAVE, '--title', 'guideline v2, from the review of factory-testbed job 3',
         '--description', 'Guideline v2, replacing v1, from the review talk on factory-testbed job 3. Accepted by the owner on the review page and merged by the fork.',
         '--remove-source-branch=false', '--yes'],
-      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', mainOf()],
+      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', tipOf()],
     ])
-    expect(branchesOf()).toEqual(['main', branch])
-    // The save repository's clone, its checkout and its branches are untouched; the save's worktree and its folder are gone.
+    expect(branchesOf()).toEqual(['main', branch, SAVE])
+    // The factory clone, its checkout and its branches are untouched; the save's worktree and its folder are gone. The remote's main never moved.
     expect([git(factory, 'branch', '--show-current'), git(factory, 'status', '--porcelain'), git(factory, 'branch', '--format=%(refname:short)')])
-      .toEqual(['main', '', 'main'])
+      .toEqual(['main', expect.stringMatching(/^\?\? records-\d+\.mjs$/), 'main'])
     expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
     expect(git(factory, 'worktree', 'list', '--porcelain').split('\n').filter(line => line.startsWith('worktree '))).toEqual([`worktree ${factory}`])
     expect(readdirSync(saves)).toEqual([])
-    // git never ran in a session's folder: only in the save repository, the save's own worktree, and the factory for the read-only check.
-    expect(new Set(runner.calls.filter(call => call.program === 'git').map(call => call.cwd === factory ? 'save repository' : call.cwd!.startsWith(saves) ? 'save' : call.cwd === home ? 'factory' : call.cwd)))
-      .toEqual(new Set(['save repository', 'save', 'factory']))
-    expect([...new Set(runner.calls.filter(call => call.cwd === home).map(call => call.args.join(' ')))].sort()).toEqual(['remote -v', 'rev-parse --git-dir'])
+    expect(mainOf()).toBe(before)
+    // git never ran in a session's folder: only in the factory clone and the save's own worktree.
+    expect(new Set(runner.calls.filter(call => call.program === 'git').map(call => call.cwd === factory ? 'factory' : call.cwd!.startsWith(saves) ? 'save' : call.cwd)))
+      .toEqual(new Set(['factory', 'save']))
   })
 
-  it('writes version 1 with no from_version when the remote\'s main has no guideline yet', async () => {
+  it('writes version 1 with no from_version when the save branch has no guideline yet', async () => {
     git(factory, 'rm', '--quiet', 'guideline/v1.md')
     git(factory, 'commit', '--quiet', '-m', 'no guideline')
-    git(factory, 'push', '--quiet', 'origin', 'main')
+    git(factory, 'push', '--quiet', 'origin', `HEAD:refs/heads/${SAVE}`)
     const saved = await saverOf().accept(proposal('First.\n'), null)
     expect(saved).toMatchObject({ saved: true, version: 1 })
-    expect(fileOnMain('guideline/v1.md')).toBe('---\nversion: 1\ndate: 2026-11-27\nfrom_job: job-a1\n---\nFirst.')
+    expect(fileOnTip('guideline/v1.md')).toBe('---\nversion: 1\ndate: 2026-11-27\nfrom_job: job-a1\n---\nFirst.')
   })
 
-  it('numbers the version from the remote\'s main after a fetch, not from the checkout', async () => {
+  it('numbers the version from the save branch after a fetch, not from the checkout', async () => {
     // Another session saved v2 on the remote; the factory clone has not fetched it.
     const other = join(root, 'other')
     git(root, 'clone', '--quiet', bare, other)
     writeFileSync(join(other, 'guideline', 'v2.md'), '---\nversion: 2\n---\nOther.\n')
     git(other, 'add', '.')
     git(other, '-c', 'user.name=Other', '-c', 'user.email=other@example.invalid', 'commit', '--quiet', '-m', 'v2')
-    git(other, 'push', '--quiet', 'origin', 'main')
+    git(other, 'push', '--quiet', 'origin', `HEAD:refs/heads/${SAVE}`)
     // Against the v1 the page showed, nothing is saved: the owner has not seen v2.
     const stale = await saverOf().accept(proposal('Third.\n'), 1)
     expect(stale).toEqual({ saved: false, reason: 'Not saved: the guideline is at v2 now, not the version this proposal was shown against. Reload the page and compare again.', mr: undefined })
-    expect(filesOnMain()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
+    expect(filesOnTip()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
     expect(readdirSync(saves)).toEqual([])
     const saved = await saverOf().accept(proposal('Third.\n'), 2)
     expect(saved).toMatchObject({ saved: true, version: 3 })
-    expect(fileOnMain('guideline/v3.md')).toContain('from_version: 2')
+    expect(fileOnTip('guideline/v3.md')).toContain('from_version: 2')
   })
 
   it('stores a planted secret masked, in the text and in the merge request', async () => {
     const saved = await saverOf().accept(proposal(`Never print ${PLANTED}.\n`, { project: `/projects/${PLANTED}` }), 1)
     expect(saved.saved).toBe(true)
-    expect(fileOnMain('guideline/v2.md')).toContain(`Never print ${REDACTED}.`)
-    expect(fileOnMain('guideline/v2.md')).not.toContain(PLANTED)
+    expect(fileOnTip('guideline/v2.md')).toContain(`Never print ${REDACTED}.`)
+    expect(fileOnTip('guideline/v2.md')).not.toContain(PLANTED)
     expect(JSON.stringify(runner.glabCalls)).not.toContain(PLANTED)
-    expect(git(bare, 'log', '-1', '--format=%B', 'main')).not.toContain(PLANTED)
+    expect(git(bare, 'log', '-1', '--format=%B', SAVE)).not.toContain(PLANTED)
   })
 
   it('merges by the branch\'s name when glab printed no merge request address', async () => {
@@ -203,8 +205,8 @@ describe('Accept saves the next version through a merge request', () => {
     await sections.attach(first)
     expect(await sectionOf(first)).toContain('version 1')
     expect((await saverOf(shared).accept(proposal('Keep to the minimum feature.\n'), 1)).saved).toBe(true)
-    // The factory clone's checkout still has only v1; the session reads the remote's main.
-    expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
+    // The factory clone's checkout and the remote's main still have only v1; the session reads the save branch.
+    expect([readdirSync(join(factory, 'guideline')), git(bare, 'ls-tree', '--name-only', 'main', 'guideline/')]).toEqual([['v1.md'], 'guideline/v1.md'])
     const next = await agent('session-2')
     await sections.attach(next)
     expect(await sectionOf(next)).toContain('version 2 (2026-11-27)')
@@ -215,15 +217,15 @@ describe('Accept saves the next version through a merge request', () => {
   })
 })
 
-describe('a failed step saves nothing on main and says which step failed', () => {
-  it('the merge fails: the merge request stays open with its address, main is unchanged, the worktree is removed', async () => {
+describe('a failed step saves nothing on the save branch and says which step failed', () => {
+  it('the merge fails: the merge request stays open with its address, the save branch is unchanged, the worktree is removed', async () => {
     runner.fail.merge = 'ERROR: merge conflict\nmore lines'
-    const before = mainOf()
+    const before = tipOf()
     const saved = await saverOf().accept(proposal('Two.\n'), 1)
     expect(saved).toEqual({ saved: false, reason: 'Not saved: the merge step failed: ERROR: merge conflict', mr: 'https://gitlab.example/factory/-/merge_requests/7' })
-    expect([mainOf(), filesOnMain()]).toEqual([before, ['guideline/v1.md']])
+    expect([tipOf(), filesOnTip()]).toEqual([before, ['guideline/v1.md']])
     // The pushed branch stays, as the merge request's source.
-    expect(branchesOf()).toEqual(['main', 'zees-factory/guideline-v2-20261127T101530Z'])
+    expect(branchesOf()).toEqual(['main', 'zees-factory/guideline-v2-20261127T101530Z', SAVE])
     expect(readdirSync(saves)).toEqual([])
   })
 
@@ -245,7 +247,7 @@ describe('a failed step saves nothing on main and says which step failed', () =>
       if (saved.dir === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = saved.dir
       if (saved.tree === undefined) delete process.env.GIT_WORK_TREE; else process.env.GIT_WORK_TREE = saved.tree
     }
-    expect(filesOnMain()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
+    expect(filesOnTip()).toEqual(['guideline/v1.md', 'guideline/v2.md'])
     expect(git(other, 'for-each-ref')).toBe('')
   })
 
@@ -253,7 +255,7 @@ describe('a failed step saves nothing on main and says which step failed', () =>
     runner.fail.create = 'could not find a GitLab host for https://user:secret-password@gitlab.example/factory.git'
     const saved = await saverOf().accept(proposal('Two.\n'), 1)
     expect(saved).toEqual({ saved: false, reason: 'Not saved: the merge request step failed: could not find a GitLab host for https://gitlab.example/factory.git', mr: undefined })
-    expect(filesOnMain()).toEqual(['guideline/v1.md'])
+    expect(filesOnTip()).toEqual(['guideline/v1.md'])
   })
 
   it('the push is refused: no branch on the remote, no glab call', async () => {
@@ -263,32 +265,29 @@ describe('a failed step saves nothing on main and says which step failed', () =>
     const saved = await saverOf().accept(proposal('Two.\n'), 1)
     expect(saved).toMatchObject({ saved: false, mr: undefined })
     expect((saved as { reason: string }).reason).toMatch(/^Not saved: the push step failed: /)
-    expect([branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([['main'], [], []])
+    expect([branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([['main', SAVE], [], []])
   })
 
-  it('the fetch fails: nothing is made', async () => {
-    git(factory, 'remote', 'set-url', 'origin', join(root, 'missing.git'))
+  it('the fetch fails, as when the save branch is not on the remote yet: nothing is made', async () => {
+    git(bare, 'update-ref', '-d', `refs/heads/${SAVE}`)
     const saved = await saverOf().accept(proposal('Two.\n'), 1)
     expect(saved).toMatchObject({ saved: false })
     expect((saved as { reason: string }).reason).toMatch(/^Not saved: the fetch step failed: /)
-    expect([readdirSync(saves), runner.glabCalls]).toEqual([[], []])
+    expect([readdirSync(saves), runner.glabCalls, branchesOf()]).toEqual([[], [], ['main']])
   })
 
-  it('without glab, without a save repository, or while another save runs, it refuses before any git call', async () => {
+  it('the remote cannot be reached: the guard cannot tell its default branch, so nothing is saved', async () => {
+    git(factory, 'remote', 'set-url', 'origin', join(root, 'missing.git'))
+    expect(await saverOf().accept(proposal('Two.\n'), 1)).toEqual({ saved: false, reason: `Not saved: ${TrialBranchGuard.NO_DEFAULT}`, mr: undefined })
+    expect([readdirSync(saves), runner.glabCalls, runner.calls.map(call => call.args[0])]).toEqual([[], [], ['rev-parse', 'ls-remote']])
+  })
+
+  it('without glab, without a save branch, or while another save runs, it refuses before any git call', async () => {
     expect(await saverOf(records(), null).accept(proposal('Two.\n'), 1)).toEqual({ saved: false, reason: `Not saved: ${FactoryRepoSave.NO_GLAB}`, mr: undefined })
-    // The save repository is the one setting that counts: a factory repository that was not found does not stop a save into it.
-    const none = new RemoteGuidelineRecords(recordsModule(root, FAKE_RECORDS.replace('return { folder: folder.pathname',
-      'return { folder: null, reason: \'The factory repository was not found.\', versions: [], current: null }; return { folder: folder.pathname')), { runner })
-    expect(await saverOf(none).accept(proposal('Two.\n'), 1)).toEqual({ saved: false, reason: 'Not saved: no save repository is set (review.saveRepo)', mr: undefined })
+    expect(await saverOf(records(null)).accept(proposal('Two.\n'), 1)).toEqual({ saved: false, reason: 'Not saved: no save branch is set (review.saveBranch)', mr: undefined })
     expect(runner.calls).toEqual([])
-    // A save repository that is not a git repository stops at the fetch, with no worktree and no glab call; the clone around it is not taken for it.
-    const plain = join(factory, 'plain'); mkdirSync(plain)
-    const notRepo = await saverOf(records(plain)).accept(proposal('Two.\n'), 1)
-    expect((notRepo as { reason: string }).reason).toMatch(/^Not saved: the fetch step failed: .*not a git repository/)
-    expect([readdirSync(saves), runner.glabCalls, runner.calls.filter(call => call.args[0] !== 'remote' && call.args[0] !== 'rev-parse').map(call => call.args[0])]).toEqual([[], [], ['fetch']])
-    runner.calls.length = 0
     const repo = new FactoryRepoSave({ glab: GLAB, root: saves })
-    const remote = new FactoryRemote({ repo: factory, runner })
+    const remote = new FactoryRemote({ repo: factory, runner, branch: SAVE })
     const one = repo.save(remote, () => ({ branch: 'zees-factory/one', title: 't', message: 'm', description: 'd', files: [{ path: 'guideline/v2.md', text: 'x\n' }] }))
     expect([repo.busy, await repo.save(remote, () => { throw new Error('never asked') })]).toEqual([true, { saved: false, step: 'start', error: FactoryRepoSave.BUSY, mr: undefined }])
     expect((await one).saved).toBe(true)
@@ -302,13 +301,16 @@ describe('a failed step saves nothing on main and says which step failed', () =>
 
   it('never writes over a file, never outside the guideline folder, and never on an odd branch name', async () => {
     const repo = new FactoryRepoSave({ glab: GLAB, root: saves })
-    const remote = new FactoryRemote({ repo: factory, runner })
+    const remote = new FactoryRemote({ repo: factory, runner, branch: SAVE })
     const change = (files: { path: string; text: string }[], branch = 'zees-factory/x') => () => ({ branch, title: 't', message: 'm', description: 'd', files })
     expect(await repo.save(remote, change([{ path: 'guideline/v1.md', text: 'edited\n' }]))).toEqual({ saved: false, step: 'write', error: 'guideline/v1.md exists already and is never written over', mr: undefined })
     for (const path of ['README.md', 'guideline/../README.md', '/guideline/v9.md', 'guideline/'])
       expect(await repo.save(remote, change([{ path, text: 'x\n' }]))).toMatchObject({ saved: false, step: 'write' })
     expect(await repo.save(remote, change([{ path: 'guideline/v9.md', text: 'x\n' }], '-x'))).toMatchObject({ saved: false, step: 'start' })
-    expect([fileOnMain('guideline/v1.md'), branchesOf(), readdirSync(saves), runner.glabCalls]).toEqual([V1.trimEnd(), ['main'], [], []])
+    // The new branch is never pushed onto the save branch itself.
+    expect(await repo.save(remote, change([{ path: 'guideline/v9.md', text: 'x\n' }], SAVE)))
+      .toEqual({ saved: false, step: 'start', error: 'the new branch is the branch it would be merged into', mr: undefined })
+    expect([fileOnTip('guideline/v1.md'), branchesOf(), readdirSync(saves), runner.glabCalls]).toEqual([V1.trimEnd(), ['main', SAVE], [], []])
   })
 })
 
@@ -340,31 +342,31 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   let author = new Author()
   const reportingSaver = (of: RemoteGuidelineRecords = records(), glab: string | null = GLAB) => new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: glab ?? undefined, root: saves }), now: () => NOW,
     reports: new TrendReports({ author, records: of, projects: [project] }) })
-  /** The files the newest commit on the remote's main changed. */
-  const lastCommitFiles = () => git(bare, 'show', '--name-only', '--format=', 'main').split('\n').filter(Boolean).sort()
+  /** The files the newest commit on the save branch changed. */
+  const lastCommitFiles = () => git(bare, 'show', '--name-only', '--format=', SAVE).split('\n').filter(Boolean).sort()
   beforeEach(() => { sampleJobs(); author = new Author() })
 
   it('the ticket\'s check: accepting v2 leaves v1\'s report in the same commit; the button writes v2\'s report naming v1; the page shows each beside its version', async () => {
     const of = records()
     const saver = reportingSaver(of)
-    const before = mainOf()
+    const before = tipOf()
     expect(await saver.accept(proposal('# Guideline\nKeep to the minimum feature.\n'), 1)).toMatchObject({ saved: true, version: 2 })
     // One commit, one merge request: the new version and the report of the version it replaced.
-    expect([git(bare, 'rev-list', '--count', `${before}..main`), lastCommitFiles(), runner.glabCalls.length]).toEqual(['1', ['guideline/v1-trends.md', 'guideline/v2.md'], 2])
-    expect(fileOnMain('guideline/v1-trends.md')).toBe('---\nversion: 1\ndate: 2026-11-27\njobs: 2\nwritten: accepted\n---\n# Trend report for guideline v1\n\n'
+    expect([git(bare, 'rev-list', '--count', `${before}..${SAVE}`), lastCommitFiles(), runner.glabCalls.length]).toEqual(['1', ['guideline/v1-trends.md', 'guideline/v2.md'], 2])
+    expect(fileOnTip('guideline/v1-trends.md')).toBe('---\nversion: 1\ndate: 2026-11-27\njobs: 2\nwritten: accepted\n---\n# Trend report for guideline v1\n\n'
       + 'This is the first version; there is none before it.\n\nReport on 2 jobs. The owner said: Keep to the minimum feature.\n\nSpent: 1,200 tokens\nProviders: dsh (the model set in its factory profile)')
     expect(author.asked.map(input => [input.version.version, input.before, input.jobs.map(job => job.job_id)])).toEqual([[1, null, ['job-a', 'job-b']]])
     // The button on the current version, v2: its own branch, merge request and merge.
-    const merged = mainOf()
+    const merged = tipOf()
     expect(await saver.report(2)).toEqual({ saved: true, version: 2, mr: 'https://gitlab.example/factory/-/merge_requests/7' })
-    expect([git(bare, 'rev-list', '--count', `${merged}..main`), lastCommitFiles()]).toEqual(['1', ['guideline/v2-trends.md']])
-    const v2 = fileOnMain('guideline/v2-trends.md')
+    expect([git(bare, 'rev-list', '--count', `${merged}..${SAVE}`), lastCommitFiles()]).toEqual(['1', ['guideline/v2-trends.md']])
+    const v2 = fileOnTip('guideline/v2-trends.md')
     expect(v2).toMatch(/^---\nversion: 2\ndate: 2026-11-27\njobs: 1\ncompared_with: 1\nwritten: asked\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n/)
     const branch = 'zees-factory/trends-v2-20261127T101530Z'
     expect(runner.glabCalls.slice(2)).toEqual([
-      ['mr', 'create', '--source-branch', branch, '--target-branch', 'main', '--title', 'trend report for guideline v2',
+      ['mr', 'create', '--source-branch', branch, '--target-branch', SAVE, '--title', 'trend report for guideline v2',
         '--description', 'The trend report for guideline v2. Asked for by the owner on the review page and merged by the fork.', '--remove-source-branch=false', '--yes'],
-      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', mainOf()],
+      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', tipOf()],
     ])
     // Nothing in the factory clone's checkout, and no worktree left.
     expect([readdirSync(join(factory, 'guideline')), readdirSync(saves), git(factory, 'branch', '--show-current')]).toEqual([['v1.md'], [], 'main'])
@@ -383,17 +385,17 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   it('accepting the first version writes no report and asks no thread', async () => {
     git(factory, 'rm', '--quiet', 'guideline/v1.md')
     git(factory, 'commit', '--quiet', '-m', 'none')
-    git(factory, 'push', '--quiet', 'origin', 'main')
+    git(factory, 'push', '--quiet', 'origin', `HEAD:refs/heads/${SAVE}`)
     expect(await reportingSaver().accept(proposal('One.\n'), null)).toMatchObject({ saved: true, version: 1 })
     expect([lastCommitFiles(), author.asked]).toEqual([['guideline/v1.md'], []])
   })
 
   it('a report that cannot be written stops the Accept: nothing pushed, no merge request, the reason said', async () => {
     author.fail = 'the report thread did not answer in time'
-    const before = mainOf()
+    const before = tipOf()
     expect(await reportingSaver().accept(proposal('Two.\n'), 1))
       .toEqual({ saved: false, reason: 'Not saved: the trend report for v1 could not be written: the report thread did not answer in time. Nothing was saved; try Accept again later.', mr: undefined })
-    expect([mainOf(), branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([before, ['main'], [], []])
+    expect([tipOf(), branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([before, ['main', SAVE], [], []])
   })
 
   it('an Accept against a version that moved on asks no thread', async () => {
@@ -404,12 +406,12 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   it('asking again replaces the report in a new commit; an old version, or no version, is refused before any thread is asked', async () => {
     const saver = reportingSaver()
     expect(await saver.report(1)).toMatchObject({ saved: true, version: 1 })
-    const first = fileOnMain('guideline/v1-trends.md')
+    const first = fileOnTip('guideline/v1-trends.md')
     author = new Author()
     sampleJobs('Ask me before any push.')
     const again = reportingSaver()
     expect(await again.report(1)).toMatchObject({ saved: true, version: 1 })
-    expect([lastCommitFiles(), fileOnMain('guideline/v1-trends.md') === first, fileOnMain('guideline/v1-trends.md')]).toEqual([['guideline/v1-trends.md'], false, expect.stringContaining('Ask me before any push.')])
+    expect([lastCommitFiles(), fileOnTip('guideline/v1-trends.md') === first, fileOnTip('guideline/v1-trends.md')]).toEqual([['guideline/v1-trends.md'], false, expect.stringContaining('Ask me before any push.')])
     expect(runner.glabCalls.filter(call => call[1] === 'create').at(-1)).toContain('The trend report for guideline v1, replacing the one written before. Asked for by the owner on the review page and merged by the fork.')
     await again.accept(proposal('Two.\n'), 1)
     author = new Author()
@@ -422,22 +424,22 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   it('a version no job ran under still gets a report, with jobs: 0, and the question says no job ran', async () => {
     writeFileSync(join(project, '.factory', 'actions.jsonl'), '')
     expect(await reportingSaver().report(1)).toMatchObject({ saved: true })
-    expect(fileOnMain('guideline/v1-trends.md')).toMatch(/^---\nversion: 1\ndate: 2026-11-27\njobs: 0\nwritten: asked\n---\n/)
+    expect(fileOnTip('guideline/v1-trends.md')).toMatch(/^---\nversion: 1\ndate: 2026-11-27\njobs: 0\nwritten: asked\n---\n/)
     expect(TrendPrompt.textOf(author.asked[0]!)).toContain('No job ran under this version.')
   })
 
   it('stores a planted secret from a comment masked, with every listed project\'s mask', async () => {
     sampleJobs(`Never print ${PLANTED}.`)
     expect(await reportingSaver().report(1)).toMatchObject({ saved: true })
-    const report = fileOnMain('guideline/v1-trends.md')
+    const report = fileOnTip('guideline/v1-trends.md')
     expect([report.includes(PLANTED), report.includes(`Never print ${REDACTED}.`)]).toEqual([false, true])
   })
 
   it('a failed step of the button\'s save names the step and links the merge request; the worktree is removed', async () => {
     runner.fail.merge = 'ERROR: not mergeable yet'
-    const before = mainOf()
+    const before = tipOf()
     expect(await reportingSaver().report(1)).toEqual({ saved: false, reason: 'Not saved: the merge step failed: ERROR: not mergeable yet', mr: 'https://gitlab.example/factory/-/merge_requests/7' })
-    expect([mainOf(), readdirSync(saves), branchesOf()]).toEqual([before, [], ['main', 'zees-factory/trends-v1-20261127T101530Z']])
+    expect([tipOf(), readdirSync(saves), branchesOf()]).toEqual([before, [], ['main', 'zees-factory/trends-v1-20261127T101530Z', SAVE]])
   })
 
   it('is busy while a report is written, so an Accept and a report never run at once', async () => {
@@ -448,7 +450,8 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   })
 
   it('a fetch that fails stops the Accept and the button before any thread is asked', async () => {
-    git(factory, 'remote', 'set-url', 'origin', join(root, 'missing.git'))
+    // The save branch is not on the remote: the guard can still ask the remote, and the fetch fails.
+    git(bare, 'update-ref', '-d', `refs/heads/${SAVE}`)
     for (const saved of [await reportingSaver().accept(proposal('Two.\n'), 1), await reportingSaver().report(1)])
       expect((saved as { reason: string }).reason).toMatch(/^Not saved: the fetch step failed: /)
     expect([author.asked, runner.glabCalls, readdirSync(saves)]).toEqual([[], [], []])
@@ -466,12 +469,12 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
     writeFileSync(join(second, '.factory', 'actions.jsonl'), `${JSON.stringify({ ts: '2026-11-21T09:00:00.000Z', project: second, job_id: 'job-z', step_id: 's1', kind: 'job_start', summary: 'Started.', guideline_version: 'v1' })}\n`)
     writeFileSync(join(second, '.factory', 'reviews.jsonl'), `${JSON.stringify({ ts: '2026-11-23T09:00:00.000Z', project: second, job_id: 'job-z', comment: 'Never print second-only-secret.' })}\n`)
     // The second project's mask alone knows its own secret.
-    const of = new RemoteGuidelineRecords(recordsModule(home, FAKE_RECORDS.replace('maskText: text => clean(text),',
-      'maskText: text => project.endsWith(\'/second\') ? clean(text).replaceAll(\'second-only-secret\', \'[second-masked]\') : clean(text),')), { runner, saveRepo: factory })
+    const of = new RemoteGuidelineRecords(recordsModule(factory, FAKE_RECORDS.replace('maskText: text => clean(text),',
+      'maskText: text => project.endsWith(\'/second\') ? clean(text).replaceAll(\'second-only-secret\', \'[second-masked]\') : clean(text),')), { runner, saveBranch: SAVE })
     const saver = new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
       reports: new TrendReports({ author, records: of, projects: [project, second] }) })
     expect(await saver.report(1)).toMatchObject({ saved: true })
-    const report = fileOnMain('guideline/v1-trends.md')
+    const report = fileOnTip('guideline/v1-trends.md')
     expect([report.includes('second-only-secret'), report.includes('Never print [second-masked].'), report.includes('jobs: 3')]).toEqual([false, true, true])
   })
 
@@ -485,11 +488,7 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
   })
 })
 
-describe('the save repository (review.saveRepo): saves go only there, and the guideline is read from there while it is set', () => {
-  /** A throwaway save repository apart from the factory: its own bare remote and a clone, holding v1 and v2 of its own. */
-  let targetBare = '', target = ''
-  const targetMain = () => git(targetBare, 'rev-parse', 'refs/heads/main')
-  const onTarget = (path: string) => git(targetBare, 'show', `main:${path}`)
+describe('the save branch (review.saveBranch): saves go only to that branch of the factory\'s remote, and the guideline is read from it while it is set', () => {
   /** A stand-in author that asks no model and writes down what it was given. */
   class Author implements TrendAuthor {
     readonly asked: TrendInput[] = []
@@ -498,122 +497,151 @@ describe('the save repository (review.saveRepo): saves go only there, and the gu
   let author = new Author()
   const saverFor = (of: RemoteGuidelineRecords) => new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
     reports: new TrendReports({ author, records: of, projects: [] }) })
+  const filesOnMain = () => git(bare, 'ls-tree', '--name-only', 'main', 'guideline/').split('\n').filter(Boolean)
+  const agent = async (id: string): Promise<GuidelineAgent & { ctx: Context }> => {
+    const ctx = new Context(); contexts.push(ctx)
+    await ctx.plugin(SystemPrompt)
+    return { id, ctx }
+  }
+  const sectionOf = async (each: { ctx: Context }) => (await each.ctx.systemPrompt.assemble()).sections.find(section => section.name === GuidelineSection.NAME)?.text ?? ''
   beforeEach(() => {
     author = new Author()
-    targetBare = join(root, 'target.git')
-    target = join(root, 'target')
-    git(root, 'init', '--bare', '--initial-branch=main', targetBare)
-    git(root, 'clone', '--quiet', targetBare, target)
-    for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false']]) git(target, 'config', name!, value!)
-    mkdirSync(join(target, 'guideline'))
-    writeFileSync(join(target, 'guideline', 'v1.md'), '---\nversion: 1\ndate: 2026-11-20\nfrom_job: job-0\n---\nTarget one.\n')
-    writeFileSync(join(target, 'guideline', 'v2.md'), '---\nversion: 2\ndate: 2026-11-21\nfrom_job: job-1\nfrom_version: 1\n---\nTarget two.\n')
-    git(target, 'add', 'guideline')
-    git(target, 'commit', '--quiet', '-m', 'v1 and v2')
-    git(target, 'push', '--quiet', 'origin', 'main')
+    // Another clone moves the two branches apart: the trial branch gets v2, main gets v5. The factory clone fetches both.
+    const writer = join(root, 'writer')
+    git(root, 'clone', '--quiet', bare, writer)
+    for (const [name, value] of [['user.name', 'Other'], ['user.email', 'other@example.invalid'], ['commit.gpgsign', 'false']]) git(writer, 'config', name!, value!)
+    git(writer, 'checkout', '--quiet', '-b', 'trial', `origin/${SAVE}`)
+    writeFileSync(join(writer, 'guideline', 'v2.md'), '---\nversion: 2\ndate: 2026-11-21\nfrom_job: job-1\nfrom_version: 1\n---\nTrial two.\n')
+    git(writer, 'add', 'guideline'); git(writer, 'commit', '--quiet', '-m', 'trial v2'); git(writer, 'push', '--quiet', 'origin', `HEAD:refs/heads/${SAVE}`)
+    git(writer, 'checkout', '--quiet', '-b', 'later', 'origin/main')
+    writeFileSync(join(writer, 'guideline', 'v5.md'), '---\nversion: 5\ndate: 2026-11-25\nfrom_job: job-5\n---\nMain five.\n')
+    git(writer, 'add', 'guideline'); git(writer, 'commit', '--quiet', '-m', 'main v5'); git(writer, 'push', '--quiet', 'origin', 'HEAD:refs/heads/main')
+    git(factory, 'fetch', '--quiet', 'origin')
   })
 
-  it('unset: Accept and the button refuse in plain words, and no mask, records, author, git, glab or worktree is touched', async () => {
+  it('unset: Accept and the button refuse in plain words before anything runs, and sessions read main', async () => {
     const touched: string[] = []
     const untouched = {
-      saveRemote: () => undefined,
+      saveBranch: undefined,
       saveTarget: async () => { touched.push('target'); throw new Error('never asked') },
       maskerFor: async () => { touched.push('mask'); throw new Error('never asked') },
       jobsReader: async () => { touched.push('jobs'); throw new Error('never asked') },
     }
     const saver = new GuidelineSaver({ records: untouched, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
       reports: new TrendReports({ author, records: untouched, projects: ['/projects/factory-testbed'] }) })
-    const refused = { saved: false, reason: 'Not saved: no save repository is set (review.saveRepo)', mr: undefined }
+    const refused = { saved: false, reason: 'Not saved: no save branch is set (review.saveBranch)', mr: undefined }
     expect(await saver.accept(proposal('Two.\n'), 1)).toEqual(refused)
     expect(await saver.report(1)).toEqual(refused)
-    // The same with the real records module, the factory's guideline still read as before.
+    // The same with the real records module.
     const of = records(null)
-    expect([of.saveRemote(), await saverFor(of).accept(proposal('Two.\n'), 1), await saverFor(of).report(1)]).toEqual([undefined, refused, refused])
-    expect([touched, author.asked, runner.calls, readdirSync(saves)]).toEqual([[], [], [], []])
-    expect((await of.guidelineReader()).read().current?.text).toBe('# Guideline\nKeep it small.\n')
+    expect([of.saveBranch, await saverFor(of).accept(proposal('Two.\n'), 5), await saverFor(of).report(5)]).toEqual([undefined, refused, refused])
+    expect([touched, author.asked, runner.calls, readdirSync(saves), git(factory, 'worktree', 'list').split('\n').length]).toEqual([[], [], [], [], 1])
+    // Sessions, and the page, read main.
+    const sections = new GuidelineSection(of, () => {})
+    const first = await agent('session-1')
+    await sections.attach(first)
+    expect([await sectionOf(first), await sections.jobVersion('session-1')]).toEqual([expect.stringContaining('Main five.'), 'v5'])
+    expect((await of.guidelineReader()).read().versions.map(version => version.version)).toEqual([5, 1])
+    expect(runner.calls.filter(call => call.program !== 'git' || !['rev-parse', 'ls-tree', 'cat-file'].includes(call.args[0]!))).toEqual([])
   })
 
-  it('set: Accept and the button save into the save repository\'s main, numbered from it; the factory\'s main and branches are unchanged', async () => {
-    const factoryMain = mainOf()
-    const of = records(target, factory)
-    const saver = saverFor(of)
-    // The page showed the target's v2: v3 is saved, with v2's report, written from the target's v2.
-    expect(await saver.accept(proposal('Target three.\n'), 2)).toMatchObject({ saved: true, version: 3 })
-    expect(onTarget('guideline/v3.md')).toContain('Target three.')
-    expect(onTarget('guideline/v3.md')).toContain('from_version: 2')
-    expect(onTarget('guideline/v2-trends.md')).toContain('compared_with: 1')
-    expect(author.asked.map(input => [input.version.version, input.version.text, input.before?.text])).toEqual([[2, 'Target two.\n', 'Target one.\n']])
-    // The button writes the target's current version's report the same way.
+  it('set: Accept and the button save onto the trial branch, numbered from it, through merge requests into it; main is unchanged', async () => {
+    const main = mainOf()
+    const saver = saverFor(records())
+    // The page showed the trial branch's v2: v3 is saved, with v2's report, written from the trial branch's v2.
+    expect(await saver.accept(proposal('Trial three.\n'), 2)).toMatchObject({ saved: true, version: 3 })
+    expect(fileOnTip('guideline/v3.md')).toContain('Trial three.')
+    expect(fileOnTip('guideline/v3.md')).toContain('from_version: 2')
+    expect(fileOnTip('guideline/v2-trends.md')).toContain('compared_with: 1')
+    expect(author.asked.map(input => [input.version.version, input.version.text, input.before?.version])).toEqual([[2, 'Trial two.\n', 1]])
+    // The button writes the trial branch's current version's report the same way.
     expect(await saver.report(3)).toMatchObject({ saved: true, version: 3 })
-    expect(onTarget('guideline/v3-trends.md')).toContain('written: asked')
-    // Nothing reached the factory: its main, its branches and its worktrees are as they were; every git call ran in the target or a save worktree.
-    expect([mainOf(), branchesOf(), git(factory, 'worktree', 'list').split('\n').length]).toEqual([factoryMain, ['main'], 1])
-    // In the factory only the check that the save repository is not the factory ran, and it only reads.
-    expect([...new Set(runner.calls.filter(call => call.cwd === factory).map(call => call.args.join(' ')))].sort()).toEqual(['remote -v', 'rev-parse --git-dir'])
-    expect(git(targetBare, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/').split('\n').length).toBe(3)
-    expect(readdirSync(saves)).toEqual([])
+    expect(fileOnTip('guideline/v3-trends.md')).toContain('written: asked')
+    expect(filesOnTip()).toEqual(['guideline/v1.md', 'guideline/v2-trends.md', 'guideline/v2.md', 'guideline/v3-trends.md', 'guideline/v3.md'])
+    // main never moved.
+    expect([mainOf(), filesOnMain()]).toEqual([main, ['guideline/v1.md', 'guideline/v5.md']])
+    // Each merge request goes into the trial branch; each push makes a new branch of its own; each fetch brings only the trial branch.
+    expect(runner.glabCalls.map(args => [args[1], args[1] === 'create' ? args[args.indexOf('--target-branch') + 1] : undefined]))
+      .toEqual([['create', SAVE], ['merge', undefined], ['create', SAVE], ['merge', undefined]])
+    const gits = runner.calls.filter(call => call.program === 'git')
+    expect(gits.filter(call => call.args[0] === 'push').map(call => call.args.at(-1)!.replace(/^[0-9a-f]{40}:/, '')))
+      .toEqual(['refs/heads/zees-factory/guideline-v3-20261127T101530Z', 'refs/heads/zees-factory/trends-v3-20261127T101530Z'])
+    expect([...new Set(gits.filter(call => call.args[0] === 'fetch').map(call => call.args.at(-1)))]).toEqual([`+refs/heads/${SAVE}:refs/remotes/origin/${SAVE}`])
+    // The worktrees were made from the trial branch's commits, never main's.
+    const bases = gits.filter(call => call.args[0] === 'worktree' && call.args[1] === 'add').map(call => call.args.at(-1))
+    expect(bases).toHaveLength(2)
+    expect(bases).not.toContain(main)
+    expect([readdirSync(saves), git(factory, 'branch', '--show-current')]).toEqual([[], 'main'])
   })
 
-  it('a save repository that is the factory, or shares a remote address with it, is refused before any fetch, worktree or glab call', async () => {
-    const before = mainOf()
-    const refused = { saved: false, reason: `Not saved: ${RemoteGuidelineRecords.IS_FACTORY}`, mr: undefined }
-    // The factory clone itself, and another clone of the factory's remote.
-    const second = join(root, 'second-clone')
-    git(root, 'clone', '--quiet', bare, second)
-    for (const saveRepo of [factory, second]) {
-      const of = records(saveRepo, factory)
-      expect([await saverFor(of).accept(proposal('Two.\n'), 1), await saverFor(of).report(1)]).toEqual([refused, refused])
-    }
-    // A save repository with the factory as a second remote is refused too, as glab could pick that remote.
-    git(target, 'remote', 'add', 'upstream', bare)
-    expect(await saverFor(records(target, factory)).accept(proposal('Two.\n'), 2)).toEqual(refused)
-    expect([mainOf(), branchesOf(), runner.glabCalls, readdirSync(saves), author.asked]).toEqual([before, ['main'], [], [], []])
-    expect(runner.calls.filter(call => !['remote -v', 'rev-parse --git-dir'].includes(call.args.join(' ')))).toEqual([])
-  })
-
-  it('the "main moved past the version shown" check and the numbering read the save repository, not the factory', async () => {
-    // The factory's main moves to v5; the target stays at v2.
-    writeFileSync(join(factory, 'guideline', 'v5.md'), 'Factory five.\n')
-    git(factory, 'add', 'guideline/v5.md'); git(factory, 'commit', '--quiet', '-m', 'v5'); git(factory, 'push', '--quiet', 'origin', 'main')
-    git(factory, 'fetch', '--quiet', 'origin')
-    const factoryMain = mainOf()
-    const saver = saverFor(records(target, factory))
-    // The factory's current version is no base here: the target is at v2.
+  it('the "moved on" check and the numbering read the trial branch: main at v5, trial at v2 gives base 2 and v3', async () => {
+    const main = mainOf()
+    const saver = saverFor(records())
+    // main's current version is no base here: the trial branch is at v2.
     expect((await saver.accept(proposal('Three.\n'), 5) as { reason: string }).reason).toBe('Not saved: the guideline is at v2 now, not the version this proposal was shown against. Reload the page and compare again.')
     expect((await saver.report(5) as { reason: string }).reason).toMatch(/^Not saved: only the current version's trend report can be written, and v5 is not the current version now \(v2 is\)/)
     expect(author.asked).toEqual([])
-    // Against the target's v2 it saves v3, not v6.
+    // Against the trial branch's v2 it saves v3, not v6.
     expect(await saver.accept(proposal('Three.\n'), 2)).toMatchObject({ saved: true, version: 3 })
-    expect([mainOf(), filesOnMain()]).toEqual([factoryMain, ['guideline/v1.md', 'guideline/v5.md']])
+    expect([mainOf(), filesOnMain(), filesOnTip().filter(path => GuidelineFile.NAME.test(path.slice('guideline/'.length)))])
+      .toEqual([main, ['guideline/v1.md', 'guideline/v5.md'], ['guideline/v1.md', 'guideline/v2.md', 'guideline/v3.md']])
   })
 
-  it('a session started after an Accept into the save repository gets the new version; the factory\'s guideline is not read', async () => {
-    const of = records(target, factory)
+  it('a session started after an Accept gets the new version from the trial branch; main\'s guideline is not read', async () => {
+    const of = records()
     const sections = new GuidelineSection(of, () => {})
-    const agent = async (id: string): Promise<GuidelineAgent & { ctx: Context }> => {
-      const ctx = new Context(); contexts.push(ctx)
-      await ctx.plugin(SystemPrompt)
-      return { id, ctx }
-    }
-    const sectionOf = async (each: { ctx: Context }) => (await each.ctx.systemPrompt.assemble()).sections.find(section => section.name === GuidelineSection.NAME)?.text ?? ''
     const first = await agent('session-1')
     await sections.attach(first)
-    expect([await sectionOf(first), await sections.jobVersion('session-1')]).toEqual([expect.stringContaining('Target two.'), 'v2'])
-    expect(await sectionOf(first)).not.toContain('Keep it small.')
-    // The review page's versions come from the target too.
+    expect([await sectionOf(first), await sections.jobVersion('session-1')]).toEqual([expect.stringContaining('Trial two.'), 'v2'])
+    expect(await sectionOf(first)).not.toContain('Main five.')
+    // The review page's versions come from the trial branch too.
     expect((await of.guidelineReader()).read().versions.map(version => version.version)).toEqual([2, 1])
-    expect(await saverFor(of).accept(proposal('Target three.\n'), 2)).toMatchObject({ saved: true, version: 3 })
+    expect(await saverFor(of).accept(proposal('Trial three.\n'), 2)).toMatchObject({ saved: true, version: 3 })
     const next = await agent('session-2')
     await sections.attach(next)
-    expect(await sectionOf(next)).toContain('Target three.')
+    expect(await sectionOf(next)).toContain('Trial three.')
     expect([await sections.jobVersion('session-2'), await sections.jobVersion('session-1')]).toEqual(['v3', 'v2'])
-    // The save's last fetch brought the merge into the target clone's copy of main; the factory's guideline is unchanged.
-    expect([git(target, 'rev-parse', 'refs/remotes/origin/main'), filesOnMain()]).toEqual([targetMain(), ['guideline/v1.md']])
+    // The save's last fetch brought the merge into the clone's copy of the trial branch; its copy of main and its checkout are unchanged.
+    expect([git(factory, 'rev-parse', `refs/remotes/origin/${SAVE}`), git(factory, 'rev-parse', 'refs/remotes/origin/main'), readdirSync(join(factory, 'guideline'))])
+      .toEqual([tipOf(), mainOf(), ['v1.md']])
+  })
+
+  it('until Epic 3 moves to main, the guard refuses main and the remote\'s default branch before any fetch, worktree or glab call', async () => {
+    const before = { main: mainOf(), trial: tipOf(), branches: branchesOf() }
+    const refused = { saved: false, reason: `Not saved: ${TrialBranchGuard.IS_MAIN}`, mr: undefined }
+    expect(refused.reason).toBe('Not saved: the save branch (review.saveBranch) is main or the remote\'s default branch; until Epic 3 moves to main, saves go only to a trial branch')
+    // main itself: refused by name, before any git call.
+    const onMain = records('main')
+    expect([await saverFor(onMain).accept(proposal('Six.\n'), 5), await saverFor(onMain).report(5)]).toEqual([refused, refused])
+    // Only the check that the factory folder is a repository ran.
+    expect(runner.calls.map(call => call.args.join(' '))).toEqual(['rev-parse --git-dir'])
+    runner.calls.length = 0
+    // Other spellings of main are refused by name too.
+    for (const name of ['Main', 'MAIN', 'master', 'origin/main'])
+      expect(await saverFor(records(name)).accept(proposal('Six.\n'), 5)).toEqual(refused)
+    expect(runner.calls.filter(call => call.args[0] !== 'rev-parse')).toEqual([])
+    runner.calls.length = 0
+    // A branch the remote names as its default (its HEAD) is refused too; only the remote was asked which branch that is.
+    git(bare, 'symbolic-ref', 'HEAD', `refs/heads/${SAVE}`)
+    const onDefault = records()
+    expect([await saverFor(onDefault).accept(proposal('Three.\n'), 2), await saverFor(onDefault).report(2)]).toEqual([refused, refused])
+    expect(runner.calls.filter(call => call.args[0] !== 'rev-parse').map(call => call.args.slice(0, 2))).toEqual([['ls-remote', '--symref'], ['ls-remote', '--symref']])
+    expect([{ main: mainOf(), trial: tipOf(), branches: branchesOf() }, runner.glabCalls, readdirSync(saves), author.asked]).toEqual([before, [], [], []])
+  })
+
+  it('a save branch that is not a plain branch name is refused when the records are made, so it never reaches git', () => {
+    for (const name of [SAVE, 'main', 'epic-3/guideline_trial.2'])
+      expect([name, SaveBranchName.isPlain(name)]).toEqual([name, true])
+    for (const name of ['', 'HEAD', 'refs/heads/main', 'heads/main', 'remotes/origin/main', 'tags/v1', 'zees-factory', 'zees-factory/x', '-x', 'a..b', 'a//b', 'a/.b', '.a', 'a/', 'a.', 'a.lock', 'a.lock/b', 'x:refs/heads/main', '+main', 'a b', 'a@{1}', 'a~1', 'a^', 'a*', 'a\\b']) {
+      expect([name, SaveBranchName.isPlain(name)]).toEqual([name, false])
+      expect(() => records(name)).toThrow(RemoteGuidelineRecords.NOT_PLAIN)
+    }
+    expect(runner.calls).toEqual([])
   })
 })
 
-describe('reading the guideline from the remote\'s main', () => {
-  it('reads the versions the remote\'s main held at the last fetch, never the checkout, and says why when there is no copy of it', async () => {
+describe('reading the guideline from the remote\'s main, or its save branch while one is set', () => {
+  it('reads the versions the remote\'s branch held at the last fetch, never the checkout, and says why when there is no copy of it', async () => {
     // The checkout holds a v2 that is not on the remote: it is not read.
     writeFileSync(join(factory, 'guideline', 'v2.md'), 'checkout only\n')
     const reader: GuidelineSource = await records(null).guidelineReader()
@@ -623,7 +651,10 @@ describe('reading the guideline from the remote\'s main', () => {
     git(factory, 'update-ref', '-d', 'refs/remotes/origin/main')
     const none = (await records(null).guidelineReader()).read()
     expect([none.current, none.reason]).toEqual([null, 'The guideline could not be read: the factory repository has no origin/main yet'])
-    expect((await records().guidelineReader()).read().reason).toBe('The guideline could not be read: the save repository has no origin/main yet')
+    // With a save branch set, its copy is read, not main's; with none, it says so in the same words.
+    expect((await records().guidelineReader()).read().current?.version).toBe(1)
+    git(factory, 'update-ref', '-d', `refs/remotes/origin/${SAVE}`)
+    expect((await records().guidelineReader()).read().reason).toBe(`The guideline could not be read: the factory repository has no origin/${SAVE} yet`)
     // The plain records module still reads the folder it is given, as before.
     expect((await new FactoryRecordsModule(recordsModule(factory)).guidelineReader()).read().current?.version).toBe(2)
   })
@@ -665,9 +696,9 @@ const FACTORY = process.env.ZEES_FACTORY_DIR?.trim() ?? ''
 const realTitle = FACTORY === '' ? 'the factory\'s real guideline reader (SKIPPED: set ZEES_FACTORY_DIR to the factory\'s folder to run it)' : 'the factory\'s real guideline reader'
 
 describe.skipIf(FACTORY === '')(realTitle, () => {
-  it('reads a saved version as the fork reads it from the remote\'s main', async () => {
+  it('reads a saved version as the fork reads it from the remote\'s save branch', async () => {
     expect((await saverOf().accept(proposal('# Guideline\nKeep to the minimum feature.\n'), 1)).saved).toBe(true)
-    git(factory, 'pull', '--quiet', '--ff-only', 'origin', 'main')
+    git(factory, 'pull', '--quiet', '--ff-only', 'origin', SAVE)
     const lib = await import(pathToFileURL(join(FACTORY, 'lib', 'dist', 'jobLog.js')).href) as { GuidelineReader: new (options: { factoryDir: string }) => GuidelineSource }
     const real = new lib.GuidelineReader({ factoryDir: factory }).read()
     const fork = (await records().guidelineReader()).read()

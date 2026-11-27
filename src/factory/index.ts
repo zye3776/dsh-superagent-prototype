@@ -7,9 +7,9 @@
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`). The guideline is read from the factory repository's remote `main`, never from a checkout, and the
  * page's Accept saves a new version through a merge request the fork merges at once (`save.ts`), with the trend report of the version it
- * replaces in the same commit; the page's "Write trend report" saves the current version's report the same way (`trends.ts`). Until Epic 3 moves to
- * main, saves go only to the throwaway repository `review.saveRepo` names, and while it is set the guideline is read from there instead of the
- * factory repository; unset, nothing is saved.
+ * replaces in the same commit; the page's "Write trend report" saves the current version's report the same way (`trends.ts`). Saves go only to
+ * the factory repository's branch `review.saveBranch` names, a trial branch until Epic 3 moves to main, and while it is set the guideline is read
+ * from that branch instead of `main`; unset, nothing is saved.
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -29,7 +29,7 @@ import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
 import { JobRecorder } from './records.ts'
 import { ReviewPage, ReviewRoute } from './review.ts'
-import { FactoryRepoSave, GlabProgram, GuidelineSaver, RemoteGuidelineRecords, TrendReports } from './save.ts'
+import { FactoryRepoSave, GlabProgram, GuidelineSaver, RemoteGuidelineRecords, SaveBranchName, TrendReports } from './save.ts'
 import { ExecFileRunner, OrcaLauncher, ReviewTalks } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
 import { TrendWriter } from './trends.ts'
@@ -54,9 +54,9 @@ export const Config = s.object({
       .description('The orca program that opens a review talk in Orca. Absolute path, optional; when set, only this file is used. Without it DSH looks for orca on PATH, then at /opt/homebrew/bin/orca, once when it starts. With none found, "Start review talk" is refused.'),
     glab: s.string().pattern(/^\//)
       .description('The glab program that opens and merges the merge request of an accepted guideline version. Absolute path, optional; when set, only this file is used. Without it DSH looks for glab on PATH, then at /opt/homebrew/bin/glab, once when it starts. With none found, Accept is refused and nothing is saved.'),
-    saveRepo: s.string().pattern(/^\//)
-      .description('The repository that Accept and "Write trend report" save into: a git repository folder, a clone of a throwaway repository with its own remote. Absolute path, optional. Every save goes there, never into the factory repository, and while it is set the decision guideline is read from its remote\'s main too: every session\'s starting guideline, the review page\'s versions and the trend report\'s input. Sessions DSH starts while it is set read that repository\'s guideline, so they see an accepted version; the factory repository\'s guideline, which the super agent reads without this setting, does not get it until this setting points at the factory repository, at the move to main. Until then a save repository that is the factory repository, or shares a remote address with it, is refused. Without it, the guideline is read from the factory repository and Accept and "Write trend report" are refused; nothing is saved.'),
-  }).default({}).description('The review page\'s review talk, its Accept and where Accept saves.'),
+    saveBranch: s.string().pattern(SaveBranchName.PATTERN)
+      .description('The branch of the factory repository\'s remote that Accept and "Write trend report" save to: a plain branch name, such as zty3776/epic-3-guideline-trial. Optional. The repository is always the factory repository, found through ZEES_FACTORY_DIR and its origin. Every save step uses this branch: the fetch, the commit the save starts from, the check that it did not move on, the version number, the merge request\'s target and the merge. While it is set, the decision guideline is read from this branch too: every session\'s starting guideline, the review page\'s versions and the trend report\'s input, so a session started after an Accept gets the new version. While it is unset, nothing is saved: Accept and "Write trend report" are refused, and the guideline is read from main. While Epic 3 is built it names a trial branch, and main or the remote\'s default branch is refused; it is switched to main only when the owner moves Epic 3 to main.'),
+  }).default({}).description('The review page\'s review talk, its Accept and the branch Accept saves to.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -66,15 +66,15 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   // Asking for the start folder throws when that folder was deleted since.
   try { folder = process.cwd() } catch { /* told below */ }
   if (folder === undefined) warn('No job_start line was written: the folder DSH was started in is gone')
-  // The guideline comes from the factory repository's remote main, so a version merged there reaches the next session (AD-18).
+  // The guideline comes from the factory repository's remote branch (main, or the save branch), so a version merged there reaches the next session (AD-18).
   const runner = new ExecFileRunner()
-  // With `review.saveRepo` set, the guideline is read from that repository, where Accept saves, so a saved version reaches the next session.
-  const records = new RemoteGuidelineRecords(config.recordsModule, { runner, saveRepo: config.review?.saveRepo })
-  // Once, in the background: the first sessions read the last fetched main until it lands. A failure only means an older copy is read.
-  void records.guidelineRemote().then(async remote => {
+  // With `review.saveBranch` set, the guideline is read from that branch, where Accept saves, so a saved version reaches the next session.
+  const records = new RemoteGuidelineRecords(config.recordsModule, { runner, saveBranch: config.review?.saveBranch })
+  // Once, in the background: the first sessions read the last fetched branch until it lands. A failure only means an older copy is read.
+  void records.factoryRemote().then(async remote => {
     if (!await remote.isRepository()) return
     const fetched = await remote.fetch()
-    if (!fetched.ok) warn(`The main of ${remote.name} could not be fetched; the guideline is read from the last fetched copy`)
+    if (!fetched.ok) warn(`The ${remote.branch} branch of the factory repository could not be fetched; the guideline is read from the last fetched copy`)
   }, () => { /* no factory repository: the guideline section says so */ })
   // Before any session exists, so every agent DSH creates gets the guideline, judges included.
   const guideline = new GuidelineSection(records, warn)

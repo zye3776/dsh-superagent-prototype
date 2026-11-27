@@ -85,11 +85,30 @@ describe('HelperRunner', () => {
     }
   })
 
-  it('reads a single result object too, and caps the answer at 6000 characters', async () => {
+  it('gives no evidence for a lone result object, whose reads cannot be checked, and caps an answer at 6000 characters', async () => {
     const long = 'x'.repeat(7_000)
-    const { runner: helpers } = runner(() => ({ code: 0, stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: long }) }))
+    const lone = runner(() => ({ code: 0, stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: long }) }))
+    const unread = await lone.runner.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000))
+    expect([unread.text, unread.evidence]).toEqual(['The helper gave no evidence (its answer could not be read). Decide without it.', false])
+    const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput(long) }))
     const result = await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000))
     expect(result.text).toBe(`${'x'.repeat(6_000)}\n[cut at 6000 characters]`)
+  })
+
+  it('checks a Glob pattern or Grep glob that starts with / or ~ as a path, and gives no evidence when it names a secret place', async () => {
+    for (const call of [{ name: 'Glob', input: { pattern: '/Users/x/.ssh/*' } }, { name: 'Grep', input: { pattern: 'k', glob: '~/.ssh/*' } }]) {
+      const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput('found keys', [call]) }))
+      const checked: unknown[] = []
+      const result = await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000, item => {
+        checked.push(item)
+        return !JSON.stringify(item).includes('.ssh')
+      }))
+      expect([result.text, result.reads, result.evidence]).toEqual(['The helper gave no evidence (it tried to read a file on the secret list). Decide without it.', [], false])
+      expect(checked).toContainEqual({ name: 'glob', arguments: { path: (call.input as { pattern?: string; glob?: string }).glob ?? call.input.pattern } })
+    }
+    // A relative pattern stays within the searched path, which is checked already.
+    const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput('ok', [{ name: 'Glob', input: { pattern: '**/*.ts' } }]) }))
+    expect((await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000))).evidence).toBe(true)
   })
 
   it('runs a Codex helper in a fresh empty folder with its MCP servers named, and reads its agent messages', async () => {
@@ -101,6 +120,12 @@ describe('HelperRunner', () => {
     expect(fake.starts[0]!.cwd).not.toBe(project)
     expect(HelperRunner.codexOutput('{"type":"turn.started"}\n')).toBeUndefined()
     expect(HelperRunner.codexOutput('garbage\n')).toBeUndefined()
+  })
+
+  it('gives no evidence when codex exec exits with an error, even with an answer printed', async () => {
+    const { runner: helpers } = runner(argv => argv[1] === 'mcp' ? { code: 0, stdout: '[]' } : { code: 1, stdout: codexOutput('it is safe') })
+    const result = await helpers.run(job({ engine: 'codex', question: 'q', text: 't' }, Date.now() + 5_000))
+    expect(result).toEqual({ text: 'The helper gave no evidence (it ended with an error). Decide without it.', reads: [], evidence: false })
   })
 
   it('gives a Codex helper without text, or whose servers cannot be listed, no run', async () => {

@@ -406,7 +406,7 @@ describe('helpers and documentation lookups', () => {
     expect(agent.registered.map(tool => tool.name)).toEqual(['docs_lookup', 'ask_helper'])
     expect([judge.lookups, judge.helpers]).toEqual([true, true])
     const brief = judge.brief()
-    expect(brief).toContain('you may ask up to 3 helpers with ask_helper, only within the first 10 seconds of a question; each one answers within 15 seconds.')
+    expect(brief).toContain('you may ask up to 3 helpers with ask_helper, only within the first 10 seconds of a question; each one is stopped 15 seconds after it starts and at the latest 20 seconds after the question.')
     expect(brief).toContain('engine "claude" reads the project with Read, Grep and Glob')
     expect(brief).toContain('engine "codex" reads no file: it answers only from the text you give it.')
     expect(brief).toContain('docs_lookup looks up a tool\'s or library\'s public documentation, only within the first 10 seconds of a question. Send only its name and one general question')
@@ -555,6 +555,31 @@ describe('helpers and documentation lookups', () => {
     expect(fake.starts[0]!.killed).toBe(true)
     expect(await pending).toBe('The helper gave no evidence (the question was answered before it finished, so it was stopped). Decide without it.')
     expect(reply.helperReads).toEqual([])
+  })
+
+  it('stops a helper started 9 seconds into a question at 20 seconds after the question, not 15 seconds after its start', async () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 0
+      const fake = fakeSpawner(() => 'hang')
+      let text: string | undefined
+      const dsh = fakeDsh(async (_text, _run, call) => {
+        clock = 9_000
+        text = await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'q' } })
+        return 'ok'
+      })
+      const judge = await new JudgeSessions(dsh.ctx, withHelpers().source, { now: () => clock, spawner: fake.spawner }).open(project, 's1')
+      const reply = judge.consult('q', new AbortController().signal)
+      await vi.advanceTimersByTimeAsync(5)
+      expect(fake.starts).toHaveLength(1)
+      // 11 seconds after the helper's start is 20 seconds after the question.
+      await vi.advanceTimersByTimeAsync(10_990)
+      expect(fake.starts[0]!.killed).toBe(false)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(fake.starts[0]!.killed).toBe(true)
+      expect((await reply).helperReads).toEqual([])
+      expect(text).toBe('The helper gave no evidence (it ran past its time limit and was stopped). Decide without it.')
+    } finally { vi.useRealTimers() }
   })
 
   it('refuses a documentation lookup once 10 seconds of the question have passed', async () => {

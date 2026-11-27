@@ -89,6 +89,8 @@ export class HelperRunner {
   private static readonly CHECKED: Readonly<Record<string, { guard: 'read' | 'glob'; key: string }>> = {
     Read: { guard: 'read', key: 'file_path' }, Grep: { guard: 'glob', key: 'path' }, Glob: { guard: 'glob', key: 'path' },
   }
+  /** The pattern argument of each search tool: one that starts with `/` or `~` names a place of its own, so it is checked as a path too. */
+  private static readonly PATTERN_KEYS: Readonly<Record<string, string>> = { Grep: 'glob', Glob: 'pattern' }
 
   constructor(private readonly command: HelperCommandBuilder, private readonly spawner: HelperSpawner = new NodeSpawner(),
     private readonly now: () => number = Date.now) {}
@@ -119,6 +121,9 @@ export class HelperRunner {
       if (!job.readAllowed({ name: read.guard, arguments: read.guard === 'read' ? { file_path: read.path } : { path: read.path } })) {
         return HelperRunner.noEvidence('it tried to read a file on the secret list')
       }
+    }
+    for (const pattern of parsed.patterns) {
+      if (!job.readAllowed({ name: 'glob', arguments: { path: pattern } })) return HelperRunner.noEvidence('it tried to read a file on the secret list')
     }
     const reads: string[] = []
     for (const read of parsed.calls) if (!reads.includes(read.full)) reads.push(read.full)
@@ -178,15 +183,19 @@ export class HelperRunner {
   }
 
   /**
-   * Reads `claude -p --output-format json` output: a JSON array of events (or a single result object). Each `assistant` event's `tool_use` blocks of Read,
-   * Grep and Glob give the paths it read (Grep's and Glob's default to the project); the `result` event gives the answer. `undefined` when there is no
+   * Reads `claude -p --output-format json` output: a JSON array of events. Each `assistant` event's `tool_use` blocks of Read, Grep and Glob give the paths
+   * it read (Grep's and Glob's default to the project), and a Grep `glob` or Glob `pattern` that starts with `/` or `~` is a path to check too; the `result`
+   * event gives the answer. `undefined` when the output is not an array (a lone result carries no tool calls, so its reads cannot be checked), there is no
    * successful result with text, or a tool call names no usable path.
    */
-  static claudeOutput(stdout: string, project: string): { text: string; calls: { guard: 'read' | 'glob'; path: string; full: string }[] } | undefined {
+  static claudeOutput(stdout: string, project: string):
+    { text: string; calls: { guard: 'read' | 'glob'; path: string; full: string }[]; patterns: string[] } | undefined {
     let parsed: unknown
     try { parsed = JSON.parse(stdout) } catch { return undefined }
-    const events = Array.isArray(parsed) ? parsed : [parsed]
+    if (!Array.isArray(parsed)) return undefined
+    const events: unknown[] = parsed
     const calls: { guard: 'read' | 'glob'; path: string; full: string }[] = []
+    const patterns: string[] = []
     let text: string | undefined
     for (const event of events) {
       if (typeof event !== 'object' || event === null) continue
@@ -203,11 +212,15 @@ export class HelperRunner {
           if (value !== undefined && typeof value !== 'string') return undefined
           const path = value === undefined || value === '' ? project : value
           calls.push({ guard: checked.guard, path, full: HelperRunner.fullPath(path, project) })
+          const patternKey = HelperRunner.PATTERN_KEYS[name]
+          const pattern = patternKey === undefined ? undefined : (input as Record<string, unknown> | null)?.[patternKey]
+          if (pattern !== undefined && typeof pattern !== 'string') return undefined
+          if (pattern !== undefined && (pattern.startsWith('/') || pattern.startsWith('~'))) patterns.push(pattern)
         }
       }
       if (type === 'result') text = subtype === 'success' && isError !== true && typeof result === 'string' ? result : undefined
     }
-    return text === undefined || text.trim() === '' ? undefined : { text: text.trim(), calls }
+    return text === undefined || text.trim() === '' ? undefined : { text: text.trim(), calls, patterns }
   }
 
   /** Reads `codex exec --json` output: one JSON event per line; the text of its `agent_message` items, joined. `undefined` when there is none. */

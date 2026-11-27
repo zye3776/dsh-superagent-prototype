@@ -121,6 +121,16 @@ describe('HelperRunner', () => {
     expect(HelperRunner.foundPaths('a-b.txt:3:x - y: z\nsrc/c.ts-4-context', 'prefixed')).toEqual(['a', 'a-b.txt', 'src/c.ts', 'src/c.ts-4'])
   })
 
+  it('does not count a tool call whose result came back as an error as a read, but still checks it against the guard', async () => {
+    const checked: unknown[] = []
+    const { runner: helpers } = runner(() => ({ code: 0, stdout: claudeOutput('a is read.', [
+      { name: 'Read', input: { file_path: '/elsewhere/b.ts' }, result: { content: 'Permission to read /elsewhere/b.ts has been denied.', isError: true } },
+      { name: 'Read', input: { file_path: 'src/a.ts' }, result: { content: '1\texport const a = 1' } }]) }))
+    const result = await helpers.run(job({ engine: 'claude', question: 'q' }, Date.now() + 5_000, call => { checked.push(call); return true }))
+    expect(result).toEqual({ text: 'a is read.', reads: [join(project, 'src', 'a.ts')], evidence: true })
+    expect(checked).toContainEqual({ name: 'read', arguments: { file_path: '/elsewhere/b.ts' } })
+  })
+
   it('gives no evidence when a tool result belongs to no tool call the helper made', async () => {
     const stdout = JSON.stringify([{ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'nobody', content: 'x' }] } },
       { type: 'result', subtype: 'success', is_error: false, result: 'a' }])

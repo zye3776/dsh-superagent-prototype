@@ -155,12 +155,12 @@ export function fakeSpawner(answer: (argv: readonly string[], cwd: string) => Fa
 }
 
 /** What `claude -p --output-format json` prints for a helper that made these tool calls and gave this answer. */
-export function claudeOutput(answer: string, calls: { name: string; input: Record<string, unknown>; result?: { content: unknown; structured?: Record<string, unknown> } }[] = []): string {
+export function claudeOutput(answer: string, calls: { name: string; input: Record<string, unknown>; result?: { content: unknown; structured?: Record<string, unknown>; isError?: boolean } }[] = []): string {
   return JSON.stringify([
     { type: 'system', subtype: 'init', tools: ['Glob', 'Grep', 'Read'], mcp_servers: [] },
     // Each call, and when it has one, the user event that carries its result (as Claude Code prints it: the text, and the structured `tool_use_result`).
     ...calls.flatMap((call, at) => [{ type: 'assistant', message: { content: [{ type: 'tool_use', id: `tool-${at + 1}`, name: call.name, input: call.input }] } },
-      ...call.result === undefined ? [] : [{ type: 'user', message: { role: 'user', content: [{ tool_use_id: `tool-${at + 1}`, type: 'tool_result', content: call.result.content }] },
+      ...call.result === undefined ? [] : [{ type: 'user', message: { role: 'user', content: [{ tool_use_id: `tool-${at + 1}`, type: 'tool_result', content: call.result.content, ...call.result.isError === true ? { is_error: true } : {} }] },
         ...call.result.structured === undefined ? {} : { tool_use_result: call.result.structured } }]]),
     { type: 'assistant', message: { content: [{ type: 'text', text: answer }] } },
     { type: 'result', subtype: 'success', is_error: false, result: answer },

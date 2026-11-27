@@ -501,9 +501,9 @@ export class JudgeSessions implements JudgeOpener {
   /** The judge's tool that asks one helper. */
   static readonly HELPER_TOOL = 'ask_helper'
   static readonly HELPER_DESCRIPTION = 'Ask one helper on a weaker, faster model one narrow question; it is stopped 15 seconds after it starts and at the latest 20 seconds'
-    + ' after the question. engine "claude" reads this project'
+    + ' after the request arrived. engine "claude" reads this project'
     + ' with Read, Grep and Glob (model haiku by default, or sonnet). engine "codex" reads no file and answers only from the text you give it in text.'
-    + ' At most 3 helpers per question, started within its first 10 seconds.'
+    + ' At most 3 helpers per question, started within the first 10 seconds of the request.'
   /** The tool's parameters, as JSON Schema. The factory guard checks them again before the tool runs. */
   static readonly HELPER_PARAMETERS = {
     type: 'object',

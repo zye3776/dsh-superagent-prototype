@@ -134,8 +134,9 @@ export class HelperRunner {
     for (const path of parsed.found) {
       if (!job.readAllowed({ name: 'read', arguments: { file_path: path } })) return HelperRunner.noEvidence('a search it ran returned a file on the secret list')
     }
+    // Only a call that came back without an error read anything: a Read the deny rules or the working folder refused is no evidence.
     const reads: string[] = []
-    for (const read of parsed.calls) if (!reads.includes(read.full)) reads.push(read.full)
+    for (const read of parsed.calls) if (!read.failed && !reads.includes(read.full)) reads.push(read.full)
     return { text: HelperRunner.capped(this.command.redact(parsed.text)), reads, evidence: true }
   }
 
@@ -194,17 +195,20 @@ export class HelperRunner {
   /**
    * Reads `claude -p --output-format json` output: a JSON array of events. Each `assistant` event's `tool_use` blocks of Read, Grep and Glob give the paths
    * it read (Grep's and Glob's default to the project), and a Grep `glob` or Glob `pattern` that starts with `/` or `~` is a path to check too; the `result`
-   * event gives the answer. Each `user` event's `tool_result` of a Grep or Glob gives the file paths that search returned (`found`, see `foundPaths`).
+   * event gives the answer. Each `user` event's `tool_result` of a Grep or Glob gives the file paths that search returned (`found`, see `foundPaths`); a
+   * `tool_result` with `is_error` marks its call `failed`, so it is still checked against the guard but is not counted as a read.
    * `undefined` when the output is not an array (a lone result carries no tool calls, so its reads cannot be checked), there is no successful result with
    * text, a tool call names no usable path, or a tool result belongs to no tool call it lists.
    */
   static claudeOutput(stdout: string, project: string):
-    { text: string; calls: { guard: 'read' | 'glob'; path: string; full: string }[]; patterns: string[]; found: string[] } | undefined {
+    { text: string; calls: { guard: 'read' | 'glob'; path: string; full: string; failed: boolean }[]; patterns: string[]; found: string[] } | undefined {
     let parsed: unknown
     try { parsed = JSON.parse(stdout) } catch { return undefined }
     if (!Array.isArray(parsed)) return undefined
     const events: unknown[] = parsed
-    const calls: { guard: 'read' | 'glob'; path: string; full: string }[] = []
+    const calls: { guard: 'read' | 'glob'; path: string; full: string; id: unknown }[] = []
+    /** The ids of the tool calls whose result came back as an error. */
+    const failed = new Set<string>()
     const patterns: string[] = []
     const found = new Set<string>()
     /** Each tool call by its id: the tool's name and how its result lists paths. */
@@ -217,10 +221,11 @@ export class HelperRunner {
         const content = (message as { content?: unknown } | null)?.content
         let searched = false
         for (const block of Array.isArray(content) ? content : []) {
-          const { type: blockType, tool_use_id: id, content: returned } = (block ?? {}) as Record<string, unknown>
+          const { type: blockType, tool_use_id: id, content: returned, is_error: resultError } = (block ?? {}) as Record<string, unknown>
           if (blockType !== 'tool_result') continue
           const call = typeof id === 'string' ? used.get(id) : undefined
           if (call === undefined) return undefined
+          if (resultError === true) failed.add(id as string)
           if (call.name === 'Read') continue
           searched = true
           for (const path of HelperRunner.foundPaths(HelperRunner.resultText(returned), call.lines)) found.add(path)
@@ -241,7 +246,7 @@ export class HelperRunner {
           const value = (input as Record<string, unknown> | null)?.[checked.key]
           if (value !== undefined && typeof value !== 'string') return undefined
           const path = value === undefined || value === '' ? project : value
-          calls.push({ guard: checked.guard, path, full: HelperRunner.fullPath(path, project) })
+          calls.push({ guard: checked.guard, path, full: HelperRunner.fullPath(path, project), id })
           const mode = (input as Record<string, unknown> | null)?.output_mode
           if (typeof id === 'string') used.set(id, { name, lines: name === 'Grep' && (mode === 'content' || mode === 'count') ? 'prefixed' : 'whole' })
           const patternKey = HelperRunner.PATTERN_KEYS[name]
@@ -252,7 +257,8 @@ export class HelperRunner {
       }
       if (type === 'result') text = subtype === 'success' && isError !== true && typeof result === 'string' ? result : undefined
     }
-    return text === undefined || text.trim() === '' ? undefined : { text: text.trim(), calls, patterns, found: [...found] }
+    if (text === undefined || text.trim() === '') return undefined
+    return { text: text.trim(), calls: calls.map(({ id, ...call }) => ({ ...call, failed: typeof id === 'string' && failed.has(id) })), patterns, found: [...found] }
   }
 
   /**

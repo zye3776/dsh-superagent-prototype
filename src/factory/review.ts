@@ -222,60 +222,147 @@ export class ReviewPage {
     job_start: 'Job started', job_stop: 'Job stopped', permission_answer: 'Permission answered', fork_answer: 'Fork answered',
     message_in: 'Message received', message_out: 'Message sent', session_start: 'Session started', session_steer: 'Session steered',
   }
+  /**
+   * A DSH colour token, followed by what the browser shows where the token is not defined. This page is a document of its own: DSH's client, whose
+   * script carries the tokens' values, does not run in it, so today the second value is the one seen. It is always a colour of the browser's own
+   * (`Canvas`, `CanvasText`, `LinkText`) or a mix of two of them, never a colour this page picks, and it follows light and dark by itself.
+   */
+  private static token(name: string, fallback: string): string { return `var(--dsw-alias-${name}, ${fallback})` }
+  /** The browser's text colour thinned into its page colour: `percent` of text, the rest page. */
+  private static thin(percent: number): string { return `color-mix(in oklab, CanvasText ${percent}%, Canvas)` }
+  private static readonly INK = ReviewPage.token('label-primary', 'CanvasText')
+  private static readonly INK2 = ReviewPage.token('label-secondary', ReviewPage.thin(68))
+  private static readonly INK3 = ReviewPage.token('label-tertiary', ReviewPage.thin(54))
+  private static readonly LINE = ReviewPage.token('border-l3', ReviewPage.thin(12))
+  private static readonly LINE2 = ReviewPage.token('border-l2', ReviewPage.thin(24))
+  private static readonly BG = ReviewPage.token('bg-layer-1', 'Canvas')
+  private static readonly BG2 = ReviewPage.token('bg-layer-2', ReviewPage.thin(4))
+  private static readonly WELL = ReviewPage.token('bg-module-platform', ReviewPage.thin(6))
+  private static readonly HOVER = ReviewPage.token('interactive-bg-hover', ReviewPage.thin(8))
+  private static readonly BRAND = ReviewPage.token('brand-primary', 'CanvasText')
+  private static readonly ON_BRAND = ReviewPage.token('label-primary-foreground', 'Canvas')
+  private static readonly OK = ReviewPage.token('state-success-primary', 'CanvasText')
+  private static readonly NO = ReviewPage.token('state-error-primary', 'CanvasText')
+  private static readonly WARN = ReviewPage.token('state-warn-primary', 'CanvasText')
+  private static readonly LINK = ReviewPage.token('link', 'LinkText')
+  private static readonly MONO = 'var(--ds-font-family-code, ui-monospace, Menlo, monospace)'
+  /**
+   * The page's look: one screen with no page scroll. A 44px top bar (title, tabs, where the owner is, the review talk's button), the notices under it,
+   * then the panels side by side, each scrolling on its own: 240px left, the middle taking the room left, 380px right, narrower in a narrow window so that
+   * the page never scrolls sideways.
+   * The body is a grid, so the top bar needs no wrapper of its own: its three parts are the body's first row.
+   */
   private static readonly STYLE = [
-    'body { margin: 16px; font-size: 13px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1); }',
-    'h1 { font-size: 13px; }',
-    'h2 { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); margin: 16px 0 8px; }',
-    '.crumb { font-size: 12px; color: var(--dsw-alias-label-secondary); padding-bottom: 8px; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
-    '.cols { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; }',
-    '.cols.with-detail { grid-template-columns: 260px minmax(0, 1fr) 360px; }',
-    '.detail { position: sticky; top: 16px; }',
-    '@media (max-width: 1100px) { .cols, .cols.with-detail { grid-template-columns: 1fr; } }',
-    '.left a { display: block; padding: 6px 8px; border-radius: 8px; color: inherit; text-decoration: none; }',
-    '.left a.on { background: var(--dsw-alias-bg-layer-2); }',
-    '.left span { display: block; }',
-    '.l2, .meta, .who { font-size: 11px; color: var(--dsw-alias-label-tertiary); }',
-    '.pill { font-size: 11px; padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; color: var(--dsw-alias-label-secondary); }',
-    'ol, ul.comments { list-style: none; padding: 0; }',
-    '.mine { margin-top: 6px; padding: 4px 8px; border-left: 3px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); font-size: 12px; }',
-    '.detail .comment { margin-top: 16px; }',
-    'li { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
-    'li.auto { color: var(--dsw-alias-label-tertiary); }',
-    'li a.step { display: block; color: inherit; text-decoration: none; }',
-    'li.on { background: var(--dsw-alias-bg-layer-2); }',
-    '.lbl { font-size: 11px; color: var(--dsw-alias-label-tertiary); margin-top: 12px; }',
-    '.val.none { color: var(--dsw-alias-label-tertiary); }',
-    '.detail p { margin: 4px 0; }',
-    'time, code { font-family: var(--ds-font-family-code); font-size: 11px; }',
-    'time { color: var(--dsw-alias-label-tertiary); }',
-    'code { overflow-wrap: anywhere; }',
-    'label, #comment-status { font-size: 12px; color: var(--dsw-alias-label-secondary); }',
-    'a { color: var(--dsw-alias-link); }',
-    'textarea, input { box-sizing: border-box; width: 100%; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font: inherit; color: inherit; background: var(--dsw-alias-bg-layer-1); }',
-    'textarea { min-height: 120px; }',
-    '.tabs { display: flex; gap: 4px; margin-bottom: 8px; }',
-    '.tabs a { padding: 4px 10px; border-radius: 8px; color: inherit; text-decoration: none; }',
-    '.tabs a.on { background: var(--dsw-alias-bg-layer-2); }',
-    'pre.guideline-text, pre.report-text { text-wrap-mode: wrap; overflow-wrap: anywhere; overflow-x: auto; font-family: var(--ds-font-family-code); font-size: 12px; }',
-    '.head { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
-    '.head .crumb { border-bottom: 0; }',
-    'button.primary { padding: 4px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); cursor: pointer; }',
-    'button.primary:disabled { opacity: 0.45; cursor: not-allowed; }',
-    'button.plain { padding: 4px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font: inherit; font-size: 12px; color: inherit; background: transparent; cursor: pointer; }',
-    'button.plain:disabled { opacity: 0.45; cursor: not-allowed; }',
-    '.answer { display: flex; gap: 8px; align-items: center; }',
-    '.head .talk { display: flex; gap: 8px; align-items: center; }',
-    '.head .hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }',
-    '.notice { margin: 8px 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; font-size: 12px; }',
-    '.notice.refused { border-color: var(--dsw-alias-state-error-primary); }',
+    ':root { color-scheme: light dark; }',
+    '* { box-sizing: border-box; }',
+    '[hidden] { display: none !important; }',
+    'html, body { height: 100%; margin: 0; }',
+    `html { color: CanvasText; background: ${ReviewPage.BG}; }`,
+    // The body's text colour is the token alone. Where the token is not defined the browser drops this line and the body takes `html`'s colour above.
+    `body { display: grid; grid-template-columns: auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dsw-alias-label-primary); background: ${ReviewPage.BG}; }`,
+    'p { margin: 0 0 8px; }',
+    `a { color: ${ReviewPage.LINK}; }`,
+    `:focus-visible { outline: 2px solid ${ReviewPage.BRAND}; outline-offset: -2px; }`,
+    // The top bar: the body's first row, with one line under all of it.
+    `body:has(> h1)::before { content: ""; grid-row: 1; grid-column: 1 / -1; height: 44px; border-bottom: 1px solid ${ReviewPage.LINE}; }`,
+    'body > h1, body > .tabs, body > .crumb, body > .head { grid-row: 1; height: 44px; }',
+    'body > h1 { grid-column: 1; display: flex; align-items: center; margin: 0; padding: 0 4px 0 16px; font-size: 13px; font-weight: 600; }',
+    'body > .tabs { grid-column: 2; display: flex; gap: 4px; padding: 0 12px; }',
+    `.tabs a { display: flex; align-items: center; padding: 0 12px; color: ${ReviewPage.INK2}; text-decoration: none; border-bottom: 2px solid transparent; }`,
+    `.tabs a.on { color: ${ReviewPage.INK}; font-weight: 600; border-bottom-color: ${ReviewPage.BRAND}; }`,
+    'body > .crumb, body > .head { grid-column: 3; }',
+    `.crumb { min-width: 0; padding: 0 16px; line-height: 43px; color: ${ReviewPage.INK2}; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; }`,
+    `.crumb > span[title] { color: ${ReviewPage.INK}; font-weight: 600; }`,
+    'body > .head { display: flex; align-items: center; gap: 16px; padding-right: 16px; }',
+    '.head > .crumb { flex: 1; }',
+    '.talk { display: flex; flex: none; align-items: center; gap: 8px; }',
+    `.hint { font-size: 12px; color: ${ReviewPage.INK3}; }`,
+    // Notices: a strip under the top bar, or a box inside a panel.
+    `.notice { margin: 8px 0; padding: 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; font-size: 12px; }`,
+    `body > .notice { grid-column: 1 / -1; margin: 0; padding: 8px 16px; border: 0; border-bottom: 1px solid ${ReviewPage.LINE}; border-radius: 0; background: ${ReviewPage.WELL}; }`,
+    'body > .notice { grid-row: 2; }',
+    'body > .head + .notice { grid-row: 3; }',
+    `.notice.refused { border-color: ${ReviewPage.NO}; }`,
     '.notice .small { font-size: 11px; }',
-    '.left a.proposal { border-left: 3px solid var(--dsw-alias-brand-primary); }',
-    '.halves { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }',
-    '.halves h3 { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); }',
-    'pre.diff { margin: 0; text-wrap-mode: wrap; overflow-wrap: anywhere; font-family: var(--ds-font-family-code); font-size: 12px; }',
-    '.diff .line { display: block; min-height: 1.45em; text-decoration: none; }',
-    '.diff del.line { text-decoration: line-through; background: color-mix(in oklab, var(--dsw-alias-state-error-primary) 14%, transparent); }',
-    '.diff ins.line { background: color-mix(in oklab, var(--dsw-alias-state-success-primary) 14%, transparent); }',
+    'body > p { grid-row: 4; grid-column: 1 / -1; margin: 0; padding: 16px; }',
+    // The panels.
+    // The three panels always fit the window's width: the middle gives way first, and in a narrow window the side panels narrow too, down to 160px and 240px.
+    '.cols { grid-row: 4; grid-column: 1 / -1; display: grid; grid-template-columns: clamp(160px, 20vw, 240px) minmax(0, 1fr); min-width: 0; min-height: 0; }',
+    '.cols.with-detail { grid-template-columns: clamp(160px, 20vw, 240px) minmax(0, 1fr) clamp(240px, 30vw, 380px); }',
+    `.cols > * { min-width: 0; min-height: 0; overflow: auto; padding: 12px; border-right: 1px solid ${ReviewPage.LINE}; overflow-wrap: anywhere; }`,
+    '.cols > :last-child { border-right: 0; }',
+    `h2, h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: ${ReviewPage.INK3}; }`,
+    '.cols h2:not(:first-child) { margin-top: 16px; }',
+    `.pill { display: inline-block; padding: 0 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 999px; font-size: 11px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; color: ${ReviewPage.INK2}; }`,
+    `.l2, .meta { margin-top: 1px; font-size: 12px; color: ${ReviewPage.INK2}; }`,
+    `.who { font-weight: 400; color: ${ReviewPage.INK2}; }`,
+    `code { padding: 0 4px; border-radius: 4px; font-family: ${ReviewPage.MONO}; font-size: 12px; background: ${ReviewPage.WELL}; overflow-wrap: anywhere; }`,
+    `time { font-family: ${ReviewPage.MONO}; font-size: 11px; color: ${ReviewPage.INK3}; }`,
+    'pre { margin: 0; font: inherit; text-wrap-mode: wrap; overflow-wrap: anywhere; }',
+    'pre.guideline-text { max-width: 68ch; }',
+    // Left panel: one row per project, job, version or proposal.
+    '.left a { display: block; margin-bottom: 4px; padding: 8px; border: 1px solid transparent; border-radius: 8px; color: inherit; text-decoration: none; }',
+    `.left a:hover { background: ${ReviewPage.HOVER}; }`,
+    '.left a.proj { margin-bottom: 2px; padding: 6px 8px; }',
+    `.left a.proj.on { background: ${ReviewPage.HOVER}; font-weight: 600; }`,
+    `.left a.job.on, .left a.version.on, .left a.proposal.on { background: ${ReviewPage.BG2}; border-color: ${ReviewPage.LINE2}; }`,
+    '.left a > span { display: block; }',
+    '.left a > span:first-child { font-weight: 600; }',
+    '.left a.job > span:first-child { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 8px; }',
+    // The dot before the number of a job with no comment yet.
+    '.left a.job.fresh > span:first-child { padding-left: 13px; }',
+    `.left a.job.fresh > span:first-child::before { content: ""; position: absolute; left: 0; top: 50%; width: 7px; height: 7px; margin-top: -4px; border-radius: 50%; background: ${ReviewPage.BRAND}; }`,
+    `.left a.proposal { border-left: 3px solid ${ReviewPage.WARN}; }`,
+    // Middle panel: the timeline as rows, the time in a column of its own.
+    'ol, ul.comments { list-style: none; margin: 0; padding: 0; }',
+    'li { position: relative; margin-bottom: 2px; border: 1px solid transparent; border-radius: 8px; }',
+    `li.on { background: ${ReviewPage.BG2}; border-color: ${ReviewPage.LINE2}; }`,
+    'li.auto { opacity: .6; }',
+    'li > a.step { display: block; padding: 8px; border-radius: 7px; color: inherit; text-decoration: none; }',
+    `li > a.step:hover { background: ${ReviewPage.HOVER}; }`,
+    'li:not(:has(> a.step)) { padding: 8px; }',
+    'ol > li > a.step, ol > li:not(:has(> a.step)) { padding-left: 64px; }',
+    'ol time { position: absolute; left: 8px; top: 10px; }',
+    'li div { margin-top: 2px; }',
+    `li .mine, .mine { margin-top: 6px; padding: 4px 8px; border-left: 3px solid ${ReviewPage.BRAND}; border-radius: 0 6px 6px 0; font-size: 12px; background: ${ReviewPage.WELL}; }`,
+    `.ok { color: ${ReviewPage.OK}; }`,
+    `.no { color: ${ReviewPage.NO}; }`,
+    // Right panel: label over value, shown in full; the comment field takes the height that is left.
+    '.detail { display: flex; flex-direction: column; }',
+    '.detail > * { flex: none; }',
+    `.lbl { margin-top: 12px; font-size: 11px; color: ${ReviewPage.INK3}; }`,
+    'h2 + .lbl { margin-top: 0; }',
+    '.val { margin-top: 2px; }',
+    `.val.none { color: ${ReviewPage.INK3}; }`,
+    '.val p { margin: 0 0 4px; }',
+    '.facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }',
+    '.detail > .comment { flex: 1 0 auto; display: flex; flex-direction: column; min-height: 120px; margin-top: 12px; }',
+    `label { font-size: 11px; color: ${ReviewPage.INK3}; }`,
+    `textarea { flex: 1; width: 100%; min-height: 72px; margin-top: 4px; padding: 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; font: inherit; color: inherit; background: ${ReviewPage.BG}; resize: none; }`,
+    `.comment p { min-height: 16px; margin: 4px 0 0; font-size: 11px; color: ${ReviewPage.INK3}; }`,
+    '.detail .head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }',
+    '.detail .head h2 { margin: 0; }',
+    // Buttons.
+    'button { font: inherit; cursor: pointer; }',
+    `button.primary, button.plain { padding: 6px 12px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; color: inherit; background: ${ReviewPage.BG}; text-wrap: nowrap; }`,
+    `button.primary { border-color: ${ReviewPage.BRAND}; font-weight: 600; color: ${ReviewPage.ON_BRAND}; background: ${ReviewPage.BRAND}; }`,
+    'button:disabled { opacity: .45; cursor: not-allowed; }',
+    '.answer { display: flex; align-items: center; gap: 8px; margin: 0; }',
+    `.answer span { color: ${ReviewPage.INK2}; }`,
+    // A proposal before → after: the middle and right panels as one area, its two halves equal and each scrolling.
+    'main.proposal { display: flex; flex-direction: column; padding: 0; overflow: hidden; }',
+    'main.proposal > * { flex: none; }',
+    'main.proposal > h2 { margin: 12px 12px 0; }',
+    'main.proposal > .meta { margin: 2px 12px 0; }',
+    'main.proposal > .notice { margin: 8px 12px 0; }',
+    `main.proposal > .answer { padding: 10px 12px; border-bottom: 1px solid ${ReviewPage.LINE}; }`,
+    'main.proposal > .halves { flex: 1; min-height: 0; }',
+    '.halves { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }',
+    `.halves section { min-height: 0; overflow: auto; padding: 12px; border-right: 1px solid ${ReviewPage.LINE}; }`,
+    '.halves section:last-child { border-right: 0; }',
+    '.diff .line { display: block; min-height: 1.45em; border-radius: 3px; text-decoration: none; }',
+    `.diff del.line { text-decoration: line-through; text-decoration-color: ${ReviewPage.NO}; background: color-mix(in oklab, ${ReviewPage.NO} 14%, transparent); }`,
+    `.diff ins.line { background: color-mix(in oklab, ${ReviewPage.OK} 16%, transparent); }`,
   ].join('\n')
   /**
    * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
@@ -606,7 +693,7 @@ ${panel}
 <nav class="left" aria-label="Guideline versions">
 ${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}
 </nav>
-<main>
+<main${open === undefined ? '' : ' class="proposal"'}>
 ${middle}
 </main>${right === '' ? '' : `\n<aside class="detail report" aria-label="Trend report">\n${right}\n</aside>`}
 </div>`, true)
@@ -761,7 +848,10 @@ ${entries.join('\n')}
   /** The owner's comment as a read-only line under what it is about. */
   private static echo(text: string): string { return `<div class="mine">You: ${ReviewPage.escape(text)}</div>` }
 
-  /** The left panel: every listed project, then the picked project's jobs, newest first, then its answers outside a job when there are any. */
+  /**
+   * The left panel: every listed project, then the picked project's jobs, newest first, then its answers outside a job when there are any.
+   * A job with no comment yet carries the class `fresh`, which the style shows as a dot before its number.
+   */
   private static left(view: ReviewView): string {
     const { project } = view
     const projects = view.projects.map(each => {
@@ -772,7 +862,7 @@ ${entries.join('\n')}
     const jobs = project.jobs.map(job => {
       const on = !view.outside && view.job?.job_id === job.job_id
       const comments = new Set(job.reviews.map(review => review.step_id ?? '')).size
-      return `<a class="job${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.address(project.project, job.job_id))}"><span>Job ${
+      return `<a class="job${comments === 0 ? ' fresh' : ''}${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.address(project.project, job.job_id))}"><span>Job ${
         job.number}${job.guideline_version === undefined ? '' : ` <span class="pill">${ReviewPage.escape(job.guideline_version)}</span>`}</span><span class="l2">${
         ReviewPage.escape(ReviewPage.span(job))}</span><span class="l2">${ReviewPage.count(job.steps.length, 'step')} · ${comments === 0 ? 'no comments yet' : ReviewPage.count(comments, 'comment')}</span></a>`
     })
@@ -830,7 +920,7 @@ ${jobs.join('\n')}`
 
   /**
    * The step detail panel: what was asked, why, what it looked at, what happened next, and the cost, each under its label and shown in full.
-   * A part no record holds keeps its label and reads "Not recorded".
+   * A part no record holds keeps its label and reads "Not recorded". The last two parts sit in one wrapper (`facts`) so they share a line as two columns.
    */
   private static detail(step: TimelineStep, detail: StepDetail): string {
     const heading = step.automatic ? ReviewPage.AUTOMATIC[step.answer.answer] : ReviewPage.HEADINGS[step.line.kind] ?? step.line.kind
@@ -842,9 +932,9 @@ ${part(ReviewPage.PARTS.asked, asked === null ? undefined : ReviewPage.askedHtml
 ${part(ReviewPage.PARTS.why, why === null ? undefined : ReviewPage.whyHtml(why))}
 ${part(ReviewPage.PARTS.looked_at, read === null ? undefined : read.length === 0 ? '<p>Nothing was read.</p>'
     : read.map(each => `<p><code>${ReviewPage.escape(each.path)}</code> · ${each.used ? 'used' : 'not used'}</p>`).join(''))}
-${part(ReviewPage.PARTS.next, next === null ? undefined : `<p>${ReviewPage.escape(ReviewPage.OUTCOMES[next.outcome] ?? next.outcome)}</p>${
-    next.detail === '' ? '' : `<p><code>${ReviewPage.escape(next.detail)}</code></p>`}`)}
-${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocaleString('en-US')} tokens · ${cost.seconds.toFixed(1)} s`)}`
+<div class="facts"><div>${part(ReviewPage.PARTS.next, next === null ? undefined : `<p>${ReviewPage.escape(ReviewPage.OUTCOMES[next.outcome] ?? next.outcome)}</p>${
+    next.detail === '' ? '' : `<p><code>${ReviewPage.escape(next.detail)}</code></p>`}`)}</div>
+<div>${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocaleString('en-US')} tokens · ${cost.seconds.toFixed(1)} s`)}</div></div>`
   }
 
   private static askedHtml(asked: StepAsked): string {
@@ -859,7 +949,7 @@ ${part(ReviewPage.PARTS.cost, cost === null ? undefined : `${cost.tokens.toLocal
 
   private static whyHtml(why: StepWhy): string {
     if (why.by === 'fixed_checks') return `<p>${ReviewPage.AUTOMATIC[why.answer]} · ${ReviewPage.CHECKED}</p>`
-    return `<p><strong>${ReviewPage.DECISIONS[why.decision] ?? ReviewPage.escape(why.decision)}</strong> · risk ${ReviewPage.escape(why.risk)}</p><p>${ReviewPage.escape(why.reason)}</p>${
+    return `<p><strong${why.decision === 'approve' ? ' class="ok"' : why.decision === 'deny' ? ' class="no"' : ''}>${ReviewPage.DECISIONS[why.decision] ?? ReviewPage.escape(why.decision)}</strong> · risk ${ReviewPage.escape(why.risk)}</p><p>${ReviewPage.escape(why.reason)}</p>${
       why.choice === null ? '' : `<p>Chosen: ${ReviewPage.escape(why.choice)}</p>`}${why.alternative === '' ? '' : `<p>Instead: ${ReviewPage.escape(why.alternative)}</p>`}${
       why.cites === '' ? '' : `<p class="meta">Rests on: ${ReviewPage.escape(why.cites)}</p>`}`
   }

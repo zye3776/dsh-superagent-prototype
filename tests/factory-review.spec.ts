@@ -387,6 +387,52 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   expect(style).toContain('var(--dsw-alias-label-primary)')
 })
 
+it('carries its whole look in the one style its policy allows: three panels on one screen, and a colour to fall back on behind every DSH token', async () => {
+  await serve()
+  put('actions.jsonl', [action()])
+  const answer = await call('GET', '/review', { cookie: await signIn() })
+  // The style is the page's own, inside it, with the nonce the policy allows a style to carry: nothing else could load under `default-src 'none'`.
+  const nonce = /style-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(String(answer.headers['content-security-policy']))![1]!
+  const page = dom(answer.text)
+  expect([page.querySelectorAll('style').length, page.querySelector('style')!.getAttribute('nonce'), page.querySelector('link')]).toEqual([1, nonce, null])
+  const style = page.querySelector('style')!.textContent
+  // One screen with no page scroll: a 44px top bar as the body's first row, then the panels, up to 240px, the room left, up to 380px, each scrolling on its own.
+  for (const rule of [
+    'html, body { height: 100%; margin: 0; }',
+    'grid-template-rows: auto auto auto minmax(0, 1fr);',
+    'body > h1, body > .tabs, body > .crumb, body > .head { grid-row: 1; height: 44px; }',
+    // The panels always fit the window: the middle gives way first, then the sides narrow, so the step detail is never cut off.
+    '.cols.with-detail { grid-template-columns: clamp(160px, 20vw, 240px) minmax(0, 1fr) clamp(240px, 30vw, 380px); }',
+    '.cols > * { min-width: 0; min-height: 0; overflow: auto;',
+    // The comment field takes the height the step detail leaves, never under 120px.
+    '.detail > .comment { flex: 1 0 auto; display: flex; flex-direction: column; min-height: 120px;',
+    // A proposal's before and after are two equal halves, each scrolling.
+    '.halves { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }',
+    '.diff del.line { text-decoration: line-through;',
+  ]) expect(style).toContain(rule)
+  // The markup those rules lay out: the three panels as the grid's children, and the comment field as the detail panel's own child.
+  expect([...page.querySelectorAll('body > .cols.with-detail > *')].map(each => each.tagName)).toEqual(['NAV', 'MAIN', 'ASIDE'])
+  expect([page.querySelector('body > h1')!.textContent, page.querySelector('body > nav.tabs a.on')!.textContent, page.querySelector('aside.detail > .comment > textarea') === null]).toEqual(['Review', ReviewPage.TAB_JOBS, false])
+  const read: GuidelineRead = { folder: '/factory/guideline', versions: [{ version: 1, date: null, from_job: null, from_version: null, text: 'Old line.\n' }], current: null, reason: null }
+  read.current = read.versions[0]!
+  const open: GuidelineProposal = { project, job_id: 'job-1', number: 1, text: 'New line.\n', ts: NOW }
+  const proposal = dom(new ReviewPage('n').guideline(read, undefined, [open], open))
+  expect([proposal.querySelectorAll('main.proposal > .halves > section').length, proposal.querySelector('.halves del.line')!.textContent, proposal.querySelector('.halves ins.line')!.textContent])
+    .toEqual([2, 'Old line.', 'New line.'])
+  expect(dom(new ReviewPage('n').guideline(read, read.versions[0])).querySelector('main')!.className).toBe('')
+  // DSH's client does not run in this page, so no token is defined in it. Every token is followed by the colour to show without it. The one
+  // exception is the body's text colour, which the browser drops when the token is missing: the body then takes the colour set on `html`.
+  const uses = [...style.matchAll(/var\(--dsw-alias-[a-z0-9-]+(\)|, )/g)].map(([, end]) => end)
+  expect([uses.length > 20, uses.filter(end => end === ')').length]).toEqual([true, 1])
+  expect(style).toContain('html { color: CanvasText;')
+  expect(style).toMatch(/\nbody \{[^}]* color: var\(--dsw-alias-label-primary\);/)
+  // The colours behind the tokens are the browser's own, which follow light and dark by themselves; the page still picks none.
+  expect(style).not.toMatch(/min-width: [1-9]/)
+  expect(style).toContain(':root { color-scheme: light dark; }')
+  for (const [, fallback] of style.matchAll(/var\(--dsw-alias-[a-z0-9-]+, ((?:[^()]|\([^()]*\))+)\)/g)) expect(fallback).toMatch(/^(?:Canvas|CanvasText|LinkText|color-mix\(in oklab, CanvasText \d+%, Canvas\))$/)
+  expect(style).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+})
+
 it('says there is no job yet when the project holds none, and skips lines it cannot read', async () => {
   await serve([project, join(root, 'missing')])
   const cookie = await signIn()

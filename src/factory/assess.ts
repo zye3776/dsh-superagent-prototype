@@ -16,7 +16,10 @@
  * time (`approvals.ts`) under the factory's own `request_key` of that exact call. A worker holds no shared token, so `/ask` asks for none and sends
  * none back. Instead it sends its session's ask key (`AskKey` in `token.ts`), which only a holder of the token can make for that `session_id`: an ask
  * without the right key for the body's `session_id` is refused with 401 before any judge is asked, so no caller can put questions into another
- * session's judge thread. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
+ * session's judge thread. A worker cannot set its ask's tier either: the route sorts every ask itself, on the raw call, with the factory's own tier
+ * sorter (`tier.ts`, the plugin's `tierModule` setting), the working folder the ask names (`cwd`, inside the project) and the session's temp folder
+ * (`scratchpad_dir`, outside the project), so the ask is judged and recorded at the tier the factory's gate would give the real call. A tier a
+ * worker writes into its ask is not read. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
  * approve replaces it.
  * A decision `/assess` writes for a request drops the approval held for that request's `request_key` (same session and project): the real call
  * has now been decided, so the same call sent again is judged again and not allowed on the older approval. An ask that was still with the judge
@@ -28,9 +31,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, relative, resolve } from 'node:path'
 import { PendingApprovals, type ApprovalClaim } from './approvals.ts'
 import { AssessRefusal, DecisionWriter, TierChoice, type Decision, type DecisionLine, type Tier } from './decisions.ts'
+import { FactoryTierModule, type TierSource } from './tier.ts'
 import { AskKey, SharedTokenFile } from './token.ts'
 
 export { AssessRefusal, DecisionsFile, TierChoice, type Decision, type DecisionLine, type DecisionRead, type Tier } from './decisions.ts'
@@ -78,8 +82,8 @@ export class TempFactsShape {
  * worker session that asks, which gets a judge Session of its own. `temp` holds the request's temp-folder facts for the judge: left out by a caller
  * that sends none, `null` when the hook could not work them out. `context` is background a worker gave with an ask: its own claim, never evidence.
  * `tier` is the checking tier the factory's gate sorted the request into by plain code (1 project direction, 2 third-party tools, 3 low risk), and
- * `tier_rule` the name of its rule: both `null` when the gate left the request unsorted, and left out by a caller that sends none. An `/ask` never
- * carries them: a worker cannot set its own tier.
+ * `tier_rule` the name of its rule: both `null` when the gate left the request unsorted, and left out by a caller that sends none. A worker cannot
+ * set them: the route sorts each `/ask` itself (`AssessRoute.ask`) and reads no tier from the ask's body.
  */
 export interface AssessRequest {
   request_id: string; project: string; session_id: string; temp?: TempFacts | null; context?: string; tier?: Tier | null; tier_rule?: string | null
@@ -88,8 +92,14 @@ export interface AssessRequest {
 /**
  * What a worker posts to `/ask` before it acts: the call it is about to make (`session_id`, `tool_name` and `tool_input`, exactly as its tool call
  * will carry them), `description` (what the action is and why) and, when it has some, `context` (background the judge would not see otherwise).
+ * `cwd` is the folder the action will run in: an absolute path that is the project or lies inside it; left out, the project counts as that folder.
+ * `scratchpad_dir` is the worker session's own temp folder: an absolute path apart from the project (not it, not inside it, not around it); left out
+ * or `null` when the session has none. The route reads both only to sort the ask into its checking tier.
  */
-export interface AskRequest { project: string; session_id: string; tool_name: string; tool_input: unknown; description: string; context?: string }
+export interface AskRequest {
+  project: string; session_id: string; tool_name: string; tool_input: unknown; description: string; context?: string
+  cwd?: string; scratchpad_dir?: string | null
+}
 /** What the factory's hook posts to `/claim`: its own `request_id`, and what identifies the request an approval may be held for. */
 export interface ClaimRequest extends ApprovalClaim { request_id: string }
 
@@ -144,7 +154,8 @@ export class AssessRoute {
   private readonly projects: ReadonlySet<string>
   constructor(projects: readonly string[], private readonly tokens: TokenSource = new SharedTokenFile(), private readonly judge: Judge = new StubJudge(),
     private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter(),
-    private readonly approvals: PendingApprovals = new PendingApprovals(undefined, () => now().getTime())) {
+    private readonly approvals: PendingApprovals = new PendingApprovals(undefined, () => now().getTime()),
+    private readonly tiers: TierSource = new FactoryTierModule()) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     // Normalised, so an entry written with a trailing slash or `..` still matches the absolute path a caller sends.
@@ -276,10 +287,16 @@ export class AssessRoute {
    * function or the mask the ask is refused with 503 before any judge is asked. The judged request has the shape of an `/assess` request, with a new
    * `request_id`, the worker's `description` as `reason`, and `context` when given. It carries no `temp`: a worker cannot state those facts itself,
    * and the hook claims no approval for a request the temp-folder rule is about.
+   * The ask is also sorted into its checking tier here, before masking, on the raw tool input, the ask's `cwd` (the project when it names none) and
+   * its `scratchpad_dir`, with the factory's own tier sorter (`tier.ts`): the same call the factory's hook makes for the real call. The judged
+   * request then carries that `tier` and `tier_rule`, so the decision is recorded at the gate's tier (`tier_set_by: 'gate'`) unless the judge
+   * raises it. An ask the sorter leaves unsorted, or one that cannot be sorted (no tier module, or one that fails), carries none: the judge's
+   * grade sets its tier. A tier problem never refuses the ask.
    */
   async ask(ask: AskRequest): Promise<string> {
     if (!this.projects.has(ask.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
     const key = await this.writer.requestKey(ask.session_id, ask.tool_name, ask.tool_input)
+    const gate = await this.tiers.sort({ tool_name: ask.tool_name, tool_input: ask.tool_input, cwd: ask.cwd ?? ask.project, scratchpad_dir: ask.scratchpad_dir ?? null })
     const masked = await this.writer.maskRequest(ask.project, { session_id: ask.session_id, tool_name: ask.tool_name, tool_input: ask.tool_input,
       reason: ask.description, ...(ask.context === undefined ? {} : { context: ask.context }) })
     const { session_id: session, context } = masked
@@ -288,7 +305,8 @@ export class AssessRoute {
     if (ask.context !== undefined && typeof context !== 'string') throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
     const since = this.approvals.mark()
     const line = await this.assess({ request_id: randomUUID(), request_key: key, project: ask.project, session_id: session, tool_name: masked.tool_name,
-      tool_input: masked.tool_input, reason: masked.reason, ...(typeof context === 'string' ? { context } : {}) })
+      tool_input: masked.tool_input, reason: masked.reason, ...(typeof context === 'string' ? { context } : {}),
+      ...(gate === null ? {} : { tier: gate.tier, tier_rule: gate.tier_rule }) })
     const decision = JSON.parse(line) as DecisionLine
     const until = decision.decision === 'approve'
       ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }, since)?.toISOString() ?? null
@@ -310,7 +328,10 @@ export class AssessRoute {
 
   /**
    * Checks a parsed `/ask` body and returns only its known fields. Refuses with 400 a body that is not an object, one without `project`, `session_id`,
-   * `tool_name`, `tool_input` or `description`, and one whose `context` is present but not text.
+   * `tool_name`, `tool_input` or `description`, and one whose `context` is present but not text. Refuses too a `cwd` that is present but not an
+   * absolute path equal to the project or inside it, and a `scratchpad_dir` that is present but neither `null` nor an absolute path apart from the
+   * project: a temp folder that is the project, lies inside it or holds it would let a delete in the project pass as a write to the temp folder.
+   * Any other field is dropped, a `tier` or `tier_rule` among them: a worker cannot set its own tier.
    */
   static askOf(body: unknown): AskRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
@@ -321,7 +342,21 @@ export class AssessRoute {
     if (input === undefined) throw new AssessRefusal(400, 'The request has no tool_input')
     if (typeof description !== 'string' || description.trim() === '') throw new AssessRefusal(400, 'The request has no description')
     if ('context' in body && typeof context !== 'string') throw new AssessRefusal(400, 'The request has a malformed context')
-    return { project, session_id: session, tool_name: tool, tool_input: input, description, ...(typeof context === 'string' ? { context } : {}) }
+    const { cwd, scratchpad_dir: scratchpad } = body as Record<string, unknown>
+    if ('cwd' in body && !(typeof cwd === 'string' && isAbsolute(cwd) && AssessRoute.holds(project, cwd))) throw new AssessRefusal(400, 'The request has a malformed cwd')
+    if ('scratchpad_dir' in body && scratchpad !== null
+      && !(typeof scratchpad === 'string' && isAbsolute(scratchpad) && !AssessRoute.holds(project, scratchpad) && !AssessRoute.holds(scratchpad, project))) {
+      throw new AssessRefusal(400, 'The request has a malformed scratchpad_dir')
+    }
+    return { project, session_id: session, tool_name: tool, tool_input: input, description, ...(typeof context === 'string' ? { context } : {}),
+      ...(typeof cwd === 'string' ? { cwd } : {}), ...(typeof scratchpad === 'string' ? { scratchpad_dir: scratchpad } : {}) }
+  }
+
+  /** Whether `inner` is the folder `outer` or lies inside it, by the paths' text once `.` and `..` are worked out. Both are absolute paths. */
+  private static holds(outer: string, inner: string): boolean {
+    if (!isAbsolute(outer) || !isAbsolute(inner)) return false
+    const steps = relative(resolve(outer), resolve(inner))
+    return steps === '' || (steps !== '..' && !steps.startsWith('../') && !isAbsolute(steps))
   }
 
   /** Checks a parsed `/claim` body and returns only its known fields. Refuses with 400 a body that is not an object or lacks one of the four texts. */

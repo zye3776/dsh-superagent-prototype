@@ -32,5 +32,9 @@
     # read-only shell commands run, and no secret file is read. There is no default: without it no judge Session is opened and
     # the route answers 503 and writes nothing. Like the mask file it is loaded once: restart DSH after the factory rebuilds it.
     guardModule: <absolute path of lib/dist/judgeGuard.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/judgeGuard.js>
+    # The factory's built tier sorter file. Every action a worker asks about first (POST /ask) is sorted with it, so the ask is
+    # judged and recorded at the checking tier the factory's gate would give the real call. There is no default: without it an
+    # ask has no gate tier and the judge's own grade sets its tier (nothing is refused). Loaded once, like the other two files.
+    tierModule: <absolute path of lib/dist/gateTier.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/gateTier.js>
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

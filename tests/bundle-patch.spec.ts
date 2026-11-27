@@ -111,4 +111,5 @@ it('turns the judge preset and the factory route on in the factory\'s example pr
   for (const id of ['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu']) expect(example).toMatch(new RegExp(`^- id: ${id}\\n  disabled: true$`, 'm'))
   expect(example).toMatch(/^    guardModule: <absolute path of lib\/dist\/judgeGuard\.js /m)
   expect(example).toMatch(/^    maskModule: <absolute path of lib\/dist\/decisionMask\.js /m)
+  expect(example).toMatch(/^    tierModule: <absolute path of lib\/dist\/gateTier\.js /m)
 })

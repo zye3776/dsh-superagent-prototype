@@ -7,10 +7,11 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { PendingApprovals } from '../src/factory/approvals.ts'
-import { AssessRefusal, AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type Verdict } from '../src/factory/assess.ts'
+import { AssessRefusal, AssessRoute, DecisionsFile, StubJudge, TempFactsShape, TierChoice, type AssessRequest, type Judge, type TempFacts, type Verdict } from '../src/factory/assess.ts'
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
+import { FactoryTierModule, type TierSource } from '../src/factory/tier.ts'
 import { AskKey, SharedTokenFile } from '../src/factory/token.ts'
 import { ModelJudge } from '../src/factory/verdict.ts'
 import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
@@ -68,14 +69,14 @@ const judgeReply = () => JSON.stringify({ decision: 'approve', risk: 'low', undo
  * The stub decides unless a test gives another judge.
  */
 let routes = new Map<string, Route>()
-async function serve(projects: string[] = [project], mask: DecisionWriter = writer(), judge: Judge = new StubJudge(), approvals?: PendingApprovals): Promise<Route> {
+async function serve(projects: string[] = [project], mask: DecisionWriter = writer(), judge: Judge = new StubJudge(), approvals?: PendingApprovals, tiers?: TierSource): Promise<Route> {
   routes = new Map<string, Route>()
   // Each request goes to the route registered for its path, as DSH's web server sends it.
   server = createServer((req, res) => { void routes.get(req.url ?? '')!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
   const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { routes.set(registered.path, registered); return () => {} } } }
-  new AssessRoute(projects, new SharedTokenFile(tokenPath()), judge, () => new Date(NOW), mask, approvals).register(ctx as never)
+  new AssessRoute(projects, new SharedTokenFile(tokenPath()), judge, () => new Date(NOW), mask, approvals, tiers).register(ctx as never)
   return routes.get('/assess')!
 }
 /** Sends one request to `path` with the valid token, unless `headers` gives another one or `undefined` for none. */
@@ -275,6 +276,8 @@ it('is a plugin that needs the web server and DSH\'s Session services, and mount
   expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath(), approvalSeconds: 120 })
   expect(plugin.Config({ maskModule: maskPath() })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, maskModule: maskPath(), approvalSeconds: 120 })
   expect(() => plugin.Config({ maskModule: 'relative/decisionMask.js' })).toThrow()
+  expect(plugin.Config({ tierModule: '/factory/lib/dist/gateTier.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, tierModule: '/factory/lib/dist/gateTier.js', approvalSeconds: 120 })
+  expect(() => plugin.Config({ tierModule: 'relative/gateTier.js' })).toThrow()
   expect(plugin.Config({})).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, approvalSeconds: 120 })
   expect(plugin.Config({ approvalSeconds: 600 }).approvalSeconds).toBe(600)
   for (const seconds of [0, 601, 1.5]) expect(() => plugin.Config({ approvalSeconds: seconds }), String(seconds)).toThrow()
@@ -902,4 +905,137 @@ it('leaves a held approval alone when another session\'s ask is refused or denie
   const denied = await ask({ session_id: 's2' })
   expect([denied.status, denied.body.pending_until]).toEqual([200, null])
   expect(await claimed()).toBe(true)
+})
+
+/**
+ * A stand-in for the factory's built tier file, with the same export. It sorts a call into the tier its `tool_input.want` names and leaves a call
+ * without one unsorted. The rule's name is everything the sorter was handed, so a test can tell that it got the raw values.
+ */
+const tierPath = () => join(root, 'fake-tier.mjs')
+const FAKE_TIER = `export class GateTierSorter {
+  sort(request) { return request.toolInput.want === undefined ? null : { tier: request.toolInput.want, rule: JSON.stringify(request) } }
+}\n`
+/** A judge that grades every request `risk` and works the final tier out as the real judge does (`TierChoice`), keeping what it was asked. */
+function gradingJudge(risk: Verdict['risk'] = 'low'): Judge & { seen: AssessRequest[] } {
+  const seen: AssessRequest[] = []
+  return { seen, decide: (asked: AssessRequest): Verdict => {
+    seen.push(asked)
+    return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission', decision: 'approve', choice: null, risk,
+      ...TierChoice.of(TierChoice.gateTierOf(asked), risk), reason: JUDGED, alternative: '', cites: 'Ticket 29', reads: [], tokens: 7 }
+  } }
+}
+/** Serves the route with a grading judge, which is returned, and the tier module `tiers` (the fake one unless a test gives another). */
+async function serveSorted(risk: Verdict['risk'] = 'low', tiers?: TierSource): Promise<Judge & { seen: AssessRequest[] }> {
+  writeFileSync(tierPath(), FAKE_TIER)
+  const judge = gradingJudge(risk)
+  await serve([project], writer(), judge, undefined, tiers ?? new FactoryTierModule(tierPath()))
+  return judge
+}
+const tierOf = (answer: Answer) => { const decision = answer.body.decision as Record<string, unknown>; return [decision.tier, decision.tier_set_by] }
+
+it('sorts an ask with the tier module, on the raw call and the ask\'s folders, and records the gate\'s tier', async () => {
+  const judge = await serveSorted()
+  const planning = { file_path: join(project, '_bmad-output', 'x', 'prd-x.md'), old_string: 'a', new_string: 'b', want: 1 }
+  const temp = join(root, 'session-temp')
+  const first = await ask({ tool_name: 'Edit', tool_input: planning, cwd: join(project, 'src'), scratchpad_dir: temp })
+  expect(first.status).toBe(200)
+  // Tier 1 from the gate, though the judge graded the action low (tier 3): the judge cannot lower it.
+  expect(tierOf(first)).toEqual([1, 'gate'])
+  expect(JSON.parse(lines()[0]!)).toMatchObject({ tier: 1, tier_set_by: 'gate' })
+  expect(first.body.pending_until).not.toBeNull()
+  const seen = judge.seen[0]!
+  expect(Object.keys(seen)).toEqual(['request_id', 'request_key', 'project', 'session_id', 'tool_name', 'tool_input', 'reason', 'tier', 'tier_rule'])
+  expect(seen.tier).toBe(1)
+  // The sorter was handed the raw input (the judge sees the masked one), the ask's working folder and its temp folder, under the hook's field names.
+  expect(JSON.parse(seen.tier_rule as string)).toEqual({ toolName: 'Edit', toolInput: planning, cwd: join(project, 'src'), scratchpadDir: temp })
+  expect(seen.tool_input).toEqual({ masked: planning })
+
+  // A low-risk call in the project folder: tier 3, set by the gate.
+  const check = await ask({ tool_input: { command: 'bun test', want: 3 }, cwd: project })
+  expect(tierOf(check)).toEqual([3, 'gate'])
+  expect(judge.seen[1]).toMatchObject({ tier: 3 })
+  expect(lines()).toHaveLength(2)
+})
+
+it('lets the judge raise the gate\'s tier of an ask, and sorts an ask without cwd or temp folder in the project folder', async () => {
+  const judge = await serveSorted('high')
+  const asked = await ask({ tool_input: { command: 'bun test', want: 3 } })
+  expect(tierOf(asked)).toEqual([1, 'judge'])
+  expect(JSON.parse(judge.seen[0]!.tier_rule as string)).toEqual({ toolName: 'Bash', toolInput: { command: 'bun test', want: 3 }, cwd: project, scratchpadDir: null })
+  // `null` says the session has no temp folder, as leaving it out does.
+  await ask({ tool_input: { command: 'bun test', want: 2 }, scratchpad_dir: null })
+  expect(JSON.parse(judge.seen[1]!.tier_rule as string)).toMatchObject({ cwd: project, scratchpadDir: null })
+})
+
+it('judges an ask the sorter leaves unsorted without a gate tier: the judge\'s grade sets it', async () => {
+  const judge = await serveSorted('medium')
+  const asked = await ask()
+  expect([asked.status, ...tierOf(asked)]).toEqual([200, 2, 'judge'])
+  expect('tier' in judge.seen[0]!).toBe(false)
+  expect('tier_rule' in judge.seen[0]!).toBe(false)
+})
+
+it('still judges an ask when the tier module is missing or cannot be used, and never answers 503 for it', async () => {
+  const broken: Record<string, string | undefined> = {
+    'no module': undefined,
+    'a relative path': 'fake-tier.mjs',
+    'a missing file': join(root, 'missing-tier.mjs'),
+    'a file that does not load': join(root, 'broken-tier.mjs'),
+    'no GateTierSorter': join(root, 'no-export-tier.mjs'),
+    'a sorter that cannot be built': join(root, 'no-build-tier.mjs'),
+    'a sorter that throws': join(root, 'throwing-tier.mjs'),
+    'a result in another shape': join(root, 'bad-shape-tier.mjs'),
+  }
+  writeFileSync(join(root, 'broken-tier.mjs'), 'export class GateTierSorter {\n')
+  writeFileSync(join(root, 'no-export-tier.mjs'), 'export const Other = 1\n')
+  writeFileSync(join(root, 'no-build-tier.mjs'), 'export class GateTierSorter { constructor() { throw new Error("no") } }\n')
+  writeFileSync(join(root, 'throwing-tier.mjs'), 'export class GateTierSorter { sort() { throw new Error("no") } }\n')
+  writeFileSync(join(root, 'bad-shape-tier.mjs'), 'export class GateTierSorter { sort() { return { tier: 4, rule: "r" } } }\n')
+  for (const [name, path] of Object.entries(broken)) {
+    const judge = await serveSorted('low', new FactoryTierModule(path))
+    const asked = await ask({ tool_input: { command: 'rm -rf src', want: 1 } })
+    expect([asked.status, ...tierOf(asked)], name).toEqual([200, 3, 'judge'])
+    expect(judge.seen, name).toHaveLength(1)
+    expect('tier' in judge.seen[0]!, name).toBe(false)
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+  }
+})
+
+it('ignores a tier a worker writes into its ask', async () => {
+  const judge = await serveSorted()
+  const asked = await ask({ tool_input: { command: 'rm -rf src', want: 1 }, tier: 3, tier_rule: 'x' })
+  expect(tierOf(asked)).toEqual([1, 'gate'])
+  expect(judge.seen[0]!.tier_rule).not.toBe('x')
+  // Unsorted by the gate, the worker's tier still counts for nothing: the judge's grade sets it.
+  const unsorted = await ask({ tier: 1, tier_rule: 'x' })
+  expect(tierOf(unsorted)).toEqual([3, 'judge'])
+  expect('tier' in judge.seen[1]!).toBe(false)
+  expect('tier_rule' in judge.seen[1]!).toBe(false)
+})
+
+it('refuses an ask whose cwd is not an absolute path in the project, before any judge is asked', async () => {
+  const judge = await serveSorted()
+  const bad: unknown[] = ['src', '', join(root, 'elsewhere'), `${project}-other`, join(project, '..', 'elsewhere'), root, '/', 7, null, [project]]
+  for (const cwd of bad) {
+    const asked = await ask({ cwd })
+    expect([asked.status, asked.body], JSON.stringify(cwd)).toEqual([400, { error: 'The request has a malformed cwd' }])
+  }
+  // The project itself, a folder inside it, and one written with `.` or `..` that stays inside are taken.
+  for (const cwd of [project, `${project}/`, join(project, 'src', 'deep'), `${project}/src/../docs`]) expect((await ask({ cwd })).status, cwd).toBe(200)
+  expect(judge.seen).toHaveLength(4)
+  expect(lines()).toHaveLength(4)
+})
+
+it('refuses an ask whose scratchpad_dir is not an absolute path apart from the project, before any judge is asked', async () => {
+  const judge = await serveSorted()
+  const bad: unknown[] = ['tmp/scratchpad', '', project, `${project}/`, join(project, 'tmp'), join(project, 'src', '..'), root, '/', 7, true, [join(root, 'temp')]]
+  for (const dir of bad) {
+    const asked = await ask({ tool_input: { command: 'rm -rf src', want: 3 }, scratchpad_dir: dir })
+    expect([asked.status, asked.body], JSON.stringify(dir)).toEqual([400, { error: 'The request has a malformed scratchpad_dir' }])
+  }
+  expect(judge.seen).toHaveLength(0)
+  expect(existsSync(file())).toBe(false)
+  // A folder beside the project, one whose name only starts like the project's, and `null` are taken.
+  for (const dir of [join(root, 'session-temp'), `${project}-temp`, null]) expect((await ask({ scratchpad_dir: dir })).status, String(dir)).toBe(200)
+  expect(judge.seen).toHaveLength(3)
 })

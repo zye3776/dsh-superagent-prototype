@@ -11,12 +11,13 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { JSDOM, VirtualConsole } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/factory/index.ts'
-import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource } from '../src/factory/records.ts'
+import { FactoryRecordFile, FactoryRecordsModule, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type ReviewLine, type StepDetail, type StepSource, type TrendReport } from '../src/factory/records.ts'
 import { ReviewAccess, ReviewPage, ReviewRoute, ReviewSignIn, type GuidelineAnswerer } from '../src/factory/review.ts'
 import type { GuidelineSaved } from '../src/factory/save.ts'
 import { OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, type GuidelineProposal, type OrcaRun } from '../src/factory/talk.ts'
 import { SharedTokenFile } from '../src/factory/token.ts'
 import { PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
+import { fakeDsh } from './fixtures/judge.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
 interface Route { kind: string; path: string; auth?: string; handler: Handler }
@@ -135,14 +136,14 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-it('registers five exact routes, anonymous to DSH\'s web server so the page answers its own line, and refuses a web server that is not on loopback', async () => {
+it('registers six exact routes, anonymous to DSH\'s web server so the page answers its own line, and refuses a web server that is not on loopback', async () => {
   const registered = await serve()
   expect(registered.map(route => [route.kind, route.path, route.auth])).toEqual([['exact', '/review', 'anonymous'],
-    ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous'], ['exact', '/review/answer', 'anonymous']])
+    ['exact', '/review/comment', 'anonymous'], ['exact', '/review/talk', 'anonymous'], ['exact', '/review/proposal', 'anonymous'], ['exact', '/review/answer', 'anonymous'], ['exact', '/review/trends', 'anonymous']])
   const disposed: string[] = []
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => () => { disposed.push(route.path) } } }
   new ReviewRoute([project]).register(ctx as never)()
-  expect(disposed).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer'])
+  expect(disposed).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer', '/review/trends'])
   expect(() => new ReviewRoute([project]).register({ webServer: { host: '0.0.0.0', port: 3083, register: () => () => {} } } as never)).toThrow('loopback')
   expect(() => new ReviewRoute(['relative/project'])).toThrow('absolute')
 })
@@ -761,7 +762,7 @@ it('is wired into the plugin without DSH\'s connection service: the page refuses
   expect(proposed.answer.status).toBe(409)
 })
 
-it('is wired into the plugin for Accept and the guideline: sessions read the remote\'s main after the start fetch, and Accept merges through the configured glab', async () => {
+it('is wired into the plugin for Accept and the guideline: sessions read the remote\'s main after the start fetch, and Accept merges the new version and the old one\'s trend report through the configured glab', async () => {
   // A throwaway factory: a bare remote and a clone, the clone holding the records module so its guideline reader names the clone's folder.
   const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
   const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
@@ -779,8 +780,12 @@ it('is wired into the plugin for Accept and the guideline: sessions read the rem
   git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(other, 'push', '--quiet', 'origin', 'main')
   const records = recordsModule(factory)
   writeFileSync(join(factory, 'proposeServer.js'), '// stand-in for the built propose server\n')
-  put('actions.jsonl', [action()])
+  put('actions.jsonl', [action({ guideline_version: 'v2' })])
   put('reviews.jsonl', [review()])
+  // A stand-in for the factory's built guard, and for DSH's Sessions: the trend report's one-off thread answers with a fixed text.
+  const guardModule = join(root, 'guard.mjs')
+  writeFileSync(guardModule, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
+  const threads = fakeDsh(() => 'Fewer wide approvals under v2.')
   // Stand-ins for orca and glab, named by the settings: glab's merge moves the bare remote's main to the commit it is given, as GitLab would.
   const orca = join(root, 'fake-orca')
   writeFileSync(orca, `#!/bin/sh\n[ "$2" = list ] && printf '%s' '{"result":{"repos":[]}}'\nexit 0\n`)
@@ -790,11 +795,12 @@ it('is wired into the plugin for Accept and the guideline: sessions read the rem
   chmodSync(orca, 0o755); chmodSync(glab, 0o755)
   const registered: Route[] = []
   const { ctx } = pluginContext(registered, dsh)
+  Object.assign(ctx, threads.ctx)
   const listeners: Record<string, (payload: { agent: unknown }) => Promise<unknown>> = {}
   Object.assign(ctx, { on: (name: string, listener: (payload: { agent: unknown }) => Promise<unknown>) => { listeners[name] = listener; return () => {} } })
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
-  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
   // The start fetch runs in the background: wait for the clone's copy of main to reach v2.
   for (let tries = 0; git(factory, 'rev-parse', 'refs/remotes/origin/main') !== git(bare, 'rev-parse', 'main'); tries++) {
     if (tries > 200) throw new Error('the start fetch never landed')
@@ -824,6 +830,11 @@ it('is wired into the plugin for Accept and the guideline: sessions read the rem
   await handler('/review/answer')(accepted.req, accepted.res)
   expect([accepted.answer.status, JSON.parse(accepted.answer.text)]).toMatchObject([200, { answered: 'accepted', version: 3, mr: 'https://gitlab.example/factory/-/merge_requests/9' }])
   expect(git(bare, 'show', 'main:guideline/v3.md')).toContain('Three.')
+  // The trend report of v2, the version Accept replaced, is in the same commit, written by one fresh thread that was asked about v2's job.
+  expect(git(bare, 'show', '--name-only', '--format=', 'main').split('\n').sort()).toEqual(['guideline/v2-trends.md', 'guideline/v3.md'])
+  const report = git(bare, 'show', 'main:guideline/v2-trends.md')
+  expect(report).toMatch(/^---\nversion: 2\ndate: \d{4}-\d{2}-\d{2}\njobs: 1\ncompared_with: 1\nwritten: accepted\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n\nFewer wide approvals under v2\.\n/)
+  expect([threads.agents.size, [...threads.agents.values()][0]!.asked[0]]).toMatchObject([1, expect.stringContaining('## Jobs under v2 (1)')])
   expect(readFileSync(glabLog, 'utf8')).toContain('mr merge 9 --yes --auto-merge=false --sha')
   expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
   expect(await sectionOf('main-2')).toContain('version 3')
@@ -1186,7 +1197,7 @@ describe('the Guideline tab', () => {
     const answer = await call('GET', ReviewRoute.guidelineAddress(), { cookie: await signIn() })
     expect(answer.status).toBe(200)
     const page = dom(answer.text)
-    expect(versionsOf(page)).toEqual([['v2 · current', '2026-11-22 · from the review of job job-2'], ['v1', '2026-11-21']])
+    expect(versionsOf(page)).toEqual([['v2 · current', '2026-11-22 · from the review of job job-2', 'No trend report yet'], ['v1', '2026-11-21', 'No trend report yet']])
     expect(page.querySelector('nav a.version.on')!.getAttribute('href')).toBe(ReviewRoute.guidelineAddress(2))
     expect(page.querySelector('main h2')!.textContent).toBe('Guideline v2 · current')
     expect(page.querySelector('.guideline-text')!.textContent).toBe('Ask me before <b>any</b> push.\nKeep it small.')
@@ -1219,16 +1230,16 @@ describe('the Guideline tab', () => {
     expect([...page.querySelectorAll('main p')].map(line => line.textContent)).toEqual([ReviewPage.NO_GUIDELINE_FOLDER, 'No zees-software-factory folder entry.'])
   })
 
-  it('is reached from the Jobs tab, has no control, keeps the five routes, and needs DSH\'s sign-in', async () => {
+  it('is reached from the Jobs tab, has only the trend report\'s button, keeps the six routes, and needs DSH\'s sign-in', async () => {
     const registered = await serve([project], new GuidelineRecords(twoVersions()))
-    expect(registered.map(route => route.path)).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer'])
+    expect(registered.map(route => route.path)).toEqual(['/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer', '/review/trends'])
     expect((await call('GET', ReviewRoute.guidelineAddress())).status).toBe(401)
     const cookie = await signIn()
     const jobs = dom((await call('GET', ReviewRoute.PATH, { cookie })).text)
     expect([...jobs.querySelectorAll('nav.tabs a')].map(link => [link.textContent, link.getAttribute('href'), link.classList.contains('on')]))
       .toEqual([['Jobs', '/review', true], ['Guideline', ReviewRoute.guidelineAddress(), false]])
     const page = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
-    expect([...page.querySelectorAll('form, button, select, input, textarea')].length).toBe(0)
+    expect([...page.querySelectorAll('form, button, select, input, textarea')].map(control => control.id)).toEqual(['write-trend'])
   })
 })
 
@@ -1639,6 +1650,8 @@ describe('the owner\'s answer to a proposal', () => {
     readonly asked: GuidelineProposal[] = []
     answer: GuidelineSaved = { saved: true, version: 2, mr: 'https://gitlab.example/factory/-/merge_requests/7' }
     async accept(proposal: GuidelineProposal, _base: number | null): Promise<GuidelineSaved> { this.asked.push(proposal); return this.answer }
+    readonly reports: number[] = []
+    async report(version: number): Promise<GuidelineSaved> { this.reports.push(version); return this.answer }
   }
   const TEXT = '# Guideline\nKeep to the minimum feature.\nAsk first.\n'
   /** A page with v1 and one proposal for job 1 waiting, as a talk's tool leaves it. */
@@ -1760,7 +1773,7 @@ describe('the owner\'s answer to a proposal', () => {
     const ok = browse()
     expect(ok.notice.hasAttribute('hidden')).toBe(true)
     ok.accept.click()
-    expect([ok.accept.disabled, ok.reject.disabled, ok.notice.textContent]).toEqual([true, true, ReviewPage.SAVING_VERSION])
+    expect([ok.accept.disabled, ok.reject.disabled, ok.notice.textContent]).toEqual([true, true, ReviewPage.savingWithReport(1)])
     await settle(); await settle(); await settle()
     expect(sent).toEqual([{ url: ReviewRoute.ANSWER_PATH, method: 'POST', body: { project, job_id: 'job-1', ts: NOW, answer: 'accept', base: 1 } }])
     expect(went.length).toBe(1)
@@ -1778,6 +1791,113 @@ describe('the owner\'s answer to a proposal', () => {
     page.reject.click()
     await settle(); await settle(); await settle()
     expect([(sent.at(-1) as { body: { answer: string } }).body.answer, page.notice.querySelector('a')]).toEqual(['reject', null])
+    page.window.close()
+  })
+
+  const trends = (cookie: string | undefined, body: unknown, headers: Record<string, string | undefined> = {}) =>
+    call('POST', ReviewRoute.TRENDS_PATH, { origin: origin(), cookie, 'content-type': 'application/json', ...headers }, typeof body === 'string' ? body : JSON.stringify(body))
+
+  it('"Write trend report" asks the saver for the current version\'s report and sends the page to that version; a failure answers 503 with the step and the merge request', async () => {
+    const saver = new Saver()
+    saver.answer = { saved: true, version: 1, mr: 'https://gitlab.example/factory/-/merge_requests/9' }
+    const cookie = await waiting(saver)
+    const written = await trends(cookie, { version: 1 })
+    expect([written.status, JSON.parse(written.text)]).toEqual([200, { written: 1, href: ReviewRoute.guidelineAddress(1), mr: 'https://gitlab.example/factory/-/merge_requests/9' }])
+    expect(saver.reports).toEqual([1])
+    saver.answer = { saved: false, reason: 'Not saved: the merge step failed: not mergeable', mr: 'https://gitlab.example/factory/-/merge_requests/10' }
+    const failed = await trends(cookie, { version: 1 })
+    expect([failed.status, JSON.parse(failed.text)]).toEqual([503, { error: 'Not saved: the merge step failed: not mergeable', mr: 'https://gitlab.example/factory/-/merge_requests/10' }])
+  })
+
+  it('refuses a report of a version that is not current, a bad body, a save running, and the button without a saver; and needs DSH\'s sign-in and an Origin', async () => {
+    const saver = new Saver()
+    const cookie = await waiting(saver)
+    const status = async (body: unknown, headers: Record<string, string | undefined> = {}, signedIn: string | null = cookie) => (await trends(signedIn ?? undefined, body, headers)).status
+    const notCurrent = await trends(cookie, { version: 2 })
+    expect([notCurrent.status, (JSON.parse(notCurrent.text) as { error: string }).error]).toEqual([409, 'Not saved: only the current version\'s trend report can be written. Reload the page.'])
+    for (const body of [{}, { version: 0 }, { version: 1.5 }, { version: '1' }, 'not json']) expect(await status(body)).toBe(400)
+    expect(await status({ version: 1 }, {}, null)).toBe(401)
+    expect(await status({ version: 1 }, { origin: 'https://elsewhere.example' })).toBe(403)
+    expect((await call('GET', ReviewRoute.TRENDS_PATH, { cookie })).status).toBe(405)
+    saver.busy = true
+    expect(await status({ version: 1 })).toBe(409)
+    expect(saver.reports).toEqual([])
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+    const plain = await waiting()
+    const refused = await trends(plain, { version: 1 })
+    expect([refused.status, (JSON.parse(refused.text) as { error: string }).error]).toEqual([503, 'Not saved: writing a trend report is not set up here'])
+  })
+
+  it('shows the picked version\'s report beside it, with when it was written; the current version has the button, an older one without a report says none was written', () => {
+    const versions: GuidelineVersion[] = [3, 2, 1].map(version => ({ version, date: `2026-11-2${version}`, from_job: null, from_version: null, text: `Text of v${version}.` }))
+    const read: GuidelineRead = { folder: '/factory/guideline', versions, current: versions[0]!, reason: null, reports: [
+      { version: 2, date: '2026-11-24', jobs: 5, compared_with: 1, written: 'accepted', text: '# Trend report for guideline v2\n\nCompared with v1.\n\n<b>Fewer</b> wide approvals.\n' },
+    ] }
+    const pageOf = (version: number) => dom(new ReviewPage('n').guideline(read, versions.find(each => each.version === version)))
+    const v2 = pageOf(2)
+    expect([...v2.querySelectorAll('nav a.version')].map(row => row.querySelectorAll('span')[2]!.textContent)).toEqual(['No trend report yet', 'Trend report · 5 jobs', 'No trend report yet'])
+    expect([v2.querySelector('aside.report h2')!.textContent, v2.querySelector('aside.report .pill')!.textContent, v2.querySelector('#write-trend')]).toEqual(['Trend report for v2', 'written 24 Nov, when v3 replaced it', null])
+    expect([v2.querySelector('.report-text')!.textContent, v2.querySelector('.report-text b')]).toEqual(['# Trend report for guideline v2\n\nCompared with v1.\n\n<b>Fewer</b> wide approvals.', null])
+    expect(v2.querySelector('.cols')!.classList.contains('with-detail')).toBe(true)
+    const v3 = pageOf(3)
+    expect([v3.querySelector('#write-trend')!.textContent, v3.querySelector('#write-trend')!.getAttribute('data-replace'), v3.querySelector('aside.report .meta')!.textContent])
+      .toEqual(['Write trend report for v3', null, 'No trend report yet for v3.'])
+    expect(pageOf(1).querySelector('aside.report .meta')!.textContent).toBe(ReviewPage.NONE_WRITTEN)
+    // With a report there, the current version's button asks before it replaces it.
+    const replaced = dom(new ReviewPage('n').guideline({ ...read, reports: [{ version: 3, date: '2026-11-26', jobs: 1, compared_with: 2, written: 'asked', text: 'R' }] }, versions[0]))
+    expect([replaced.querySelector('#write-trend')!.getAttribute('data-replace'), replaced.querySelector('aside.report .pill')!.textContent])
+      .toEqual(['Replace the report written on 26 Nov?', 'written 26 Nov, on request'])
+    // The button sits in the panel's header, beside its title.
+    expect(replaced.querySelector('aside.report .head #write-trend')).not.toBeNull()
+    // A report file that says no date, no job count or no reason still reads plainly, and a date not in the usual form is shown as written.
+    const plain = (fields: Partial<TrendReport>) => dom(new ReviewPage('n').guideline({ ...read, reports: [{ version: 3, date: null, jobs: null, compared_with: null, written: null, text: 'R', ...fields }] }, versions[0]))
+    const undated = plain({})
+    expect([undated.querySelector('nav a.version')!.querySelectorAll('span')[2]!.textContent, undated.querySelector('aside.report .pill')!.textContent,
+      undated.querySelector('#write-trend')!.getAttribute('data-replace')]).toEqual(['Trend report', 'written on a day not recorded', ReviewPage.REPLACE_UNDATED])
+    expect(plain({ date: 'late Nov' }).querySelector('aside.report .pill')!.textContent).toBe('written late Nov')
+  })
+
+  it('the button asks before it replaces a report, says the report is being written, posts the version and goes where the answer names; a refusal shows its reason', async () => {
+    const versions: GuidelineVersion[] = [{ version: 2, date: '2026-11-22', from_job: null, from_version: 1, text: 'Two.' }]
+    const read: GuidelineRead = { folder: '/factory/guideline', versions, current: versions[0]!, reason: null, reports: [{ version: 2, date: '2026-11-26', jobs: 1, compared_with: 1, written: 'asked', text: 'R' }] }
+    const html = new ReviewPage('nonce').guideline(read, versions[0])
+    let reply: { ok: boolean; status: number; body: unknown } = { ok: true, status: 200, body: { written: 2, href: ReviewRoute.guidelineAddress(2) } }
+    let confirmed = true
+    const sent: unknown[] = [], went: string[] = [], asked: string[] = []
+    const browse = () => {
+      const virtualConsole = new VirtualConsole()
+      virtualConsole.on('jsdomError', error => { if (error.message.includes('navigation')) went.push(error.message) })
+      const window = new JSDOM(html, { runScripts: 'dangerously', virtualConsole, url: 'http://127.0.0.1:3083/review?tab=guideline', beforeParse: view => {
+        (view as unknown as { setInterval: unknown }).setInterval = () => 0
+        ;(view as unknown as { confirm: unknown }).confirm = (text: string) => { asked.push(text); return confirmed }
+        ;(view as unknown as { fetch: unknown }).fetch = (url: string, init: { method?: string; body?: string } = {}) => {
+          if (url === ReviewRoute.PROPOSAL_PATH) return Promise.resolve({ ok: true, json: () => Promise.resolve({ waiting: [] }) })
+          sent.push({ url, method: init.method, body: init.body === undefined ? undefined : JSON.parse(init.body) })
+          return Promise.resolve({ ok: reply.ok, status: reply.status, json: () => Promise.resolve(reply.body) })
+        }
+      } }).window
+      return { window, button: window.document.getElementById('write-trend') as HTMLButtonElement, notice: window.document.getElementById('trend-notice')! }
+    }
+    // The owner says no to replacing it: nothing is sent.
+    confirmed = false
+    const no = browse()
+    no.button.click()
+    await settle()
+    expect([asked, sent]).toEqual([['Replace the report written on 26 Nov?'], []])
+    no.window.close()
+    confirmed = true
+    const ok = browse()
+    ok.button.click()
+    expect([ok.button.disabled, ok.notice.textContent, ok.notice.hasAttribute('hidden')]).toEqual([true, ReviewPage.writingTrend(2), false])
+    await settle(); await settle(); await settle()
+    expect([sent, went.length]).toEqual([[{ url: ReviewRoute.TRENDS_PATH, method: 'POST', body: { version: 2 } }], 1])
+    ok.window.close()
+    reply = { ok: false, status: 503, body: { error: 'Not saved: the trend report for v2 could not be written: the report thread gave no answer', mr: 'https://gitlab.example/factory/-/merge_requests/8' } }
+    const page = browse()
+    page.button.click()
+    await settle(); await settle(); await settle()
+    expect([page.notice.querySelector('span')!.textContent, page.notice.querySelector('a')!.getAttribute('href'), page.notice.classList.contains('refused'), page.button.disabled])
+      .toEqual(['Not saved: the trend report for v2 could not be written: the report thread gave no answer', 'https://gitlab.example/factory/-/merge_requests/8', true, false])
     page.window.close()
   })
 })
@@ -1917,7 +2037,7 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     const { cookie } = await serveSample()
     const list = dom((await call('GET', ReviewRoute.guidelineAddress(), { cookie })).text)
     expect([...list.querySelectorAll('nav a.version')].map(link => [...link.querySelectorAll('span')].map(part => part.textContent)))
-      .toEqual([['v2 · current', '2026-11-24 · from the review of job job-a1'], ['v1', '2026-11-20']])
+      .toEqual([['v2 · current', '2026-11-24 · from the review of job job-a1', 'No trend report yet'], ['v1', '2026-11-20', 'No trend report yet']])
     const page = dom((await call('GET', ReviewRoute.guidelineAddress(2), { cookie })).text)
     expect([page.querySelector('main h2')!.textContent, page.querySelector('main .meta')!.textContent]).toEqual(['Guideline v2 · current', '2026-11-24 · from the review of job job-a1'])
     expect(page.querySelector('.guideline-text')!.textContent).toBe(readFileSync(join(FACTORY, 'lib', 'fixtures', 'guideline', 'v2.md'), 'utf8').split('---\n')[2])

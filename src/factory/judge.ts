@@ -36,8 +36,9 @@ export interface GuardSource { guard(): Promise<JudgeGuard> }
 /**
  * A judge's answer to one question: its text, the full paths of the files it read with the `read` tool while it answered, in the order it first read them, and the
  * tokens the answer used, counted by `TokenTally` from the events the judge Session recorded between the question and the end of its turn.
+ * `model` is the provider and model the Session's request header names after the answer, when it names them.
  */
-export interface JudgeReply { text: string; reads: string[]; tokens: number }
+export interface JudgeReply { text: string; reads: string[]; tokens: number; model?: { provider: string; model: string } }
 /** A judge as the one who asks it sees it: the brief, one question at a time, and whether it ever read a file. */
 export type AskedJudge = Pick<JudgeSession, 'brief' | 'consult' | 'readPath'>
 /** Opens the judge Session of one worker session. `ModelJudge` (`verdict.ts`) knows only this much of `JudgeSessions`. */
@@ -212,8 +213,11 @@ export class JudgeSession {
     // Only the events of this question: the Session also holds the events of every question before it.
     const events = agent.session.snapshotEvents().slice(before)
     const last = events.filter(event => event.type === 'assistant/message').at(-1)
+    // The model the Session asked, as its request header names it; a stand-in Session without a header names none.
+    const config = agent.session.requestHeader?.()?.config
+    const model = typeof config?.provider === 'string' && typeof config.model === 'string' ? { model: { provider: config.provider, model: config.model } } : {}
     return { text: last?.type === 'assistant/message' ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : '',
-      reads: [...reads], tokens: TokenTally.of(events) }
+      reads: [...reads], tokens: TokenTally.of(events), ...model }
   }
 }
 

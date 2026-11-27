@@ -6,7 +6,8 @@
  * service lets the owner's browser in with DSH's own sign-in, and while DSH has no connection service the page refuses every browser request.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`). The guideline is read from the factory repository's remote `main`, never from a checkout, and the
- * page's Accept saves a new version there through a merge request the fork merges at once (`save.ts`).
+ * page's Accept saves a new version there through a merge request the fork merges at once (`save.ts`), with the trend report of the version it
+ * replaces in the same commit; the page's "Write trend report" saves the current version's report the same way (`trends.ts`).
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -26,9 +27,10 @@ import { FactoryGuardModule, JudgeSessions } from './judge.ts'
 import { MainSessionWatch } from './mainsession.ts'
 import { JobRecorder } from './records.ts'
 import { ReviewPage, ReviewRoute } from './review.ts'
-import { FactoryRepoSave, GlabProgram, GuidelineSaver, RemoteGuidelineRecords } from './save.ts'
+import { FactoryRepoSave, GlabProgram, GuidelineSaver, RemoteGuidelineRecords, TrendReports } from './save.ts'
 import { ExecFileRunner, OrcaLauncher, ReviewTalks } from './talk.ts'
 import { SharedTokenFile } from './token.ts'
+import { TrendWriter } from './trends.ts'
 import { ModelJudge } from './verdict.ts'
 
 export const name = 'dsh-superagent-factory'
@@ -83,7 +85,9 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   ctx.logger.info('dsh-superagent-factory serves POST %s for %d project(s)', AssessRoute.PATH, route.projectCount)
   // A review talk's folder is outside every repository; its propose server is the factory's `lib/dist/proposeServer.js`, next to the job log file.
   const talks = new ReviewTalks({ records, tokenFile: tokens.path, words: ReviewPage, orca: new OrcaLauncher({ program: OrcaLauncher.find(config.review?.orca) }) })
-  const saver = new GuidelineSaver({ records, repo: new FactoryRepoSave({ glab: GlabProgram.find(config.review?.glab) }) })
+  // A trend report is written by a one-off judge Session, read-only like every judge, with the guideline in its system prompt like every thread.
+  const reports = new TrendReports({ author: new TrendWriter({ opener: judges, projects: config.projects ?? [] }), records, projects: config.projects ?? [] })
+  const saver = new GuidelineSaver({ records, repo: new FactoryRepoSave({ glab: GlabProgram.find(config.review?.glab) }), reports })
   const review = new ReviewRoute(config.projects ?? [], tokens, records, undefined, talks, saver)
   ctx.effect(() => review.register(ctx), 'factory: review page')
   // Optional, so `/assess` and the job log work without it: the review page asks DSH's connection service while DSH has it.
@@ -98,14 +102,15 @@ export { MainSessionWatch, type MainSessionJob } from './mainsession.ts'
 export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeToolCall } from './judge.ts'
 export {
   FactoryRecordFile, FactoryRecordsModule, JobRecorder, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobLogKind, type JobLogLine, type JobsSource, type JobStep,
-  type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
+  type ProjectJobs, type ReadJobLog, type RecordedJob, type RecordsMasker, type RecordsReader, type RecordsSource, type ReviewLine, type TrendReport, type StepAsked, type StepDetail,
   type StepOutcome, type StepSource, type StepWhy, type TimelineStep,
 } from './records.ts'
 export { TextDiff, type DiffLine, type DiffMark, type DiffSides } from './diff.ts'
 export { JobComments, ReviewAccess, ReviewPage, ReviewRefusal, ReviewRoute, ReviewSignIn, type GuidelineAnswerer, type ReviewConnection, type ReviewTokenSource, type ReviewView } from './review.ts'
 export {
-  FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, type GuidelineSaved, type RepoChange, type SaveFile, type SaveOutcome, type SaveStep,
+  FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, TrendReports, type GuidelineSaved, type RepoChange, type SaveFile, type SaveOutcome, type SaveStep,
 } from './save.ts'
+export { TrendPrompt, TrendReportFile, TrendWriter, type TrendAuthor, type TrendInput, type WrittenTrend } from './trends.ts'
 export {
   ExecFileRunner, GuidelineProposals, OrcaLauncher, ReviewTalks, TalkComments, TalkFolder, TalkOpening, TalkRefusal, TalkTexts, type GuidelineProposal, type OrcaRun, type OrcaRunner, type RunOptions,
   type ReviewTalksOptions, type StepWords,

@@ -11,11 +11,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { JSDOM } from 'jsdom'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { GuidelineSection, type GuidelineAgent } from '../src/factory/guideline.ts'
-import { FactoryRecordsModule, type GuidelineSource } from '../src/factory/records.ts'
-import { FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords } from '../src/factory/save.ts'
+import { FactoryRecordsModule, RecordsRefusal, type GuidelineSource } from '../src/factory/records.ts'
+import { ReviewPage } from '../src/factory/review.ts'
+import { FactoryRemote, FactoryRepoSave, GlabProgram, GuidelineFile, GuidelineSaver, RemoteGuidelineRecords, TrendReports } from '../src/factory/save.ts'
 import { ExecFileRunner, type GuidelineProposal, type OrcaRun, type OrcaRunner, type RunOptions } from '../src/factory/talk.ts'
+import { TrendPrompt, TrendReportFile, TrendWriter, type TrendAuthor, type TrendInput, type WrittenTrend } from '../src/factory/trends.ts'
 import { FAKE_RECORDS, PLANTED, REDACTED, recordsModule } from './fixtures/factory-records.ts'
 
 const GLAB = '/stand-in/glab'
@@ -290,6 +293,173 @@ describe('a failed step saves nothing on main and says which step failed', () =>
   })
 })
 
+describe('trend reports: in the Accept\'s commit, and from the button by the same route', () => {
+  /** A target project with sample jobs: two under v1 (one with a comment), one under v2. */
+  let project = ''
+  const line = (fields: Record<string, unknown>) => JSON.stringify({ ts: '2026-11-21T08:00:00.000Z', project, step_id: 's1', kind: 'job_start', summary: 'Started.', ...fields })
+  function sampleJobs(comment = 'Keep to the minimum feature.'): void {
+    project = join(root, 'testbed')
+    mkdirSync(join(project, '.factory'), { recursive: true })
+    writeFileSync(join(project, '.factory', 'actions.jsonl'), [
+      line({ job_id: 'job-a', guideline_version: 'v1' }), line({ job_id: 'job-a', step_id: 's2', kind: 'permission_answer', summary: 'Approved: widen the story.', ts: '2026-11-21T08:05:00.000Z' }),
+      line({ job_id: 'job-b', guideline_version: 'v1', ts: '2026-11-22T08:00:00.000Z' }),
+      line({ job_id: 'job-c', guideline_version: 'v2', ts: '2026-11-28T08:00:00.000Z' }),
+    ].join('\n') + '\n')
+    writeFileSync(join(project, '.factory', 'reviews.jsonl'), `${JSON.stringify({ ts: '2026-11-23T08:00:00.000Z', project, job_id: 'job-a', step_id: 's2', comment })}\n`)
+  }
+  /** A stand-in author: it asks no model, writes down what it was given, and echoes the comments it saw into the report. */
+  class Author implements TrendAuthor {
+    readonly asked: TrendInput[] = []
+    fail: string | undefined
+    async write(input: TrendInput): Promise<WrittenTrend> {
+      this.asked.push(input)
+      if (this.fail !== undefined) throw new RecordsRefusal(503, this.fail)
+      const said = input.jobs.flatMap(job => job.reviews.map(review => review.comment))
+      return { body: TrendWriter.bodyOf(input, `Report on ${input.jobs.length} jobs.${said.length === 0 ? '' : ` The owner said: ${said.join(' ')}`}`, 1200), jobs: input.jobs.length }
+    }
+  }
+  let author = new Author()
+  const reportingSaver = (of: RemoteGuidelineRecords = records()) => new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
+    reports: new TrendReports({ author, records: of, projects: [project] }) })
+  /** The files the newest commit on the remote's main changed. */
+  const lastCommitFiles = () => git(bare, 'show', '--name-only', '--format=', 'main').split('\n').filter(Boolean).sort()
+  beforeEach(() => { sampleJobs(); author = new Author() })
+
+  it('the ticket\'s check: accepting v2 leaves v1\'s report in the same commit; the button writes v2\'s report naming v1; the page shows each beside its version', async () => {
+    const of = records()
+    const saver = reportingSaver(of)
+    const before = mainOf()
+    expect(await saver.accept(proposal('# Guideline\nKeep to the minimum feature.\n'), 1)).toMatchObject({ saved: true, version: 2 })
+    // One commit, one merge request: the new version and the report of the version it replaced.
+    expect([git(bare, 'rev-list', '--count', `${before}..main`), lastCommitFiles(), runner.glabCalls.length]).toEqual(['1', ['guideline/v1-trends.md', 'guideline/v2.md'], 2])
+    expect(fileOnMain('guideline/v1-trends.md')).toBe('---\nversion: 1\ndate: 2026-11-27\njobs: 2\nwritten: accepted\n---\n# Trend report for guideline v1\n\n'
+      + 'This is the first version; there is none before it.\n\nReport on 2 jobs. The owner said: Keep to the minimum feature.\n\nSpent: 1,200 tokens\nProviders: dsh (the model set in its factory profile)')
+    expect(author.asked.map(input => [input.version.version, input.before, input.jobs.map(job => job.job_id)])).toEqual([[1, null, ['job-a', 'job-b']]])
+    // The button on the current version, v2: its own branch, merge request and merge.
+    const merged = mainOf()
+    expect(await saver.report(2)).toEqual({ saved: true, version: 2, mr: 'https://gitlab.example/factory/-/merge_requests/7' })
+    expect([git(bare, 'rev-list', '--count', `${merged}..main`), lastCommitFiles()]).toEqual(['1', ['guideline/v2-trends.md']])
+    const v2 = fileOnMain('guideline/v2-trends.md')
+    expect(v2).toMatch(/^---\nversion: 2\ndate: 2026-11-27\njobs: 1\ncompared_with: 1\nwritten: asked\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n/)
+    const branch = 'zees-factory/trends-v2-20261127T101530Z'
+    expect(runner.glabCalls.slice(2)).toEqual([
+      ['mr', 'create', '--source-branch', branch, '--target-branch', 'main', '--title', 'trend report for guideline v2',
+        '--description', 'The trend report for guideline v2. Asked for by the owner on the review page and merged by the fork.', '--remove-source-branch=false', '--yes'],
+      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', mainOf()],
+    ])
+    // Nothing in the factory clone's checkout, and no worktree left.
+    expect([readdirSync(join(factory, 'guideline')), readdirSync(saves), git(factory, 'branch', '--show-current')]).toEqual([['v1.md'], [], 'main'])
+    // The page reads both reports from the remote's main and shows each beside its version.
+    const read = (await of.guidelineReader()).read()
+    expect(read.reports!.map(report => [report.version, report.jobs, report.compared_with, report.written])).toEqual([[2, 1, 1, 'asked'], [1, 2, null, 'accepted']])
+    const pageOf = (version: number) => new JSDOM(new ReviewPage('n').guideline(read, read.versions.find(each => each.version === version))).window.document
+    const v2Page = pageOf(2), v1Page = pageOf(1)
+    expect([...v2Page.querySelectorAll('nav a.version')].map(row => row.querySelectorAll('span')[2]!.textContent)).toEqual(['Trend report · 1 job', 'Trend report · 2 jobs'])
+    expect([v2Page.querySelector('aside.report h2')!.textContent, v2Page.querySelector('aside.report .pill')!.textContent]).toEqual(['Trend report for v2', 'written 27 Nov, on request'])
+    expect(v2Page.querySelector('aside.report .report-text')!.textContent).toContain('Compared with v1.')
+    expect([v1Page.querySelector('aside.report .pill')!.textContent, v1Page.querySelector('#write-trend')]).toEqual(['written 27 Nov, when v2 replaced it', null])
+    expect(v1Page.querySelector('aside.report .report-text')!.textContent).toContain('Report on 2 jobs.')
+  })
+
+  it('accepting the first version writes no report and asks no thread', async () => {
+    git(factory, 'rm', '--quiet', 'guideline/v1.md')
+    git(factory, 'commit', '--quiet', '-m', 'none')
+    git(factory, 'push', '--quiet', 'origin', 'main')
+    expect(await reportingSaver().accept(proposal('One.\n'), null)).toMatchObject({ saved: true, version: 1 })
+    expect([lastCommitFiles(), author.asked]).toEqual([['guideline/v1.md'], []])
+  })
+
+  it('a report that cannot be written stops the Accept: nothing pushed, no merge request, the reason said', async () => {
+    author.fail = 'the report thread did not answer in time'
+    const before = mainOf()
+    expect(await reportingSaver().accept(proposal('Two.\n'), 1))
+      .toEqual({ saved: false, reason: 'Not saved: the trend report for v1 could not be written: the report thread did not answer in time', mr: undefined })
+    expect([mainOf(), branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([before, ['main'], [], []])
+  })
+
+  it('an Accept against a version that moved on asks no thread', async () => {
+    expect(await reportingSaver().accept(proposal('Two.\n'), 7)).toMatchObject({ saved: false, reason: expect.stringContaining('the guideline is at v1 now') })
+    expect([author.asked, runner.glabCalls]).toEqual([[], []])
+  })
+
+  it('asking again replaces the report in a new commit; an old version, or no version, is refused before any thread is asked', async () => {
+    const saver = reportingSaver()
+    expect(await saver.report(1)).toMatchObject({ saved: true, version: 1 })
+    const first = fileOnMain('guideline/v1-trends.md')
+    author = new Author()
+    sampleJobs('Ask me before any push.')
+    const again = reportingSaver()
+    expect(await again.report(1)).toMatchObject({ saved: true, version: 1 })
+    expect([lastCommitFiles(), fileOnMain('guideline/v1-trends.md') === first, fileOnMain('guideline/v1-trends.md')]).toEqual([['guideline/v1-trends.md'], false, expect.stringContaining('Ask me before any push.')])
+    expect(runner.glabCalls.filter(call => call[1] === 'create').at(-1)).toContain('The trend report for guideline v1, replacing the one written before. Asked for by the owner on the review page and merged by the fork.')
+    await again.accept(proposal('Two.\n'), 1)
+    author = new Author()
+    const old = await reportingSaver().report(1)
+    expect([old, author.asked]).toEqual([{ saved: false, reason: 'Not saved: only the current version\'s trend report can be written, and v1 is not the current version now (v2 is). Reload the page.', mr: undefined }, []])
+    // Without trend reports set up, the button is refused and nothing runs.
+    expect(await saverOf().report(2)).toEqual({ saved: false, reason: `Not saved: ${GuidelineSaver.NO_REPORTS}`, mr: undefined })
+  })
+
+  it('a version no job ran under still gets a report, with jobs: 0, and the question says no job ran', async () => {
+    writeFileSync(join(project, '.factory', 'actions.jsonl'), '')
+    expect(await reportingSaver().report(1)).toMatchObject({ saved: true })
+    expect(fileOnMain('guideline/v1-trends.md')).toMatch(/^---\nversion: 1\ndate: 2026-11-27\njobs: 0\nwritten: asked\n---\n/)
+    expect(TrendPrompt.textOf(author.asked[0]!)).toContain('No job ran under this version.')
+  })
+
+  it('stores a planted secret from a comment masked, with every listed project\'s mask', async () => {
+    sampleJobs(`Never print ${PLANTED}.`)
+    expect(await reportingSaver().report(1)).toMatchObject({ saved: true })
+    const report = fileOnMain('guideline/v1-trends.md')
+    expect([report.includes(PLANTED), report.includes(`Never print ${REDACTED}.`)]).toEqual([false, true])
+  })
+
+  it('a failed step of the button\'s save names the step and links the merge request; the worktree is removed', async () => {
+    runner.fail.merge = 'ERROR: not mergeable yet'
+    const before = mainOf()
+    expect(await reportingSaver().report(1)).toEqual({ saved: false, reason: 'Not saved: the merge step failed: ERROR: not mergeable yet', mr: 'https://gitlab.example/factory/-/merge_requests/7' })
+    expect([mainOf(), readdirSync(saves), branchesOf()]).toEqual([before, [], ['main', 'zees-factory/trends-v1-20261127T101530Z']])
+  })
+
+  it('is busy while a report is written, so an Accept and a report never run at once', async () => {
+    const saver = reportingSaver()
+    const writing = saver.report(1)
+    expect([saver.busy, await saver.accept(proposal('Two.\n'), 1)]).toEqual([true, { saved: false, reason: `Not saved: ${FactoryRepoSave.BUSY}`, mr: undefined }])
+    expect(await writing).toMatchObject({ saved: true })
+  })
+
+  it('a fetch that fails stops the Accept and the button before any thread is asked', async () => {
+    git(factory, 'remote', 'set-url', 'origin', join(root, 'missing.git'))
+    for (const saved of [await reportingSaver().accept(proposal('Two.\n'), 1), await reportingSaver().report(1)])
+      expect((saved as { reason: string }).reason).toMatch(/^Not saved: the fetch step failed: /)
+    expect([author.asked, runner.glabCalls, readdirSync(saves)]).toEqual([[], [], []])
+  })
+
+  it('masks the report with each listed project\'s own mask, not only the first one\'s', async () => {
+    const second = join(root, 'second')
+    mkdirSync(join(second, '.factory'), { recursive: true })
+    writeFileSync(join(second, '.factory', 'actions.jsonl'), `${JSON.stringify({ ts: '2026-11-21T09:00:00.000Z', project: second, job_id: 'job-z', step_id: 's1', kind: 'job_start', summary: 'Started.', guideline_version: 'v1' })}\n`)
+    writeFileSync(join(second, '.factory', 'reviews.jsonl'), `${JSON.stringify({ ts: '2026-11-23T09:00:00.000Z', project: second, job_id: 'job-z', comment: 'Never print second-only-secret.' })}\n`)
+    // The second project's mask alone knows its own secret.
+    const of = new RemoteGuidelineRecords(recordsModule(factory, FAKE_RECORDS.replace('maskText: text => clean(text),',
+      'maskText: text => project.endsWith(\'/second\') ? clean(text).replaceAll(\'second-only-secret\', \'[second-masked]\') : clean(text),')), { runner })
+    const saver = new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
+      reports: new TrendReports({ author, records: of, projects: [project, second] }) })
+    expect(await saver.report(1)).toMatchObject({ saved: true })
+    const report = fileOnMain('guideline/v1-trends.md')
+    expect([report.includes('second-only-secret'), report.includes('Never print [second-masked].'), report.includes('jobs: 3')]).toEqual([false, true, true])
+  })
+
+  it('a plain factory folder reads its reports from the folder', () => {
+    const folder = join(root, 'plain')
+    mkdirSync(folder)
+    writeFileSync(join(folder, 'v1-trends.md'), TrendReportFile.textOf({ version: 1, date: '2026-11-20', jobs: 3, compared_with: null, written: 'asked' }, 'Text.\n'))
+    writeFileSync(join(folder, 'v2.md'), 'not a report\n')
+    expect(RemoteGuidelineRecords.reportsIn(folder)).toEqual([{ version: 1, date: '2026-11-20', jobs: 3, compared_with: null, written: 'asked', text: 'Text.\n' }])
+    expect(RemoteGuidelineRecords.reportsIn(join(root, 'missing'))).toEqual([])
+  })
+})
+
 describe('reading the guideline from the remote\'s main', () => {
   it('reads the versions the remote\'s main held at the last fetch, never the checkout, and says why when there is no copy of it', async () => {
     // The checkout holds a v2 that is not on the remote: it is not read.
@@ -310,8 +480,12 @@ describe('reading the guideline from the remote\'s main', () => {
     const plain = join(factory, 'plain')
     mkdirSync(join(plain, 'guideline'), { recursive: true })
     writeFileSync(join(plain, 'guideline', 'v5.md'), 'Plain.\n')
+    writeFileSync(join(plain, 'guideline', 'v5-trends.md'), TrendReportFile.textOf({ version: 5, date: '2026-11-25', jobs: 2, compared_with: 4, written: 'asked' }, 'Report.\n'))
     const reader = new RemoteGuidelineRecords(recordsModule(plain), { runner })
-    expect((await reader.guidelineReader()).read().current).toMatchObject({ version: 5, text: 'Plain.\n' })
+    const read = (await reader.guidelineReader()).read()
+    expect(read.current).toMatchObject({ version: 5, text: 'Plain.\n' })
+    // Its trend reports are read from the folder too, so the page shows them.
+    expect(read.reports).toEqual([{ version: 5, date: '2026-11-25', jobs: 2, compared_with: 4, written: 'asked', text: 'Report.\n' }])
     expect(await (await reader.factoryRemote()).isRepository()).toBe(false)
     expect(new Set(runner.calls.map(call => call.args.join(' ')))).toEqual(new Set(['rev-parse --git-dir']))
   })

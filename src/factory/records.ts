@@ -144,7 +144,13 @@ export interface GuidelineVersion { version: number; date: string | null; from_j
  * The guideline's versions, newest first, and the current one (the highest number). With none, `reason` says why: there is no version yet, or the factory
  * repository was not found (`folder` is then null).
  */
-export interface GuidelineRead { folder: string | null; versions: GuidelineVersion[]; current: GuidelineVersion | null; reason: string | null }
+export interface GuidelineRead { folder: string | null; versions: GuidelineVersion[]; current: GuidelineVersion | null; reason: string | null; reports?: TrendReport[] }
+/**
+ * One version's trend report, `guideline/v<N>-trends.md` (architecture AD-18): the super agent's own review of its actions under that version.
+ * `jobs` is how many jobs it was written from, `compared_with` the version before it, `written` whether it was written when the next version was
+ * accepted or when the owner asked for it on the page. A field the file does not say is `null`.
+ */
+export interface TrendReport { version: number; date: string | null; jobs: number | null; compared_with: number | null; written: 'accepted' | 'asked' | null; text: string }
 /** Reads the guideline's versions. It never throws. */
 export interface GuidelineSource { read(): GuidelineRead }
 /** Gives the masker of one project and the four readers. Each rejects with `RecordsRefusal(503)` when there is none. */

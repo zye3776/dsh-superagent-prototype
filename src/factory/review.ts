@@ -25,7 +25,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, isAbsolute, resolve } from 'node:path'
 import {
   FactoryRecordsModule, RecordsRefusal, ReviewWriter, type AutomaticAnswer, type GuidelineRead, type GuidelineVersion, type JobLogLine, type ProjectJobs, type RecordedJob, type RecordsSource, type ReviewLine, type StepAsked, type StepDetail,
-  type StepOutcome, type StepWhy, type TimelineStep,
+  type StepOutcome, type StepWhy, type TimelineStep, type TrendReport,
 } from './records.ts'
 import { TextDiff, type DiffLine } from './diff.ts'
 import type { GuidelineSaved } from './save.ts'
@@ -193,6 +193,15 @@ export class ReviewPage {
   static readonly SAVING_VERSION = 'Saving: a merge request into the factory\'s main branch is opened and merged…'
   static readonly NOT_ANSWERED = 'Not answered: the review page did not answer'
   static readonly OPEN_MR = 'Open the merge request'
+  static readonly NO_REPORT_YET = 'No trend report yet'
+  static readonly NONE_WRITTEN = 'None was written.'
+  static trendHead(version: number): string { return `Trend report for v${version}` }
+  static writeTrend(version: number): string { return `Write trend report for v${version}` }
+  static noTrend(version: number): string { return `No trend report yet for v${version}.` }
+  static writingTrend(version: number): string { return `Writing the trend report for v${version}…` }
+  static replaceTrend(day: string): string { return `Replace the report written on ${day}?` }
+  static readonly REPLACE_UNDATED = 'Replace the report written before?'
+  static savingWithReport(version: number): string { return `Saving: the trend report for v${version} is written first, then a merge request into the factory's main branch is opened and merged…` }
   /** How often the page asks whether a proposal is waiting, in milliseconds; it also asks when its window gets focus. */
   static readonly POLL_MS = 5000
   /** The rows that stand for the whole job: picking one shows the whole job's comment, and no comment is kept on them alone. */
@@ -247,7 +256,7 @@ export class ReviewPage {
     '.tabs { display: flex; gap: 4px; margin-bottom: 8px; }',
     '.tabs a { padding: 4px 10px; border-radius: 8px; color: inherit; text-decoration: none; }',
     '.tabs a.on { background: var(--dsw-alias-bg-layer-2); }',
-    'pre.guideline-text { text-wrap-mode: wrap; overflow-wrap: anywhere; overflow-x: auto; font-family: var(--ds-font-family-code); font-size: 12px; }',
+    'pre.guideline-text, pre.report-text { text-wrap-mode: wrap; overflow-wrap: anywhere; overflow-x: auto; font-family: var(--ds-font-family-code); font-size: 12px; }',
     '.head { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--dsw-alias-border-l3); }',
     '.head .crumb { border-bottom: 0; }',
     'button.primary { padding: 4px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); cursor: pointer; }',
@@ -272,7 +281,7 @@ export class ReviewPage {
    * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
    * on a page without its element. The parts are joined with a semicolon, or each would be read as a call of the one before it.
    */
-  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript(), ReviewPage.answerScript()].join(';\n') }
+  private static script(): string { return [ReviewPage.commentScript(), ReviewPage.talkScript(), ReviewPage.pollScript(), ReviewPage.answerScript(), ReviewPage.trendScript()].join(';\n') }
 
   /**
    * The comment field's part of the script. It talks only to this page's own comment address.
@@ -422,7 +431,7 @@ export class ReviewPage {
   const send = async answer => {
     if (busy) return
     busy = true; accept.disabled = true; reject.disabled = true
-    if (answer === 'accept') show(${JSON.stringify(ReviewPage.SAVING_VERSION)})
+    if (answer === 'accept') show(accept.dataset.saving || ${JSON.stringify(ReviewPage.SAVING_VERSION)})
     try {
       const reply = await fetch(${JSON.stringify(ReviewRoute.ANSWER_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ project: accept.dataset.project, job_id: accept.dataset.job, ts: accept.dataset.ts, answer, base: accept.dataset.base ? Number(accept.dataset.base) : null }) })
@@ -434,6 +443,43 @@ export class ReviewPage {
   }
   accept.addEventListener('click', () => { void send('accept') })
   reject.addEventListener('click', () => { void send('reject') })
+})()`
+  }
+
+  /**
+   * The trend report panel's part of the script: "Write trend report for v<N>" posts the version to the page's trends address, after the owner
+   * confirms when a report is there already (it is replaced). While it runs the panel says so and the rest of the page stays usable. A report saved
+   * goes to the address the answer names; a refusal shows its reason, and the merge request's link when one was opened.
+   */
+  private static trendScript(): string {
+    return `(() => {
+  const button = document.getElementById('write-trend'), notice = document.getElementById('trend-notice')
+  if (!button || !notice) return
+  let busy = false
+  const show = (text, mr, refused) => {
+    notice.replaceChildren()
+    notice.classList.toggle('refused', refused === true)
+    const words = document.createElement('span'); words.textContent = text; notice.append(words)
+    if (typeof mr === 'string' && mr.startsWith('https://')) {
+      const link = document.createElement('a'); link.href = mr; link.rel = 'noreferrer'; link.target = '_blank'; link.textContent = ${JSON.stringify(ReviewPage.OPEN_MR)}
+      notice.append(' ', link)
+    }
+    notice.hidden = false
+  }
+  button.addEventListener('click', async () => {
+    if (busy) return
+    if (button.dataset.replace && !window.confirm(button.dataset.replace)) return
+    busy = true; button.disabled = true
+    show(button.dataset.writing)
+    try {
+      const reply = await fetch(${JSON.stringify(ReviewRoute.TRENDS_PATH)}, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ version: Number(button.dataset.version) }) })
+      const body = await reply.json().catch(() => ({}))
+      if (reply.ok && typeof body.href === 'string') { window.location.assign(body.href); return }
+      show(typeof body.error === 'string' && body.error !== '' ? body.error : 'Not saved: the review page answered HTTP ' + reply.status, body.mr, true)
+    } catch { show(${JSON.stringify(ReviewPage.NOT_ANSWERED)}, undefined, true) }
+    busy = false; button.disabled = false
+  })
 })()`
   }
 
@@ -525,12 +571,14 @@ ${panel}
    * the factory repository was not found it says so with the reader's reason.
    * With a proposal `open`, the middle shows it before → after instead: the current version on the left, the proposal on the right, both whole, removed
    * lines marked as deletions and added lines as insertions (`TextDiff`), under "Accept as v<N>", "Reject" and the line "Nothing is saved until you accept."
-   * Without a proposal open it only reads: there is no control on it.
+   * Without a proposal open, the right panel shows the picked version's trend report, and for the current version the button that writes it
+   * ("Write trend report for v<N>"); an older version without one says that none was written.
    */
   guideline(read: GuidelineRead, picked: GuidelineVersion | undefined, waiting: readonly GuidelineProposal[] = [], open?: GuidelineProposal): string {
     let crumb = ReviewPage.TAB_GUIDELINE
     let left = ''
     let middle: string
+    let right = ''
     if (open !== undefined) {
       crumb += ` › Proposal from ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}`
       left = read.versions.map(each => ReviewPage.versionRow(each, read, undefined)).join('\n')
@@ -545,6 +593,7 @@ ${panel}
       middle = `<h2>Guideline v${picked.version}${picked.version === read.current?.version ? ' · current' : ''}</h2>
 <p class="meta">${ReviewPage.escape(ReviewPage.sourceOf(picked))}</p>
 <pre class="guideline-text">${ReviewPage.escape(picked.text)}</pre>`
+      right = ReviewPage.reportPanel(read, picked)
     }
     const proposals = waiting.map(each => {
       const on = open !== undefined && each.project === open.project && each.job_id === open.job_id
@@ -553,20 +602,64 @@ ${panel}
     })
     return this.document(`${ReviewPage.tabs('guideline', waiting)}
 <div class="crumb">${crumb}</div>
-<div class="cols">
+<div class="cols${right === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Guideline versions">
 ${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}
 </nav>
 <main>
 ${middle}
-</main>
+</main>${right === '' ? '' : `\n<aside class="detail report" aria-label="Trend report">\n${right}\n</aside>`}
 </div>`, true)
   }
 
-  /** One version in the Guideline tab's list, marked when it is the picked one. */
+  /** The trend report panel of `picked`: its report in full, or that there is none; for the current version, the button that writes it. */
+  private static reportPanel(read: GuidelineRead, picked: GuidelineVersion): string {
+    const report = ReviewPage.reportOf(read, picked.version)
+    const current = picked.version === read.current?.version
+    const button = current
+      ? `<p class="answer"><button type="button" id="write-trend" class="primary" data-version="${picked.version}" \
+data-writing="${ReviewPage.escape(ReviewPage.writingTrend(picked.version))}"${report === undefined ? '' : ` data-replace="${ReviewPage.escape(report.date === null ? ReviewPage.REPLACE_UNDATED : ReviewPage.replaceTrend(ReviewPage.day(report.date)))}"`}>\
+${ReviewPage.escape(ReviewPage.writeTrend(picked.version))}</button></p>`
+      : ''
+    const pill = report === undefined ? '' : ` <span class="pill">${ReviewPage.escape(ReviewPage.writtenWhen(report))}</span>`
+    // The panel's header holds its title, when the report was written, and the button (EXPERIENCE: "the header has 'Write trend report for v<N>'").
+    const head = `<div class="head"><h2>${ReviewPage.escape(ReviewPage.trendHead(picked.version))}</h2>${pill}${button}</div>${current ? '\n<div id="trend-notice" class="notice" role="status" hidden></div>' : ''}`
+    if (report === undefined) return `${head}\n<p class="meta">${ReviewPage.escape(current ? ReviewPage.noTrend(picked.version) : ReviewPage.NONE_WRITTEN)}</p>`
+    return `${head}\n<pre class="report-text">${ReviewPage.escape(report.text.trim())}</pre>`
+  }
+
+  /** The report of version `version` in `read`, if there is one. */
+  private static reportOf(read: GuidelineRead, version: number): TrendReport | undefined {
+    return (read.reports ?? []).find(each => each.version === version)
+  }
+
+  /** When and why a report was written, as its pill says it: "written 24 Nov, when v3 replaced it", or "written 24 Nov, on request". */
+  private static writtenWhen(report: TrendReport): string {
+    const day = ReviewPage.day(report.date)
+    if (report.written === 'accepted') return `written ${day}, when v${report.version + 1} replaced it`
+    if (report.written === 'asked') return `written ${day}, on request`
+    return `written ${day}`
+  }
+
+  /** A `YYYY-MM-DD` day as "24 Nov"; anything else as it is, and no day as "on a day not recorded". */
+  private static day(date: string | null): string {
+    if (date === null) return 'on a day not recorded'
+    const found = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+    if (found === null) return date
+    return new Date(Number(found[1]), Number(found[2]) - 1, Number(found[3])).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
+  }
+
+  /** One version in the Guideline tab's list, marked when it is the picked one, with whether it has a trend report. */
   private static versionRow(each: GuidelineVersion, read: GuidelineRead, picked: GuidelineVersion | undefined): string {
     return `<a class="version${each.version === picked?.version ? ' on' : ''}" href="${ReviewPage.escape(ReviewRoute.guidelineAddress(each.version))}">\
-<span>v${each.version}${each.version === read.current?.version ? ' · current' : ''}</span><span class="l2">${ReviewPage.escape(ReviewPage.sourceOf(each))}</span></a>`
+<span>v${each.version}${each.version === read.current?.version ? ' · current' : ''}</span><span class="l2">${ReviewPage.escape(ReviewPage.sourceOf(each))}</span>\
+<span class="l2">${ReviewPage.escape(ReviewPage.reportLine(ReviewPage.reportOf(read, each.version)))}</span></a>`
+  }
+
+  /** A version row's line about its trend report: "Trend report · 5 jobs", or "No trend report yet". */
+  private static reportLine(report: TrendReport | undefined): string {
+    if (report === undefined) return ReviewPage.NO_REPORT_YET
+    return report.jobs === null ? 'Trend report' : `Trend report · ${ReviewPage.count(report.jobs, 'job')}`
   }
 
   /**
@@ -581,7 +674,9 @@ ${middle}
       return `<${tag} class="line">${ReviewPage.escape(line.text)}</${tag}>`
     }).join('')
     const next = (current?.version ?? 0) + 1
-    const data = `data-project="${ReviewPage.escape(open.project)}" data-job="${ReviewPage.escape(open.job_id)}" data-ts="${ReviewPage.escape(open.ts)}" data-base="${current?.version ?? ''}"`
+    // With a version before it, Accept first has that version's trend report written, which can take minutes: the saving notice says so.
+    const saving = current === null ? ReviewPage.SAVING_VERSION : ReviewPage.savingWithReport(current.version)
+    const data = `data-project="${ReviewPage.escape(open.project)}" data-job="${ReviewPage.escape(open.job_id)}" data-ts="${ReviewPage.escape(open.ts)}" data-base="${current?.version ?? ''}" data-saving="${ReviewPage.escape(saving)}"`
     return `<h2>Proposed change · from the review talk on ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}</h2>
 <p class="meta">Proposed ${ReviewPage.escape(ReviewPage.when(open.ts))}</p>
 <div id="answer-notice" class="notice" role="status" hidden></div>
@@ -818,11 +913,19 @@ interface AnonymousRoute {
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   auth: 'anonymous'
 }
-/** Which of the page's five addresses a request is for. */
-type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal' | 'answer'
+/** Which of the page's six addresses a request is for. */
+type ReviewTarget = 'page' | 'comment' | 'talk' | 'proposal' | 'answer' | 'trends'
 
 /** What the page's Accept runs: saves a proposal as the next guideline version (`GuidelineSaver`), one save at a time. */
-export interface GuidelineAnswerer { readonly busy: boolean; accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> }
+/**
+ * Saves the owner's answers on the Guideline tab: an accepted proposal (`accept`), and the current version's trend report asked for with the button
+ * (`report`). `GuidelineSaver` (`save.ts`) is the real one.
+ */
+export interface GuidelineAnswerer {
+  readonly busy: boolean
+  accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved>
+  report(version: number): Promise<GuidelineSaved>
+}
 
 /**
  * Serves the review page on DSH's web server, for the owner's browser on this machine only:
@@ -845,6 +948,10 @@ export interface GuidelineAnswerer { readonly busy: boolean; accept(proposal: Gu
  * of the proposal the page showed and `base` the version it was shown against (`null`: none), which Accept refuses to save over a newer one. Reject drops it and saves nothing. Accept saves it as the next guideline version through `saver` and then drops it;
  * when the save fails the proposal stays and the answer is 503 with `{ error, mr? }`, the error naming the step that failed. 400 for a bad body, 404 for
  * a proposal not waiting, 409 when a newer proposal replaced the one shown or a save is running, 503 without a saver: nothing is saved by default.
+ * With a version before it, the saver writes that version's trend report and saves it in the same commit; when the report cannot be written, nothing is saved.
+ * `POST /review/trends` takes `{ version }` from the trend report panel's button: the current version's trend report is written by a one-off model thread and
+ * saved through `saver` by the same branch and merge request route, replacing one written before. 400 for a bad body, 409 when the version is not the
+ * current one or a save is running, 503 without a saver or when the report or a save step fails, with `{ error, mr? }`.
  * `ReviewAccess.admit` runs first on every request (403), then DSH's sign-in (`ReviewSignIn`: 401, 403, or 503 without DSH's connection service),
  * then the method is checked (405); a body is read only after all three. The one exception is `POST /review/proposal`, where `ReviewAccess.admitTool`
  * takes the place of all three.
@@ -856,6 +963,7 @@ export class ReviewRoute {
   static readonly TALK_PATH = '/review/talk'
   static readonly PROPOSAL_PATH = '/review/proposal'
   static readonly ANSWER_PATH = '/review/answer'
+  static readonly TRENDS_PATH = '/review/trends'
   static readonly MAX_BODY_BYTES = 64 * 1024
   private readonly projects: readonly string[]
   private readonly access: ReviewAccess
@@ -881,11 +989,11 @@ export class ReviewRoute {
       orca: new OrcaLauncher({ program: undefined }) })
   }
 
-  /** Adds the page's five addresses to the web server and returns the function that removes them. */
+  /** Adds the page's six addresses to the web server and returns the function that removes them. */
   register(ctx: Context): () => void {
     if (ctx.webServer.host !== '127.0.0.1') throw new Error('The factory /review page requires a loopback Web server')
     const targets: [string, ReviewTarget][] = [[ReviewRoute.PATH, 'page'], [ReviewRoute.COMMENT_PATH, 'comment'],
-      [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal'], [ReviewRoute.ANSWER_PATH, 'answer']]
+      [ReviewRoute.TALK_PATH, 'talk'], [ReviewRoute.PROPOSAL_PATH, 'proposal'], [ReviewRoute.ANSWER_PATH, 'answer'], [ReviewRoute.TRENDS_PATH, 'trends']]
     // Anonymous to DSH's web server, so the page answers a browser that is not signed in with its own line; DSH's sign-in is asked in `handle`.
     const disposers = targets.map(([path, target]) => {
       const route: AnonymousRoute = { kind: 'exact', path, auth: 'anonymous', handler: (req, res) => this.handle(req, res, ctx.webServer.port, target) }
@@ -895,7 +1003,7 @@ export class ReviewRoute {
   }
 
   /**
-   * Answers one HTTP request. A refusal becomes its status, as a page for the two addresses a person sees and as `{ error }` for the three a script or a
+   * Answers one HTTP request. A refusal becomes its status, as a page for the address a person sees and as `{ error }` for the ones a script or a
    * program posts to.
    */
   async handle(req: IncomingMessage, res: ServerResponse, port: number, target: ReviewTarget): Promise<void> {
@@ -912,6 +1020,7 @@ export class ReviewRoute {
       if (target === 'comment') await this.comment(req, res, state)
       else if (target === 'talk') await this.talk(req, res, port, state)
       else if (target === 'answer') await this.answer(req, res, state)
+      else if (target === 'trends') await this.trends(req, res, state)
       else if (target === 'proposal') ReviewRoute.sendJson(res, 200, { waiting: this.waiting() })
       else await this.show(req, res, page)
     } catch (error) {
@@ -923,7 +1032,7 @@ export class ReviewRoute {
       // Any other error's own text is left out: it could quote a record or a path.
       const status = refusal?.status ?? 500, message = refusal?.message ?? 'The review page failed'
       const headers: Record<string, string> = status === 405 ? { allow: (error as { allow?: string }).allow ?? 'GET' } : {}
-      if (target === 'comment' || target === 'talk' || target === 'proposal' || target === 'answer') ReviewRoute.sendJson(res, status, { error: message }, headers)
+      if (target === 'comment' || target === 'talk' || target === 'proposal' || target === 'answer' || target === 'trends') ReviewRoute.sendJson(res, status, { error: message }, headers)
       // Not signed in to DSH, the page is the one line `ReviewSignIn.SIGNED_OUT`, and nothing else: no record content, no token form.
       else if (status === 401) ReviewRoute.sendPage(res, status, page.signedOut(), page, headers)
       else ReviewRoute.sendPage(res, status, page.notice(message), page, headers)
@@ -1059,6 +1168,20 @@ export class ReviewRoute {
     if (!saved.saved) { ReviewRoute.sendJson(res, 503, { error: saved.reason, ...(saved.mr === undefined ? {} : { mr: saved.mr }) }); return }
     this.proposals.remove(project, job_id, ts)
     ReviewRoute.sendJson(res, 200, { answered: 'accepted', version: saved.version, href: ReviewRoute.guidelineAddress(saved.version), ...(saved.mr === undefined ? {} : { mr: saved.mr }) })
+  }
+
+  /** `POST /review/trends` for a signed-in owner: writes the current version's trend report and saves it, replacing one written before. */
+  private async trends(req: IncomingMessage, res: ServerResponse, state: { bodyRead: boolean }): Promise<void> {
+    state.bodyRead = true
+    const { version } = await ReviewRoute.objectOf(req) as { version?: unknown }
+    if (!(typeof version === 'number' && Number.isInteger(version) && version > 0)) throw new ReviewRefusal(400, 'version must be the number of the current guideline version')
+    const current = (await this.records.guidelineReader()).read().current
+    if (current?.version !== version) throw new ReviewRefusal(409, 'Not saved: only the current version\'s trend report can be written. Reload the page.')
+    if (this.saver === undefined) throw new ReviewRefusal(503, 'Not saved: writing a trend report is not set up here')
+    if (this.saver.busy) throw new ReviewRefusal(409, 'Not saved: a guideline version or a trend report is being saved; try again when it is done')
+    const saved = await this.saver.report(version)
+    if (!saved.saved) { ReviewRoute.sendJson(res, 503, { error: saved.reason, ...(saved.mr === undefined ? {} : { mr: saved.mr }) }); return }
+    ReviewRoute.sendJson(res, 200, { written: version, href: ReviewRoute.guidelineAddress(version), ...(saved.mr === undefined ? {} : { mr: saved.mr }) })
   }
 
   /** The request body as a JSON object: 400 when it is not JSON or not an object, 413 over the limit. */

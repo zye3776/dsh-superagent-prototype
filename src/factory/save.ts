@@ -18,11 +18,12 @@
  * When a step fails the save stops there and says which step failed; nothing done before is undone, so a merge request that was opened stays open.
  * The worktree is removed in every case. git and glab run only through the runner they are given; tests give one that reaches no real remote.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, posix, resolve } from 'node:path'
-import { FactoryRecordsModule, RecordsRefusal, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type RecordsMasker } from './records.ts'
+import { FactoryRecordsModule, RecordsRefusal, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobsSource, type RecordsMasker, type TrendReport } from './records.ts'
 import { TalkTexts, type GuidelineProposal, type OrcaRun, type OrcaRunner } from './talk.ts'
+import { TrendPrompt, TrendReportFile, type TrendAuthor } from './trends.ts'
 
 /** One version file of the guideline, `guideline/v<N>.md`: its name, its text, and how it is read back. */
 export class GuidelineFile {
@@ -134,21 +135,26 @@ export class FactoryRemote {
     const listed = await this.git(['ls-tree', '-z', commit, '--', `${GuidelineFile.FOLDER}/`])
     if (!listed.ok) return { folder, versions: [], current: null, reason: `The guideline could not be read from ${this.remote}/${this.branch}` }
     const versions: GuidelineVersion[] = []
+    const reports: TrendReport[] = []
     let complete = true
     for (const entry of listed.stdout.split('\0')) {
       // `<mode> <type> <object>\t<path>`
       const found = /^\d+ blob ([0-9a-f]+)\t(.+)$/.exec(entry)
       if (found === null) continue
       const name = posix.basename(found[2]!)
-      if (!GuidelineFile.NAME.test(name)) continue
+      // A version and its trend report (`v<N>-trends.md`) are the folder's two kinds of file.
+      if (!GuidelineFile.NAME.test(name) && !TrendReportFile.NAME.test(name)) continue
       const blob = await this.git(['cat-file', 'blob', found[1]!])
       // A file that cannot be read is left out; the others still show.
-      if (!blob.ok) complete = false
-      const version = blob.ok ? GuidelineFile.parse(name, blob.stdout) : null
+      if (!blob.ok) { complete = false; continue }
+      const version = GuidelineFile.parse(name, blob.stdout)
       if (version !== null) versions.push(version)
+      const report = TrendReportFile.parse(name, blob.stdout)
+      if (report !== null) reports.push(report)
     }
     versions.sort((left, right) => right.version - left.version)
-    const read: GuidelineRead = { folder, versions, current: versions[0] ?? null, reason: versions.length === 0 ? FactoryRemote.NO_VERSION : null }
+    reports.sort((left, right) => right.version - left.version)
+    const read: GuidelineRead = { folder, versions, current: versions[0] ?? null, reason: versions.length === 0 ? FactoryRemote.NO_VERSION : null, reports }
     // A read that missed a file is not kept, so the next read tries again.
     if (complete) this.cached = { commit, read }
     return read
@@ -188,9 +194,21 @@ export class RemoteGuidelineRecords extends FactoryRecordsModule {
     const local = (await super.guidelineReader()).read()
     if (local.folder === null) return { read: () => local }
     const remote = await this.factoryRemote()
-    if (!await remote.isRepository()) return { read: () => local }
+    if (!await remote.isRepository()) {
+      const read = { ...local, reports: RemoteGuidelineRecords.reportsIn(local.folder) }
+      return { read: () => read }
+    }
     const read = await remote.read()
     return { read: () => read }
+  }
+  /** The trend reports in a plain `guideline/` folder, newest first. A file that cannot be read is left out. */
+  static reportsIn(folder: string): TrendReport[] {
+    let names: string[] = []
+    try { names = readdirSync(folder) } catch { return [] }
+    return names.flatMap(name => {
+      if (!TrendReportFile.NAME.test(name)) return []
+      try { const report = TrendReportFile.parse(name, readFileSync(join(folder, name), 'utf8')); return report === null ? [] : [report] } catch { return [] }
+    }).sort((left, right) => right.version - left.version)
   }
 }
 
@@ -299,42 +317,102 @@ export class FactoryRepoSave {
   }
 
   /** A failed step, with the first line of what failed; an address's user name and password are left out. */
-  private static failed(step: SaveStep, error: string, mr?: string): SaveOutcome {
+  static failed(step: SaveStep, error: string, mr?: string): Extract<SaveOutcome, { saved: false }> {
     const first = (error.split(/\r?\n/).map(line => line.trim()).find(line => line !== '') ?? 'it failed').replace(/\/\/[^/\s@]+@/g, '//')
     return { saved: false, step, error: first, mr }
   }
 }
 
-/** How the owner's Accept ended: the version saved, or why not, in plain words. */
+/** How the owner's Accept, or a trend report asked for on the page, ended: the version saved, or why not, in plain words. */
 export type GuidelineSaved = { saved: true; version: number; mr: string | undefined } | { saved: false; reason: string; mr: string | undefined }
 
-/** The owner's Accept: the proposal as the next guideline version, masked, saved through `FactoryRepoSave`. */
+/**
+ * Makes one version's trend report as a file to save: the jobs that ran under the version, read from the records, go to the report's author
+ * (`TrendWriter`, a one-off model thread), and the file it gives is masked with every listed project's mask before anything is written.
+ */
+export class TrendReports {
+  private readonly author: TrendAuthor
+  private readonly records: { jobsReader(): Promise<JobsSource>; maskerFor(project: string): Promise<RecordsMasker> }
+  private readonly projects: readonly string[]
+  constructor(options: { author: TrendAuthor; records: { jobsReader(): Promise<JobsSource>; maskerFor(project: string): Promise<RecordsMasker> }; projects: readonly string[] }) {
+    this.author = options.author
+    this.records = options.records
+    this.projects = options.projects
+  }
+
+  /** One function that applies every listed project's mask in turn. Rejects with `RecordsRefusal(503)` when a mask cannot be had. */
+  async mask(): Promise<(text: string) => string> {
+    const masks = await Promise.all(this.projects.map(async project => GuidelineSaver.maskOf(await this.records.maskerFor(project))))
+    return text => masks.reduce((masked, mask) => mask(masked), text)
+  }
+
+  /**
+   * The report of `version`, as `read` holds the guideline, ready to save over any report of that version written before. `written` says why it
+   * is written. Rejects with `RecordsRefusal(503)` in plain words when it cannot be made; nothing is written then.
+   */
+  async file(version: number, read: GuidelineRead, written: 'accepted' | 'asked', now: Date): Promise<SaveFile> {
+    const of = read.versions.find(each => each.version === version)
+    if (of === undefined) throw new RecordsRefusal(503, `v${version} is not on the factory's main`)
+    // The version before it: the highest number below it.
+    const before = read.versions.filter(each => each.version < version).sort((left, right) => right.version - left.version)[0] ?? null
+    let jobs
+    try { jobs = TrendPrompt.jobsUnder((await this.records.jobsReader()).read(this.projects), version) }
+    catch (error) { throw error instanceof RecordsRefusal ? error : new RecordsRefusal(503, 'the jobs could not be read') }
+    const mask = await this.mask()
+    const report = await this.author.write({ version: of, before, jobs })
+    const text = TrendReportFile.textOf({ version, date: GuidelineSaver.dayOf(now), jobs: report.jobs, compared_with: before?.version ?? null, written }, report.body)
+    let masked: string
+    try { masked = mask(text) } catch (error) { throw error instanceof RecordsRefusal ? error : new RecordsRefusal(503, 'the factory\'s mask failed') }
+    return { path: TrendReportFile.pathOf(version), text: masked, replace: true }
+  }
+}
+
+/**
+ * The owner's Accept: the proposal as the next guideline version, masked, saved through `FactoryRepoSave`; with `reports`, the trend report of the
+ * version it replaces goes in the same commit. Also the owner's "Write trend report" for the current version, saved the same way on a branch of its
+ * own. One of them runs at a time.
+ */
 export class GuidelineSaver {
   static readonly NOT_SAVED = 'Not saved: '
+  static readonly NO_REPORTS = 'writing a trend report is not set up here'
   private readonly records: Pick<RemoteGuidelineRecords, 'factoryRemote' | 'maskerFor'>
   private readonly repo: FactoryRepoSave
   private readonly now: () => Date
-  constructor(options: { records: Pick<RemoteGuidelineRecords, 'factoryRemote' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date }) {
+  private readonly reports: TrendReports | undefined
+  constructor(options: { records: Pick<RemoteGuidelineRecords, 'factoryRemote' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date; reports?: TrendReports }) {
     this.records = options.records
     this.repo = options.repo
     this.now = options.now ?? (() => new Date())
+    this.reports = options.reports
   }
   private running = false
-  /** Whether an Accept runs, from its first step: two Accepts never both pass the page's check. */
+  /** Whether an Accept or a report runs, from its first step: two of them never both pass the page's check. */
   get busy(): boolean { return this.running || this.repo.busy }
 
   /**
    * Saves `proposal` as the version after the remote's current one. `base` is the version the owner saw it against (`null`: none): when the
-   * remote's main moved on since, nothing is saved, so an Accept never silently undoes a version the owner did not see. It never throws.
+   * remote's main moved on since, nothing is saved, so an Accept never silently undoes a version the owner did not see. With `reports` and a version
+   * before it, that version's trend report is written first and saved in the same commit; when it cannot be written, nothing is saved. It never throws.
    */
   async accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> {
-    if (this.busy) return { saved: false, reason: `${GuidelineSaver.NOT_SAVED}${FactoryRepoSave.BUSY}`, mr: undefined }
+    if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
     this.running = true
-    try { return await this.save(proposal, base) } catch { return { saved: false, reason: `${GuidelineSaver.NOT_SAVED}the save failed`, mr: undefined } } finally { this.running = false }
+    try { return await this.save(proposal, base) } catch { return GuidelineSaver.not('the save failed') } finally { this.running = false }
+  }
+
+  /**
+   * Writes the trend report of `version`, which must be the remote's current version, and saves it on a branch of its own through a merge request the
+   * fork merges, replacing a report written before. It never throws.
+   */
+  async report(version: number): Promise<GuidelineSaved> {
+    if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
+    if (this.reports === undefined) return GuidelineSaver.not(GuidelineSaver.NO_REPORTS)
+    this.running = true
+    try { return await this.saveReport(this.reports, version) } catch { return GuidelineSaver.not('the save failed') } finally { this.running = false }
   }
 
   private async save(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> {
-    const not = (why: string, mr?: string): GuidelineSaved => ({ saved: false, reason: `${GuidelineSaver.NOT_SAVED}${why}`, mr })
+    const not = GuidelineSaver.not
     let mask: (text: string) => string
     let remote: FactoryRemote
     try {
@@ -342,6 +420,19 @@ export class GuidelineSaver {
       remote = await this.records.factoryRemote()
     } catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
     const now = this.now()
+    // The report of the version being replaced is written before the save, from the remote's main as it is now; the save checks again after its fetch.
+    let report: SaveFile | undefined
+    if (base !== null && this.reports !== undefined) {
+      // A fetch that fails stops here, before any thread is asked: the save's own fetch would fail the same way.
+      const fetched = await remote.fetch()
+      if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
+      const read = await remote.read()
+      const before = read.current?.version ?? null
+      if (before !== base) return not(GuidelineSaver.movedText(before))
+      try { report = await this.reports.file(base, read, 'accepted', now) } catch (error) {
+        return not(`the trend report for v${base} could not be written: ${GuidelineSaver.reasonOf(error, mask)}`)
+      }
+    }
     let version = 0
     let moved: number | null | undefined
     const outcome = await this.repo.save(remote, read => {
@@ -351,27 +442,84 @@ export class GuidelineSaver {
       const name = mask(TalkTexts.nameOf(proposal.project))
       const title = `guideline v${version}, from the review of ${name} job ${proposal.number}`
       return {
-        branch: `zees-factory/guideline-v${version}-${now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')}`,
+        branch: `zees-factory/guideline-v${version}-${GuidelineSaver.stampOf(now)}`,
         title,
-        message: `${title}\n\nAccepted by the owner on the review page.`,
-        description: `Guideline v${version}${before === null ? '' : `, replacing v${before}`}, from the review talk on ${name} job ${proposal.number}. Accepted by the owner on the review page and merged by the fork.`,
-        files: [{ path: GuidelineFile.pathOf(version), text: GuidelineFile.textOf({ version, date: GuidelineSaver.dayOf(now), from_job: mask(proposal.job_id), from_version: before }, mask(proposal.text)) }],
+        message: `${title}\n\nAccepted by the owner on the review page.${report === undefined ? '' : ` With the trend report for v${before}.`}`,
+        description: `Guideline v${version}${before === null ? '' : `, replacing v${before}`}, from the review talk on ${name} job ${proposal.number}.${report === undefined ? '' : ` With the trend report for v${before}.`} Accepted by the owner on the review page and merged by the fork.`,
+        files: [{ path: GuidelineFile.pathOf(version), text: GuidelineFile.textOf({ version, date: GuidelineSaver.dayOf(now), from_job: mask(proposal.job_id), from_version: before }, mask(proposal.text)) },
+          ...(report === undefined ? [] : [report])],
       }
     })
     if (outcome.saved) return { saved: true, version, mr: outcome.mr }
-    if (moved !== undefined) return not(`the guideline is at ${moved === null ? 'no version' : `v${moved}`} now, not the version this proposal was shown against. Reload the page and compare again.`)
+    if (moved !== undefined) return not(GuidelineSaver.movedText(moved))
+    return GuidelineSaver.failedOf(outcome, mask)
+  }
+
+  private async saveReport(reports: TrendReports, version: number): Promise<GuidelineSaved> {
+    const not = GuidelineSaver.not
+    let mask: (text: string) => string
+    let remote: FactoryRemote
+    try {
+      mask = await reports.mask()
+      remote = await this.records.factoryRemote()
+    } catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
+    const now = this.now()
+    const fetched = await remote.fetch()
+    if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
+    const read = await remote.read()
+    if (read.current?.version !== version) return not(GuidelineSaver.notCurrentText(version, read.current?.version ?? null))
+    const replacing = (read.reports ?? []).some(each => each.version === version)
+    let file: SaveFile
+    try { file = await reports.file(version, read, 'asked', now) } catch (error) {
+      return not(`the trend report for v${version} could not be written: ${GuidelineSaver.reasonOf(error, mask)}`)
+    }
+    let moved: number | null | undefined
+    const outcome = await this.repo.save(remote, after => {
+      const current = after.current?.version ?? null
+      if (current !== version) { moved = current; throw new RecordsRefusal(409, 'the guideline moved on') }
+      const title = `trend report for guideline v${version}`
+      return {
+        branch: `zees-factory/trends-v${version}-${GuidelineSaver.stampOf(now)}`,
+        title,
+        message: `${title}\n\nAsked for by the owner on the review page.`,
+        description: `The trend report for guideline v${version}${replacing ? ', replacing the one written before' : ''}. Asked for by the owner on the review page and merged by the fork.`,
+        files: [file],
+      }
+    })
+    if (outcome.saved) return { saved: true, version, mr: outcome.mr }
+    if (moved !== undefined) return not(GuidelineSaver.notCurrentText(version, moved))
+    return GuidelineSaver.failedOf(outcome, mask)
+  }
+
+  private static not(why: string, mr?: string): GuidelineSaved { return { saved: false, reason: `${GuidelineSaver.NOT_SAVED}${why}`, mr } }
+  private static movedText(now: number | null): string {
+    return `the guideline is at ${now === null ? 'no version' : `v${now}`} now, not the version this proposal was shown against. Reload the page and compare again.`
+  }
+  private static notCurrentText(version: number, current: number | null): string {
+    return `only the current version's trend report can be written, and v${version} is not the current version now (${current === null ? 'there is none' : `v${current} is`}). Reload the page.`
+  }
+  /** A failure's words, masked: a refusal's own message, else a plain line. */
+  private static reasonOf(error: unknown, mask: (text: string) => string): string {
+    const reason = error instanceof RecordsRefusal ? error.message : 'it failed'
+    try { return mask(reason) } catch { return 'its message could not be masked' }
+  }
+  /** A save that stopped at a step, in plain words, its error masked. */
+  private static failedOf(outcome: Extract<SaveOutcome, { saved: false }>, mask: (text: string) => string): GuidelineSaved {
     const step = outcome.step === 'start' ? '' : `the ${outcome.step} step failed: `
     let error = outcome.error
     try { error = mask(error) } catch { error = 'its message could not be masked' }
-    return not(`${step}${error}`, outcome.mr)
+    return GuidelineSaver.not(`${step}${error}`, outcome.mr)
   }
 
   /** The day of `when` on this machine's clock, as `YYYY-MM-DD`. */
   static dayOf(when: Date): string {
     return `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')}`
   }
+  /** `when` in UTC as a branch name's stamp, `YYYYMMDDTHHMMSSZ`. */
+  static stampOf(when: Date): string { return when.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z') }
 
-  private static maskOf(masker: RecordsMasker): (text: string) => string {
+  /** One project's mask of a plain text, as a function. Each call throws `RecordsRefusal(503)` when the mask fails. */
+  static maskOf(masker: RecordsMasker): (text: string) => string {
     const maskText = masker.maskText
     if (typeof maskText !== 'function') throw new RecordsRefusal(503, 'the factory\'s built job log file cannot mask a plain text; rebuild it and restart DSH')
     return text => {

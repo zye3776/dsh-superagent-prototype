@@ -3,11 +3,9 @@
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-permission-presets'
-import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-workspace'
 import s from '@deepseek-ai/schemastery'
 import { PendingApprovals } from './approvals.ts'
@@ -18,7 +16,7 @@ import { SharedTokenFile } from './token.ts'
 import { ModelJudge } from './verdict.ts'
 
 export const name = 'dsh-superagent-factory'
-export const inject = ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets', 'tools']
+export const inject = ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets']
 /** Plugin configuration of the dsh-superagent-factory entry. */
 export const Config = s.object({
   projects: s.array(s.string().pattern(/^\//)).default([])
@@ -34,13 +32,8 @@ export const Config = s.object({
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
-  // DSH's subagent service (dsh-subagent, loaded by the base bundle), looked up when a judge waits for its helpers; without it the judge does not wait.
-  const subagents = () => (ctx as unknown as { get(name: string): { waitForTreeWork?(root: Agent): Promise<boolean> } | undefined }).get('subagents')
-  const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule),
-    { treeWork: root => subagents()?.waitForTreeWork?.(root) ?? Promise.resolve(false) })
-  // One global guard, in place before any helper exists: DSH does not give a helper its parent's tool limits, so every helper of a judge is checked here with
-  // the factory's strict guard. It answers nothing for any other agent.
-  ctx.tools.guard(execution => judges.helperRefusal(execution))
+  // The judge's helpers are Claude Code and Codex processes its ask_helper tool starts (helpers.ts), not DSH agents, so no global guard is needed for them.
+  const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
   const route = new AssessRoute(config.projects ?? [], new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH), new ModelJudge(judges), undefined,
     new DecisionWriter(new FactoryMaskModule(config.maskModule)), new PendingApprovals(config.approvalSeconds ?? PendingApprovals.DEFAULT_SECONDS))
   ctx.effect(() => route.register(ctx), 'factory: assess, ask and claim routes')
@@ -50,7 +43,8 @@ export { PendingApprovals, type ApprovalClaim, type HeldApproval } from './appro
 export { AssessRoute, StubJudge, TempFactsShape, type AskRequest, type AssessRequest, type ClaimRequest, type Judge, type TempFacts, type TempPathFact, type TokenSource, type Verdict } from './assess.ts'
 export { DecisionsFile, DecisionWriter, FactoryMaskModule, type Decision, type DecisionLine, type DecisionMasker, type MaskSource } from './decisions.ts'
 export { DocsLookup, type DocsLookupArgs, type DocumentationBodies, type Fetcher } from './docs.ts'
-export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeTools, type JudgeToolCall, type TreeWork } from './judge.ts'
+export { HelperRunner, NodeSpawner, type HelperArgs, type HelperCommandBuilder, type HelperExit, type HelperJob, type HelperProcess, type HelperResult, type HelperSpawner, type ReadCheck } from './helpers.ts'
+export { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger, type AskedJudge, type GuardSource, type HelperWindow, type JudgeGuard, type JudgeOpener, type JudgeReply, type JudgeTools, type JudgeToolCall } from './judge.ts'
 export { SharedTokenFile } from './token.ts'
 export { TokenTally, type TalliedEvent } from './usage.ts'
 export { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from './verdict.ts'

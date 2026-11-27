@@ -16,9 +16,6 @@
 # The agent preset the route's judge Sessions are created with. A judge reads a project and changes nothing.
 - id: dsh-superagent-judge-preset
   disabled: false
-# The agent preset of the judge's helpers: read-only agents a judge starts on a faster model to check a claim for it.
-- id: dsh-superagent-judge-helper-preset
-  disabled: false
 - id: dsh-superagent-factory
   disabled: false
   config:

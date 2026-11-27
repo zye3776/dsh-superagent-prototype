@@ -16,7 +16,7 @@ import { SharedTokenFile } from '../src/factory/token.ts'
 import { JudgeAnswer, JudgeQuestion, ModelJudge, UnusableAnswer } from '../src/factory/verdict.ts'
 import { RecordedRequests } from './fixtures/factory-requests.ts'
 import { JudgeEvents } from './fixtures/judge-events.ts'
-import { fakeDsh, fakeGuard, type FakeExecution, type FakeReply } from './fixtures/judge.ts'
+import { claudeOutput, fakeDsh, fakeGuard, fakeSpawner, type FakeExecution, type FakeReply } from './fixtures/judge.ts'
 
 const TOKEN = 'test-token_0123456789abcdefghijklmnopqrstuvwxyz'
 /** A stand-in for the factory's built mask file, with the same export. It marks `reason`, so a test can tell that the line went through it. */
@@ -650,26 +650,22 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect(verdict.reads).toEqual([{ path: inProject(RecordedRequests.SCRIPT), used: true }])
   })
 
-  it('records the files only a helper read with by: "helper", and the factory\'s real mask and schema accept the line (story 2.22)', async () => {
+  it('records the files only a Claude helper read with by: "helper", and the factory\'s real mask and schema accept the line (story 2.25)', async () => {
     put(inProject(RecordedRequests.SOURCE))
     put(inProject('src/b.ts'))
     put(inProject('nested/src/a.ts'))
-    let judges!: JudgeSessions
-    let parent = ''
-    const helperCall = (path: string) => judges.helperRefusal({ name: 'read', arguments: { file_path: path },
-      agent: { session: { header: { id: 'helper-1', agentPreset: JudgeSessions.HELPER_PRESET, parentSession: parent } } } })
-    const helperRefusals: (string | undefined)[] = []
-    const dsh = fakeDsh((_question, run) => {
-      run({ name: 'subagent', arguments: { description: 'check the sources', prompt: 'Read src/a.ts and src/b.ts and say what they do.' } })
-      helperRefusals.push(helperCall(RecordedRequests.SOURCE), helperCall('src/b.ts'), helperCall(RecordedRequests.SECRET), helperCall('nested/src/a.ts'))
+    const fake = fakeSpawner(() => ({ code: 0, stdout: claudeOutput('Both are plain source files.', [
+      { name: 'Read', input: { file_path: RecordedRequests.SOURCE } }, { name: 'Read', input: { file_path: 'src/b.ts' } },
+      { name: 'Read', input: { file_path: 'nested/src/a.ts' } }]) }))
+    const texts: string[] = []
+    const dsh = fakeDsh(async (_question, run, call) => {
+      texts.push(await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'What do src/a.ts and src/b.ts do?' } }))
       run(readOf(RecordedRequests.SCRIPT))
       return JSON.stringify(answer({ reads: [{ path: RecordedRequests.SCRIPT, used: true }, { path: RecordedRequests.SOURCE, used: true }] }))
     })
-    judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD))
-    parent = (await judges.open(project, requests.editedScript().session_id)).id
+    const judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD), { spawner: fake.spawner })
     const verdict = await new ModelJudge(judges).decide(requests.editedScript())
-    expect(helperRefusals.slice(0, 2)).toEqual([undefined, undefined])
-    expect(helperRefusals[2]).toMatch(/secret list/)
+    expect(texts).toEqual(['Both are plain source files.'])
     expect(verdict.reads).toEqual([
       { path: inProject(RecordedRequests.SCRIPT), used: true },
       { path: inProject(RecordedRequests.SOURCE), used: true, by: 'helper' },
@@ -680,6 +676,19 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     const masker = await new FactoryMaskModule(join(FACTORY, 'lib', 'dist', 'decisionMask.js')).maskerFor(project)
     const masked = masker.mask({ ...verdict, seconds: 1, ts: new Date().toISOString(), project })
     expect(masked.reads.map(read => read.by)).toEqual([undefined, 'helper', 'helper', 'helper'])
+  })
+
+  it('records no helper reads when the helper read a file on the secret list (story 2.25)', async () => {
+    put(inProject(RecordedRequests.SOURCE))
+    const fake = fakeSpawner(() => ({ code: 0, stdout: claudeOutput('The key is set.', [
+      { name: 'Read', input: { file_path: RecordedRequests.SOURCE } }, { name: 'Read', input: { file_path: RecordedRequests.SECRET } }]) }))
+    const dsh = fakeDsh(async (_question, run, call) => {
+      await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'Is the key set?' } })
+      run(readOf(RecordedRequests.SCRIPT))
+      return JSON.stringify(answer({ reads: [{ path: RecordedRequests.SCRIPT, used: true }] }))
+    })
+    const verdict = await new ModelJudge(new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD), { spawner: fake.spawner })).decide(requests.editedScript())
+    expect(verdict.reads).toEqual([{ path: inProject(RecordedRequests.SCRIPT), used: true }])
   })
 })
 

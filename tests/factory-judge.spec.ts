@@ -1,12 +1,13 @@
 /** The factory's judge Sessions on a stand-in DSH, and the factory's real built guard when `ZEES_FACTORY_DIR` says where the factory is. */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AssessRefusal } from '../src/factory/decisions.ts'
+import type { HelperCommandBuilder } from '../src/factory/helpers.ts'
 import { FactoryGuardModule, JudgeSession, JudgeSessions, ReadLedger } from '../src/factory/judge.ts'
 import { JudgeEvents } from './fixtures/judge-events.ts'
-import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
+import { claudeOutput, codexOutput, fakeDsh, fakeGuard, fakeSpawner } from './fixtures/judge.ts'
 
 let root = '', project = ''
 const put = (path: string, text = 'x\n'): void => { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, text) }
@@ -382,38 +383,47 @@ const FAKE_BODIES = {
 }
 /** A guard source with the judge variant: the fake guard for the judge's own calls too. */
 const withJudgeTools = (fake = fakeGuard()) => ({ ...fake, source: { ...fake.source, judgeTools: vi.fn(async () => ({ guard: fake.guard, documentation: FAKE_BODIES })) } })
-/** One tool call of a helper of `parent`, as DSH hands it to the global guard. */
-const helperCall = (name: string, args: unknown, parent: string, id = 'helper-1', agentPreset: string = JudgeSessions.HELPER_PRESET, createdAt?: number) =>
-  ({ name, arguments: args, agent: { session: { header: { id, parentSession: parent, agentPreset, ...createdAt === undefined ? {} : { createdAt } } } } })
+/** A stand-in for the guard file's `HelperCommand`: short command lines that say which helper they are, and a prompt that shows what it carries. */
+const FAKE_HELPERS: HelperCommandBuilder = {
+  claude: (model = 'haiku') => ({ argv: ['claude', '-p', '--model', model], settings: {} }),
+  codexMcpListArgv: () => ['codex', 'mcp', 'list', '--json'],
+  mcpNames: (stdout) => { try { const names = JSON.parse(stdout) as { name: string }[]; return Array.isArray(names) ? names.map(item => item.name) : null } catch { return null } },
+  codex: (names) => ['codex', 'exec', ...names.map(name => `off:${name}`), '--json', '-'],
+  prompt: (question, text) => text === undefined ? `Q: ${question}` : `Q: ${question}\nT: ${text}`,
+}
+/** A guard source with the judge variant and the helpers' commands. */
+const withHelpers = (fake = fakeGuard(), helpers: HelperCommandBuilder = FAKE_HELPERS) =>
+  ({ ...fake, source: { ...fake.source, judgeTools: vi.fn(async () => ({ guard: fake.guard, documentation: FAKE_BODIES, helpers })) } })
+/** Waits until `test` holds, a few milliseconds at a time. */
+const until = async (test: () => boolean): Promise<void> => { for (let tries = 0; !test() && tries < 200; tries++) await new Promise(resolve => { setTimeout(resolve, 2) }) }
 
-describe('helpers and documentation lookups (story 2.22)', () => {
-  it('gives a judge subagent, wait_agent and docs_lookup only when the guard file has the judge variant, and says so in the brief', async () => {
+describe('helpers and documentation lookups', () => {
+  it('gives a judge docs_lookup and ask_helper only when the guard file has the judge variant and the helper commands, and says so in the brief', async () => {
     const dsh = fakeDsh()
-    const judge = await new JudgeSessions(dsh.ctx, withJudgeTools().source).open(project, 's1')
+    const judge = await new JudgeSessions(dsh.ctx, withHelpers().source).open(project, 's1')
     const agent = dsh.agents.get(judge.id)!
-    expect(agent.allowed).toEqual([['read', 'grep', 'glob', 'bash', 'subagent', 'wait_agent']])
-    expect(agent.registered.map(tool => tool.name)).toEqual(['docs_lookup'])
+    expect(agent.allowed).toEqual([['read', 'grep', 'glob', 'bash']])
+    expect(agent.registered.map(tool => tool.name)).toEqual(['docs_lookup', 'ask_helper'])
+    expect([judge.lookups, judge.helpers]).toEqual([true, true])
     const brief = judge.brief()
-    expect(brief).toContain('up to 3 read-only helpers with subagent')
-    expect(brief).toContain('wait_agent and timeout_ms of at most 15000')
+    expect(brief).toContain('you may ask up to 3 helpers with ask_helper, only within the first 10 seconds of a question; each one answers within 15 seconds.')
+    expect(brief).toContain('engine "claude" reads the project with Read, Grep and Glob')
+    expect(brief).toContain('engine "codex" reads no file: it answers only from the text you give it.')
     expect(brief).toContain('docs_lookup looks up a tool\'s or library\'s public documentation, only within the first 10 seconds of a question. Send only its name and one general question')
-    expect(brief).toContain('that does not apply to you. Never end your turn while helpers run; collect their results with wait_agent, then answer in this same turn.')
-    // Without the judge variant: the four read tools, no lookup tool, and a brief that names neither.
+    expect(brief).not.toMatch(/subagent|wait_agent/)
+    // A guard file with the judge variant but without HelperCommand: the lookup only.
+    const lookups = fakeDsh(), noHelpers = await new JudgeSessions(lookups.ctx, withJudgeTools().source).open(project, 's1')
+    expect(lookups.agents.get(noHelpers.id)!.registered.map(tool => tool.name)).toEqual(['docs_lookup'])
+    expect([noHelpers.lookups, noHelpers.helpers]).toEqual([true, false])
+    expect(noHelpers.brief()).not.toContain('ask_helper')
+    // Without the judge variant: the four read tools, no registered tool, and a brief that names neither.
     const plain = fakeDsh(), old = await new JudgeSessions(plain.ctx, fakeGuard().source).open(project, 's1')
     expect(plain.agents.get(old.id)!.allowed).toEqual([['read', 'grep', 'glob', 'bash']])
     expect(plain.agents.get(old.id)!.registered).toEqual([])
-    expect(old.brief()).not.toContain('subagent')
+    expect(old.brief()).not.toMatch(/ask_helper|docs_lookup/)
   })
 
-  it('falls back to the four read tools when DSH does not know the delegation tools', async () => {
-    const dsh = fakeDsh(undefined, { restrictable: ['read', 'grep', 'glob', 'bash'] })
-    const judge = await new JudgeSessions(dsh.ctx, withJudgeTools().source).open(project, 's1')
-    const agent = dsh.agents.get(judge.id)!
-    expect([agent.allowed, agent.registered]).toEqual([[['read', 'grep', 'glob', 'bash']], []])
-    expect(judge.helpers).toBe(false)
-  })
-
-  it('a guard file without forJudge or DocumentationQuery gives no judge variant; a full one does', async () => {
+  it('a guard file without forJudge or DocumentationQuery gives no judge variant; one without a usable HelperCommand gives no helpers', async () => {
     const strict = 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n'
     expect(await new FactoryGuardModule(moduleFile('old.mjs', strict)).judgeTools()).toBeUndefined()
     const noDocs = 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }), forJudge: () => ({ check: () => undefined }) }\n'
@@ -424,147 +434,127 @@ describe('helpers and documentation lookups (story 2.22)', () => {
     const full = throws.replace('forJudge: () => { throw new Error("x") }', 'forJudge: () => ({ judge: true, check: () => undefined })')
     const tools = await new FactoryGuardModule(moduleFile('full.mjs', full)).judgeTools()
     expect((tools?.guard as unknown as { judge: boolean }).judge).toBe(true)
+    expect(tools?.helpers).toBeUndefined()
+    const command = '{ claude() {}, codexMcpListArgv() {}, mcpNames() {}, codex() {}, prompt() {} }'
+    const helped = await new FactoryGuardModule(moduleFile('helped.mjs', `${full}export const HelperCommand = { forHome: () => (${command}) }\n`)).judgeTools()
+    expect(typeof helped?.helpers?.claude).toBe('function')
+    const partial = await new FactoryGuardModule(moduleFile('partial.mjs', `${full}export const HelperCommand = { forHome: () => ({ claude() {} }) }\n`)).judgeTools()
+    expect([partial?.helpers, typeof partial?.documentation]).toEqual([undefined, 'object'])
+    const broken = await new FactoryGuardModule(moduleFile('broken.mjs', `${full}export const HelperCommand = { forHome: () => { throw new Error("x") } }\n`)).judgeTools()
+    expect([broken?.helpers, typeof broken?.guard]).toEqual([undefined, 'object'])
     const dsh = fakeDsh(), judge = await new JudgeSessions(dsh.ctx, new FactoryGuardModule(moduleFile('old2.mjs', strict))).open(project, 's1')
     expect(dsh.agents.get(judge.id)!.registered).toEqual([])
   })
 
-  it('lets a judge start at most 3 helpers per question, only in its first 10 seconds, and wait only until 20 seconds', async () => {
+  it('lets a judge ask at most 3 helpers per question, only in its first 10 seconds', async () => {
     let clock = 1_000
     const answers: (string | undefined)[][] = []
-    const dsh = fakeDsh((text, run) => {
-      const start = () => run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } })
-      const wait = (timeout_ms: number) => run({ name: 'wait_agent', arguments: { timeout_ms } })
-      if (text === 'one') {
-        answers.push([start(), start(), start(), start()])
-        clock += 6_000
-        answers.push([wait(14_000), wait(15_000)])
-      } else {
-        clock += 10_000
-        answers.push([start()])
-        clock += 2_000
-        answers.push([wait(10_000)])
-      }
+    const ask = { name: 'ask_helper', arguments: { engine: 'claude', question: 'Where is the build script?' } }
+    const dsh = fakeDsh((_text, run) => {
+      const seen = [run(ask), run(ask), run(ask), run(ask)]
+      clock += 10_000
+      answers.push([...seen, run(ask)])
       return 'ok'
     })
-    const judges = new JudgeSessions(dsh.ctx, withJudgeTools().source, { now: () => clock })
-    const judge = await judges.open(project, 's1')
-    await judge.ask('one', new AbortController().signal)
+    const judge = await new JudgeSessions(dsh.ctx, withHelpers().source, { now: () => clock }).open(project, 's1')
+    expect(judge.helperRefusal()).toMatch(/no question is being answered/)
+    await judge.ask('q1', new AbortController().signal)
     expect(answers[0]!.slice(0, 3)).toEqual([undefined, undefined, undefined])
     expect(answers[0]![3]).toMatch(/at most 3 helpers per question/)
-    // 6 s in: a wait of 14 s ends at 20 s, one of 15 s would not.
-    expect(answers[1]![0]).toBeUndefined()
-    expect(answers[1]![1]).toMatch(/largest allowed timeout_ms now is 14000/)
-    await judge.ask('two', new AbortController().signal)
-    expect(answers[2]![0]).toMatch(/only within the first 10 seconds/)
-    expect(answers[3]![0]).toMatch(/no time left to wait/)
-    // Outside a question nothing is started or waited for.
-    expect(judge.subagentRefusal()).toMatch(/no question is being answered/)
+    expect(answers[0]![4]).toMatch(/at most 3 helpers per question/)
+    // A new question has its own budget, and its window closes after 10 seconds.
+    const late = fakeDsh((_text, run) => { clock += 10_000; return run(ask) ?? 'ran' })
+    const lateJudge = await new JudgeSessions(late.ctx, withHelpers().source, { now: () => clock }).open(project, 's2')
+    expect(await lateJudge.ask('q', new AbortController().signal)).toMatch(/helpers start only within the first 10 seconds of a question/)
+    await judge.ask('q2', new AbortController().signal)
+    expect(answers[1]!.slice(0, 3)).toEqual([undefined, undefined, undefined])
   })
 
-  it('waits after the judge\'s turn until its helpers are done, and gives up at 25 seconds so it cannot hang', async () => {
-    let clock = 1_000
-    const dsh = fakeDsh((_text, run) => { run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } }); return 'ok' })
-    const helperDone = Promise.withResolvers<boolean>()
-    let openDuringWait: boolean | undefined
-    const treeWork = vi.fn(async () => {
-      if (treeWork.mock.calls.length === 1) {
-        openDuringWait = judge.waitRefusal(10_000) === undefined
-        return helperDone.promise
-      }
-      return false
-    })
-    const judges = new JudgeSessions(dsh.ctx, withJudgeTools().source, { now: () => clock, treeWork })
-    const judge = await judges.open(project, 's1')
-    let answered = false
-    const asked = judge.ask('one', new AbortController().signal).then(text => { answered = true; return text })
-    await vi.waitFor(() => { expect(treeWork).toHaveBeenCalledTimes(1) })
-    expect(answered).toBe(false)
-    // The question stays open while its helpers run.
-    expect(openDuringWait).toBe(true)
-    helperDone.resolve(true)
-    expect(await asked).toBe('ok')
-    expect(treeWork).toHaveBeenCalledTimes(2)
-    expect(judge.subagentRefusal()).toMatch(/no question is being answered/)
-
-    // A helper that never finishes: the wait ends at 25 s after the question was sent.
-    const stuck = vi.fn(() => new Promise<boolean>(() => {}))
-    const late = new JudgeSessions(fakeDsh((_text, run) => { run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } }); clock += 24_990; return 'late' }).ctx,
-      withJudgeTools().source, { now: () => clock, treeWork: stuck })
-    const lateJudge = await late.open(project, 's2')
-    expect(await lateJudge.ask('two', new AbortController().signal)).toBe('late')
-    expect(stuck).toHaveBeenCalledTimes(1)
-
-    // No helper started: nothing is waited for.
-    const none = vi.fn(async () => false)
-    const quiet = await new JudgeSessions(fakeDsh().ctx, withJudgeTools().source, { now: () => clock, treeWork: none }).open(project, 's3')
-    await quiet.ask('three', new AbortController().signal)
-    expect(none).not.toHaveBeenCalled()
-  })
-
-  it('holds every helper to the strict guard with the project as folder, records its reads, and refuses it once the question is answered', async () => {
-    const strict = fakeGuard(['.env'])
-    const during: (string | undefined)[] = []
-    let judges!: JudgeSessions
-    let parent = ''
-    const dsh = fakeDsh((_text, run) => {
-      run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } })
-      during.push(judges.helperRefusal(helperCall('read', { file_path: 'src/a.ts' }, parent)))
-      during.push(judges.helperRefusal(helperCall('read', { file_path: 'src/b.ts' }, parent)))
-      during.push(judges.helperRefusal(helperCall('write', { file_path: 'src/a.ts' }, parent)))
-      during.push(judges.helperRefusal(helperCall('read', { file_path: '.env' }, parent)))
-      // A second helper the judge did not start for this question.
-      during.push(judges.helperRefusal(helperCall('read', { file_path: 'src/a.ts' }, parent, 'helper-2')))
+  it('runs a Claude helper in the project with the prompt on its input, and records the files and folders it read, the judge\'s own read once', async () => {
+    const fake = fakeSpawner(argv => argv[0] === 'claude' ? { code: 0, stdout: claudeOutput('src/a.ts exports one function.', [
+      { name: 'Read', input: { file_path: join(project, 'src', 'a.ts') } }, { name: 'Grep', input: { pattern: 'x', path: 'src' } },
+      { name: 'Glob', input: { pattern: '**/*.ts' } }, { name: 'Read', input: { file_path: 'src/missing.ts' } }, { name: 'Read', input: { file_path: 'src/b.ts' } }]) } : 'missing')
+    const texts: string[] = []
+    const dsh = fakeDsh(async (_text, run, call) => {
+      texts.push(await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'What does src/a.ts export?', model: 'sonnet' } }))
       run({ name: 'read', arguments: { file_path: 'src/b.ts' } })
       return 'ok'
     })
-    judges = new JudgeSessions(dsh.ctx, { guard: strict.source.guard, judgeTools: async () => ({ guard: fakeGuard().guard, documentation: FAKE_BODIES }) })
-    const judge = await judges.open(project, 's1')
-    parent = judge.id
+    const guard = withHelpers()
+    const judge = await new JudgeSessions(dsh.ctx, guard.source, { spawner: fake.spawner }).open(project, 's1')
     const reply = await judge.consult('q', new AbortController().signal)
-    expect(during.slice(0, 2)).toEqual([undefined, undefined])
-    expect(during[2]).toBe('Refused: write')
-    expect(during[3]).toMatch(/secret list/)
-    expect(during[4]).toMatch(/not started for the question/)
-    // The strict guard checked the helper's calls in the judge's project.
-    expect(strict.calls.filter(item => item.call.name === 'write').map(item => item.cwd)).toEqual([project])
-    // The judge read src/b.ts itself, so only src/a.ts is a helper read.
+    expect(texts).toEqual(['src/a.ts exports one function.'])
+    expect(fake.starts.map(start => [start.argv, start.cwd, start.input])).toEqual([[['claude', '-p', '--model', 'sonnet'], project, 'Q: What does src/a.ts export?']])
+    // The judge read src/b.ts itself, so it is the judge's; a file that is not there is no read.
     expect(reply.reads).toEqual([join(project, 'src', 'b.ts')])
-    expect(reply.helperReads).toEqual([join(project, 'src', 'a.ts')])
-    expect(judges.helperRefusal(helperCall('read', { file_path: 'src/a.ts' }, parent))).toMatch(/has answered the question/)
+    expect(reply.helperReads).toEqual([join(project, 'src', 'a.ts'), join(project, 'src'), project])
+    // Every path the helper read was checked with the judge's guard: a read as read, a searched path as glob.
+    expect(guard.calls.filter(item => item.call.name === 'read' || item.call.name === 'glob').slice(0, 5).map(item => [item.call.name, item.cwd])).toEqual([
+      ['read', project], ['glob', project], ['glob', project], ['read', project], ['read', project]])
   })
 
-  it('refuses a helper left over from an earlier question at its first call, and keeps the new helper\'s slot free', async () => {
-    let clock = 1_000
-    let judges!: JudgeSessions
-    let parent = ''
-    const seen: (string | undefined)[] = []
-    const dsh = fakeDsh((text, run) => {
-      run({ name: 'subagent', arguments: { description: 'd', prompt: 'p' } })
-      if (text === 'two') {
-        // Made at 1000, during question one; its first call comes now, in question two.
-        seen.push(judges.helperRefusal(helperCall('read', { file_path: 'src/a.ts' }, parent, 'old', JudgeSessions.HELPER_PRESET, 1_000)))
-        seen.push(judges.helperRefusal(helperCall('read', { file_path: 'src/b.ts' }, parent, 'new', JudgeSessions.HELPER_PRESET, clock)))
-      }
+  it('drops a Claude helper\'s answer and reads when it read a file on the secret list', async () => {
+    const fake = fakeSpawner(() => ({ code: 0, stdout: claudeOutput('KEY is set.', [
+      { name: 'Read', input: { file_path: 'src/a.ts' } }, { name: 'Read', input: { file_path: '.env' } }]) }))
+    const texts: string[] = []
+    const dsh = fakeDsh(async (_text, _run, call) => { texts.push(await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'Is KEY set?' } })); return 'ok' })
+    const judge = await new JudgeSessions(dsh.ctx, withHelpers(fakeGuard(['.env'])).source, { spawner: fake.spawner }).open(project, 's1')
+    const reply = await judge.consult('q', new AbortController().signal)
+    expect(texts).toEqual(['The helper gave no evidence (it tried to read a file on the secret list). Decide without it.'])
+    expect(reply.helperReads).toEqual([])
+  })
+
+  it('runs a Codex helper on the text only, in an empty folder of its own that is removed, with every MCP server it listed turned off', async () => {
+    const folders: string[] = []
+    const fake = fakeSpawner((argv, cwd) => {
+      folders.push(cwd)
+      return argv[1] === 'mcp' ? { code: 0, stdout: '[{"name":"node_repl"},{"name":"memory"}]' } : { code: 0, stdout: codexOutput('It deletes the build folder.') }
+    })
+    const texts: string[] = []
+    const dsh = fakeDsh(async (_text, _run, call) => {
+      texts.push(await call({ name: 'ask_helper', arguments: { engine: 'codex', question: 'What does this do?', text: 'rm -rf build' } }))
       return 'ok'
     })
-    judges = new JudgeSessions(dsh.ctx, withJudgeTools().source, { now: () => clock })
-    const judge = await judges.open(project, 's1')
-    parent = judge.id
-    await judge.ask('one', new AbortController().signal)
-    clock = 5_000
-    const reply = await judge.consult('two', new AbortController().signal)
-    expect(seen[0]).toMatch(/has answered the question/)
-    expect(seen[1]).toBeUndefined()
-    expect(reply.helperReads).toEqual([join(project, 'src', 'b.ts')])
+    const judge = await new JudgeSessions(dsh.ctx, withHelpers().source, { spawner: fake.spawner }).open(project, 's1')
+    const reply = await judge.consult('q', new AbortController().signal)
+    expect(texts).toEqual(['It deletes the build folder.'])
+    expect(fake.starts.map(start => start.argv)).toEqual([['codex', 'mcp', 'list', '--json'], ['codex', 'exec', 'off:node_repl', 'off:memory', '--json', '-']])
+    expect(fake.starts[1]!.input).toBe('Q: What does this do?\nT: rm -rf build')
+    expect(new Set(folders).size).toBe(1)
+    expect(folders[0]).not.toBe(project)
+    expect(existsSync(folders[0]!)).toBe(false)
+    expect(reply.helperReads).toEqual([])
   })
 
-  it('refuses a call whose Session header cannot be read', async () => {
-    const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, withJudgeTools().source)
-    await judges.open(project, 's1')
-    const session = { get header(): never { throw new Error('planted-detail') } }
-    const refusal = judges.helperRefusal({ name: 'read', arguments: {}, agent: { session } })
-    expect(refusal).toMatch(/could not read this agent's Session/)
-    expect(refusal).not.toContain('planted-detail')
+  it('refuses a Codex helper whose MCP servers cannot be listed, and says when a helper\'s program is not installed', async () => {
+    const texts: string[] = []
+    const ask = (args: Record<string, unknown>) => fakeDsh(async (_text, _run, call) => { texts.push(await call({ name: 'ask_helper', arguments: args })); return 'ok' })
+    for (const [run, args] of [
+      [{ code: 0, stdout: '{"not":"a list"}' }, { engine: 'codex', question: 'q', text: 't' }],
+      [{ code: 1, stdout: '' }, { engine: 'codex', question: 'q', text: 't' }],
+      ['missing', { engine: 'claude', question: 'q' }],
+    ] as const) {
+      const fake = fakeSpawner(() => run)
+      const dsh = ask(args)
+      const judge = await new JudgeSessions(dsh.ctx, withHelpers().source, { spawner: fake.spawner }).open(project, `s-${texts.length}`)
+      await judge.consult('q', new AbortController().signal)
+      if (args.engine === 'codex') expect(fake.starts.map(start => start.argv[1])).toEqual(['mcp'])
+    }
+    expect(texts[0]).toMatch(/no evidence \(its MCP servers could not be listed, so they could not be turned off, and it was not started\)/)
+    expect(texts[1]).toMatch(/could not be turned off/)
+    expect(texts[2]).toBe('The claude helper is unavailable (the claude program was not found). Decide without it.')
+  })
+
+  it('stops a helper still running when the question is answered, and records none of its reads', async () => {
+    const fake = fakeSpawner(() => 'hang')
+    let pending: Promise<string> | undefined
+    const dsh = fakeDsh((_text, _run, call) => { pending = call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'q' } }); return 'answered without waiting' })
+    const judge = await new JudgeSessions(dsh.ctx, withHelpers().source, { spawner: fake.spawner }).open(project, 's1')
+    const reply = await judge.consult('q', new AbortController().signal)
+    await until(() => fake.starts.length > 0 && fake.starts[0]!.killed)
+    expect(fake.starts[0]!.killed).toBe(true)
+    expect(await pending).toBe('The helper gave no evidence (the question was answered before it finished, so it was stopped). Decide without it.')
+    expect(reply.helperReads).toEqual([])
   })
 
   it('refuses a documentation lookup once 10 seconds of the question have passed', async () => {
@@ -584,23 +574,14 @@ describe('helpers and documentation lookups (story 2.22)', () => {
   })
 
   it('gives a judge made again for an already guarded agent the helper brief', async () => {
-    const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, withJudgeTools().source)
+    const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, withHelpers().source)
     // The first open guards the agent, then fails at the rename, so its judge is forgotten.
     dsh.controller.rename.mockRejectedValueOnce(new Error('planted-detail'))
     await expect(judges.open(project, 's1')).rejects.toBeInstanceOf(AssessRefusal)
     const judge = await judges.open(project, 's1')
-    expect(dsh.agents.get(judge.id)!.registered.map(tool => tool.name)).toEqual(['docs_lookup'])
-    expect(judge.helpers).toBe(true)
-    expect(judge.brief()).toContain('read-only helpers with subagent')
-  })
-
-  it('refuses every call of an orphan helper, and lets every other agent\'s call through', async () => {
-    const dsh = fakeDsh(), judges = new JudgeSessions(dsh.ctx, withJudgeTools().source)
-    await judges.open(project, 's1')
-    expect(judges.helperRefusal(helperCall('read', { file_path: 'src/a.ts' }, 'someone-else'))).toMatch(/no known judge/)
-    expect(judges.helperRefusal(helperCall('write', {}, 'someone-else', 'w', 'standard'))).toBeUndefined()
-    expect(judges.helperRefusal({ name: 'write', arguments: {} })).toBeUndefined()
-    expect(judges.helperRefusal({ name: 'write', arguments: {}, agent: { session: { header: undefined } } })).toBeUndefined()
+    expect(dsh.agents.get(judge.id)!.registered.map(tool => tool.name)).toEqual(['docs_lookup', 'ask_helper'])
+    expect([judge.lookups, judge.helpers]).toEqual([true, true])
+    expect(judge.brief()).toContain('ask_helper')
   })
 })
 
@@ -652,38 +633,54 @@ describe.skipIf(FACTORY === '')(realTitle, () => {
     expect(judge.ledger.size).toBe(1)
   })
 
-  it('holds the judge\'s helpers to the strict guard and checks the judge\'s own delegation and lookup arguments (story 2.22)', async () => {
-    let judges!: JudgeSessions
-    let parent = ''
-    const helper: (string | undefined)[] = [], own: (string | undefined)[] = []
-    const dsh = fakeDsh((_text, run) => {
-      own.push(run({ name: 'subagent', arguments: { description: 'check', prompt: 'Read src/a.ts and say what it exports.' } }))
-      for (const [name, args] of [['write', { file_path: 'src/a.ts', content: 'y' }], ['bash', { command: 'rm -rf src' }], ['read', { file_path: '~/.ssh/id_rsa' }],
-        ['subagent', { description: 'd', prompt: 'p' }], ['wait_agent', { timeout_ms: 12_000 }], ['docs_lookup', { service: 'deepwiki', name: 'facebook/react', question: 'How?' }],
-        ['read', { file_path: 'src/a.ts' }]] as const) helper.push(judges.helperRefusal(helperCall(name, args, parent)))
-      for (const args of [{ description: 'd', prompt: 'p', agent_preset: 'standard' }, { description: 'd', prompt: 'p', provider: 'x', model: 'y' }]) {
-        own.push(run({ name: 'subagent', arguments: args }))
-      }
-      own.push(run({ name: 'wait_agent', arguments: {} }))
+  it('checks the judge\'s own helper and lookup arguments, builds the helpers\' real command lines, and checks every helper read with the guard', async () => {
+    put(join(project, '.env'), 'KEY=made-up\n')
+    const own: (string | undefined)[] = []
+    const texts: string[] = []
+    let reads: { name: string; input: Record<string, unknown> }[] = []
+    const fake = fakeSpawner(argv => argv[0] === 'claude' ? { code: 0, stdout: claudeOutput('It exports a.', reads) }
+      : argv[1] === 'mcp' ? { code: 0, stdout: '[{"name":"node_repl"}]' } : { code: 0, stdout: codexOutput('It deletes build.') })
+    const dsh = fakeDsh(async (_text, run, call) => {
+      for (const args of [{ engine: 'claude', question: 'q', model: 'opus' }, { engine: 'codex', question: 'q' }, { engine: 'codex', question: 'q', text: 't', model: 'x' },
+        { engine: 'gemini', question: 'q' }]) own.push(run({ name: 'ask_helper', arguments: args }))
       own.push(run({ name: 'docs_lookup', arguments: { service: 'deepwiki', name: 'facebook/react', question: 'What does src/a.ts export?' } }))
+      reads = [{ name: 'Read', input: { file_path: 'src/a.ts' } }, { name: 'Grep', input: { pattern: 'x', path: 'src' } }]
+      texts.push(await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'What does src/a.ts export?' } }))
+      texts.push(await call({ name: 'ask_helper', arguments: { engine: 'codex', question: 'What does this do?', text: 'rm -rf build' } }))
       return 'ok'
     })
-    judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD))
+    const judges = new JudgeSessions(dsh.ctx, new FactoryGuardModule(REAL_GUARD), { spawner: fake.spawner })
     const judge = await judges.open(project, 's1')
-    parent = judge.id
-    expect(dsh.agents.get(judge.id)!.allowed).toEqual([['read', 'grep', 'glob', 'bash', 'subagent', 'wait_agent']])
+    expect(dsh.agents.get(judge.id)!.allowed).toEqual([['read', 'grep', 'glob', 'bash']])
+    expect(dsh.agents.get(judge.id)!.registered.map(tool => tool.name)).toEqual(['docs_lookup', 'ask_helper'])
     const reply = await judge.consult('q', new AbortController().signal)
-    expect(helper.slice(0, 6).every(refusal => refusal?.startsWith('Refused: '))).toBe(true)
-    expect(helper[0]).toMatch(/only reads/)
-    expect(helper[1]).toMatch(/only reads/)
-    expect(helper[2]).toMatch(/secret list/)
-    for (const refusal of helper.slice(3, 6)) expect(refusal).toMatch(/not one the judge may use/)
-    expect(helper[6]).toBeUndefined()
-    expect(reply.helperReads).toEqual([join(project, 'src', 'a.ts')])
-    expect(own[0]).toBeUndefined()
-    expect(own[1]).toMatch(/only description, prompt/)
-    expect(own[2]).toMatch(/only description, prompt/)
-    expect(own[3]).toMatch(/15000 \(the largest allowed value\)/)
+    expect(own[0]).toMatch(/model is haiku or sonnet/)
+    expect(own[1]).toMatch(/codex helper needs text/)
+    expect(own[2]).toMatch(/its model is fixed/)
+    expect(own[3]).toMatch(/needs engine "claude"/)
     expect(own[4]).toMatch(/documentation lookup cannot be sent/)
+    expect(texts).toEqual(['It exports a.', 'It deletes build.'])
+    expect(reply.helperReads).toEqual([join(project, 'src', 'a.ts'), join(project, 'src')])
+    const [claude, list, codex] = fake.starts.map(start => start.argv)
+    for (const flag of ['--restricted', '--strict-mcp-config', '--no-session-persistence', '--disable-slash-commands']) expect(claude).toContain(flag)
+    expect(claude!.slice(claude!.indexOf('--tools'), claude!.indexOf('--tools') + 2)).toEqual(['--tools', 'Read,Grep,Glob'])
+    expect(claude!.slice(claude!.indexOf('--permission-mode'), claude!.indexOf('--permission-mode') + 2)).toEqual(['--permission-mode', 'dontAsk'])
+    const deny = (JSON.parse(claude![claude!.indexOf('--settings') + 1]!) as { permissions: { deny: string[] } }).permissions.deny
+    for (const rule of ['Read(//**/.env)', 'Read(//**/.env/**)', 'Read(~/.ssh)', 'Read(~/.ssh/**)', 'Read(//**/*.pem)', 'Read(~/.codex/**)', 'Bash', 'Edit', 'Write', 'WebFetch']) {
+      expect(deny).toContain(rule)
+    }
+    expect(list).toEqual(['codex', 'mcp', 'list', '--json'])
+    expect(codex).toContain('mcp_servers.node_repl.enabled=false')
+    expect(codex!.slice(0, 6)).toEqual(['codex', 'exec', '-s', 'read-only', '-m', 'glm-5.3-flash'])
+
+    // A helper that read .env, or a link to it, gives no evidence and no reads.
+    symlinkSync(join(project, '.env'), join(project, 'src', 'notes.txt'))
+    for (const path of ['.env', 'src/notes.txt']) {
+      reads = [{ name: 'Read', input: { file_path: path } }]
+      const leaky = fakeDsh(async (_text, _run, call) => { texts.push(await call({ name: 'ask_helper', arguments: { engine: 'claude', question: 'q' } })); return 'ok' })
+      const leakyJudge = await new JudgeSessions(leaky.ctx, new FactoryGuardModule(REAL_GUARD), { spawner: fake.spawner }).open(project, `leak-${path}`)
+      expect((await leakyJudge.consult('q', new AbortController().signal)).helperReads).toEqual([])
+      expect(texts.at(-1)).toMatch(/tried to read a file on the secret list/)
+    }
   })
 })

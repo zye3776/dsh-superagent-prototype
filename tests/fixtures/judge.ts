@@ -1,15 +1,19 @@
 /** A stand-in for the DSH services the factory's judge Sessions use: the Session controller, the workspace registry and the permission presets. */
 import { vi } from 'vitest'
+import type { HelperExit, HelperSpawner } from '../../src/factory/helpers.ts'
 import type { JudgeGuard, JudgeSessions, JudgeToolCall } from '../../src/factory/judge.ts'
 
 /** What DSH hands a guard for one tool call; the real one carries more. */
 export interface FakeExecution { name: string; arguments: unknown }
 type GuardFunction = (execution: FakeExecution) => string | undefined
+/** Makes one call of a tool registered on the agent's own scope, as DSH does: the agent's guards first, then the tool. Gives the refusal or the tool's text. */
+export type ToolCaller = (execution: FakeExecution) => Promise<string>
 /**
  * What a fake judge answers to one message. `run` makes a tool call as the judge would: it passes the call through the agent's guards, as DSH does before a
- * tool runs, and returns the refusal, or `undefined` when the call may run. A promise makes the judge slow.
+ * tool runs, and returns the refusal, or `undefined` when the call may run. `call` also runs a tool registered on the agent (`docs_lookup`, `ask_helper`)
+ * when its guards let it. A promise makes the judge slow.
  */
-export type FakeReply = (text: string, run: GuardFunction) => string | FakeAnswer | Promise<string | FakeAnswer>
+export type FakeReply = (text: string, run: GuardFunction, call: ToolCaller) => string | FakeAnswer | Promise<string | FakeAnswer>
 /**
  * An answer that also says what the judge Session records for it, so a fake judge can report token usage. `events` are appended before the answer's
  * `assistant/message`, as the steps and attempts before the last one. `usage` and `stream` are put on that message, and `step` is its step in the turn (1 if left out).
@@ -26,7 +30,7 @@ export interface FakeAgent {
   allowed: string[][]
   /** The texts sent to the agent, in order. */
   asked: string[]
-  /** Every tool registered on the agent's own scope, in order (the judge's `docs_lookup`). */
+  /** Every tool registered on the agent's own scope, in order (the judge's `docs_lookup` and `ask_helper`). */
   registered: FakeTool[]
   session: { id: string; snapshotEvents(): FakeEvent[] }
 }
@@ -49,6 +53,14 @@ export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`, options
       if (refusal !== undefined) return refusal
     }
     return undefined
+  }
+  /** Runs one registered tool of `agent` after its guards, as DSH does. */
+  const callTool = async (agent: FakeAgent, execution: FakeExecution): Promise<string> => {
+    const refusal = guarded(agent, execution)
+    if (refusal !== undefined) return refusal
+    const tool = agent.registered.find(item => item.name === execution.name)
+    if (tool === undefined) throw new Error(`no tool ${execution.name} is registered`)
+    return (await tool.execute(execution.arguments, {})).text
   }
   /** A new agent for Session `id`, as DSH makes one when it creates or resumes the Session. */
   const agentOf = (id: string): FakeAgent => {
@@ -74,7 +86,7 @@ export function fakeDsh(reply: FakeReply = text => `answer to: ${text}`, options
         events.push({ type: 'user/message', data: { message } })
         idle = idle.then(async () => {
           await new Promise(resolve => { setTimeout(resolve, 1) })
-          const replied = await reply(text, execution => guarded(agent, execution))
+          const replied = await reply(text, execution => guarded(agent, execution), execution => callTool(agent, execution))
           const answer: FakeAnswer = typeof replied === 'string' ? { text: replied } : replied
           events.push(...answer.events ?? [])
           events.push({ type: 'assistant/message', data: { turn, step: answer.step ?? 1, message: { content: [{ type: 'text', text: answer.text }] },
@@ -114,4 +126,46 @@ export function fakeGuard(secrets: readonly string[] = []) {
     return secrets.some(secret => named.includes(secret)) ? 'Refused: the file is on the secret list' : undefined
   } }
   return { guard, calls, source: { guard: vi.fn(async () => guard) } }
+}
+
+/** What a fake helper process does: ends with this exit code and output, never ends by itself (`hang`), or is not installed (`missing`). */
+export type FakeRun = { code: number; stdout: string } | 'hang' | 'missing'
+/** One process the fake spawner started, as it was asked: the command line, the folder and the standard input; `killed` once its group was killed. */
+export interface FakeStart { argv: string[]; cwd: string; input: string; killed: boolean }
+
+/**
+ * A stand-in for the helpers' process spawner. `answer` says what each started command does; every start is kept in `starts`. `kill` ends a process at once,
+ * as SIGKILL to its group does.
+ */
+export function fakeSpawner(answer: (argv: readonly string[], cwd: string) => FakeRun) {
+  const starts: FakeStart[] = []
+  const spawner: HelperSpawner = {
+    start(argv, options) {
+      const start: FakeStart = { argv: [...argv], cwd: options.cwd, input: options.input, killed: false }
+      starts.push(start)
+      const run = answer(argv, options.cwd)
+      let end: (exit: HelperExit) => void = () => {}
+      const done = new Promise<HelperExit>(resolveExit => { end = resolveExit })
+      if (run === 'missing') end({ code: null, stdout: '', overflow: false, failure: 'missing' })
+      else if (run !== 'hang') setTimeout(() => { end({ code: run.code, stdout: run.stdout, overflow: false }) }, 1)
+      return { done, kill: () => { start.killed = true; end({ code: null, stdout: '', overflow: false }) } }
+    },
+  }
+  return { spawner, starts }
+}
+
+/** What `claude -p --output-format json` prints for a helper that made these tool calls and gave this answer. */
+export function claudeOutput(answer: string, calls: { name: string; input: Record<string, unknown> }[] = []): string {
+  return JSON.stringify([
+    { type: 'system', subtype: 'init', tools: ['Glob', 'Grep', 'Read'], mcp_servers: [] },
+    ...calls.map(call => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-1', name: call.name, input: call.input }] } })),
+    { type: 'assistant', message: { content: [{ type: 'text', text: answer }] } },
+    { type: 'result', subtype: 'success', is_error: false, result: answer },
+  ])
+}
+
+/** What `codex exec --json` prints for a helper that gave this answer. */
+export function codexOutput(answer: string): string {
+  return [{ type: 'thread.started', thread_id: 't-1' }, { type: 'turn.started' }, { type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: answer } },
+    { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }].map(event => JSON.stringify(event)).join('\n') + '\n'
 }

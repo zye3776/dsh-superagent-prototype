@@ -239,9 +239,16 @@ export class FactoryRepoSave {
    * Saves what `prepare` asks for in `remote`'s repository. `prepare` is given the guideline as the remote's branch holds it right after the fetch,
    * so it can number a new version; it may throw a `RecordsRefusal`, which stops the save at the write step with its message.
    */
-  async save(remote: FactoryRemote, prepare: (read: GuidelineRead) => RepoChange): Promise<SaveOutcome> {
+  /** The start step's refusal, if a save could not start now; lets a caller refuse before it spends a model thread. */
+  refusal(): Extract<SaveOutcome, { saved: false }> | undefined {
     if (this.running) return FactoryRepoSave.failed('start', FactoryRepoSave.BUSY)
     if (this.glab === undefined) return FactoryRepoSave.failed('start', FactoryRepoSave.NO_GLAB)
+    return undefined
+  }
+
+  async save(remote: FactoryRemote, prepare: (read: GuidelineRead) => RepoChange): Promise<SaveOutcome> {
+    const refused = this.refusal()
+    if (refused !== undefined || this.glab === undefined) return refused ?? FactoryRepoSave.failed('start', FactoryRepoSave.NO_GLAB)
     this.running = true
     try { return await this.run(remote, prepare, this.glab) } finally { this.running = false }
   }
@@ -423,6 +430,9 @@ export class GuidelineSaver {
     // The report of the version being replaced is written before the save, from the remote's main as it is now; the save checks again after its fetch.
     let report: SaveFile | undefined
     if (base !== null && this.reports !== undefined) {
+      // A save that could not start (glab missing, another save running) stops here too, before the thread is asked.
+      const refused = this.repo.refusal()
+      if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
       // A fetch that fails stops here, before any thread is asked: the save's own fetch would fail the same way.
       const fetched = await remote.fetch()
       if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
@@ -464,6 +474,8 @@ export class GuidelineSaver {
       remote = await this.records.factoryRemote()
     } catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
     const now = this.now()
+    const refused = this.repo.refusal()
+    if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
     const fetched = await remote.fetch()
     if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
     const read = await remote.read()

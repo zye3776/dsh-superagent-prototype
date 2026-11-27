@@ -319,7 +319,7 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
     }
   }
   let author = new Author()
-  const reportingSaver = (of: RemoteGuidelineRecords = records()) => new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: GLAB, root: saves }), now: () => NOW,
+  const reportingSaver = (of: RemoteGuidelineRecords = records(), glab: string | null = GLAB) => new GuidelineSaver({ records: of, repo: new FactoryRepoSave({ glab: glab ?? undefined, root: saves }), now: () => NOW,
     reports: new TrendReports({ author, records: of, projects: [project] }) })
   /** The files the newest commit on the remote's main changed. */
   const lastCommitFiles = () => git(bare, 'show', '--name-only', '--format=', 'main').split('\n').filter(Boolean).sort()
@@ -432,6 +432,12 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
     git(factory, 'remote', 'set-url', 'origin', join(root, 'missing.git'))
     for (const saved of [await reportingSaver().accept(proposal('Two.\n'), 1), await reportingSaver().report(1)])
       expect((saved as { reason: string }).reason).toMatch(/^Not saved: the fetch step failed: /)
+    expect([author.asked, runner.glabCalls, readdirSync(saves)]).toEqual([[], [], []])
+  })
+
+  it('a save that cannot start (glab not found) stops the Accept and the button before any thread is asked', async () => {
+    for (const saved of [await reportingSaver(records(), null).accept(proposal('Two.\n'), 1), await reportingSaver(records(), null).report(1)])
+      expect(saved).toEqual({ saved: false, reason: `Not saved: ${FactoryRepoSave.NO_GLAB}`, mr: undefined })
     expect([author.asked, runner.glabCalls, readdirSync(saves)]).toEqual([[], [], []])
   })
 

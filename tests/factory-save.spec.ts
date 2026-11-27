@@ -373,7 +373,7 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
     author.fail = 'the report thread did not answer in time'
     const before = mainOf()
     expect(await reportingSaver().accept(proposal('Two.\n'), 1))
-      .toEqual({ saved: false, reason: 'Not saved: the trend report for v1 could not be written: the report thread did not answer in time', mr: undefined })
+      .toEqual({ saved: false, reason: 'Not saved: the trend report for v1 could not be written: the report thread did not answer in time. Nothing was saved; try Accept again later.', mr: undefined })
     expect([mainOf(), branchesOf(), runner.glabCalls, readdirSync(saves)]).toEqual([before, ['main'], [], []])
   })
 

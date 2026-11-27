@@ -440,7 +440,9 @@ export class GuidelineSaver {
       const before = read.current?.version ?? null
       if (before !== base) return not(GuidelineSaver.movedText(before))
       try { report = await this.reports.file(base, read, 'accepted', now) } catch (error) {
-        return not(`the trend report for v${base} could not be written: ${GuidelineSaver.reasonOf(error, mask)}`)
+        // Accept is blocked, not half done (owner, AD-18): the proposal stays, so the owner is told to try again.
+        const reason = GuidelineSaver.reasonOf(error, mask).replace(/\.$/, '')
+        return not(`the trend report for v${base} could not be written: ${reason}. Nothing was saved; try Accept again later.`)
       }
     }
     let version = 0

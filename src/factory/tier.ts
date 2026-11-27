@@ -27,7 +27,7 @@ interface TierModuleExports { GateTierSorter?: unknown }
  * The factory's tier sorter, loaded from its built file `lib/dist/gateTier.js`.
  * The file is imported on the first ask, not at start, so the plugin starts without it, and one sorter is built and kept.
  * Nothing here throws or refuses. No path, a path that is not absolute, a file that does not load, a file without `GateTierSorter`, a sorter that
- * cannot be built or that throws, and a result that is not `{ tier: 1 | 2 | 3, rule: text }` all give `null`: the ask is then judged without a gate
+ * cannot be built or that throws, and a result that is not `{ tier: 1 | 2 | 3, rule: text }` with a rule name that is not empty all give `null`: the ask is then judged without a gate
  * tier, as every ask was before this setting.
  * Only a missing file is tried again on the next ask. Node keeps a file once it has loaded it or once it threw while loading, so a tier file that
  * was fixed or rebuilt takes effect only after DSH restarts.
@@ -44,7 +44,7 @@ export class FactoryTierModule implements TierSource {
       const result = sorter.sort({ toolName: fields.tool_name, toolInput: fields.tool_input, cwd: fields.cwd, scratchpadDir: fields.scratchpad_dir })
       if (result === null || typeof result !== 'object') return null
       const { tier, rule } = result as { tier?: unknown; rule?: unknown }
-      if (!FactoryTierModule.TIERS.includes(tier) || typeof rule !== 'string') return null
+      if (!FactoryTierModule.TIERS.includes(tier) || typeof rule !== 'string' || rule === '') return null
       return { tier: tier as Tier, tier_rule: rule }
     } catch {
       // Any failure of the module or its sorter leaves the ask unsorted.

@@ -1013,17 +1013,45 @@ it('ignores a tier a worker writes into its ask', async () => {
   expect('tier_rule' in judge.seen[1]!).toBe(false)
 })
 
-it('refuses an ask whose cwd is not an absolute path in the project, before any judge is asked', async () => {
+it('refuses an ask whose cwd is not an absolute path, before any judge is asked, and takes one outside the project', async () => {
   const judge = await serveSorted()
-  const bad: unknown[] = ['src', '', join(root, 'elsewhere'), `${project}-other`, join(project, '..', 'elsewhere'), root, '/', 7, null, [project]]
+  const bad: unknown[] = ['src', '', './src', 7, null, true, [project]]
   for (const cwd of bad) {
     const asked = await ask({ cwd })
     expect([asked.status, asked.body], JSON.stringify(cwd)).toEqual([400, { error: 'The request has a malformed cwd' }])
   }
-  // The project itself, a folder inside it, and one written with `.` or `..` that stays inside are taken.
-  for (const cwd of [project, `${project}/`, join(project, 'src', 'deep'), `${project}/src/../docs`]) expect((await ask({ cwd })).status, cwd).toBe(200)
-  expect(judge.seen).toHaveLength(4)
-  expect(lines()).toHaveLength(4)
+  expect(judge.seen).toHaveLength(0)
+  expect(existsSync(file())).toBe(false)
+  // The project and a folder inside it are taken, and so is a folder outside it: a git worktree of the project is elsewhere.
+  const worktree = join(root, 'worktrees', 'story-29')
+  for (const cwd of [project, join(project, 'src', 'deep'), worktree]) {
+    const asked = await ask({ tool_input: { command: 'bun test', want: 3 }, cwd })
+    expect([asked.status, ...tierOf(asked)], cwd).toEqual([200, 3, 'gate'])
+    // The sorter is handed the ask's own working folder.
+    expect((JSON.parse(judge.seen.at(-1)!.tier_rule as string) as { cwd: string }).cwd, cwd).toBe(cwd)
+  }
+  expect(lines()).toHaveLength(3)
+})
+
+it('sorts asks with the configured tierModule when it runs as the plugin', async () => {
+  const registered: Route[] = []
+  const dsh = fakeDsh(judgeReply)
+  const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn() }, tools: { guard: vi.fn(() => () => {}) } }
+  const guardPath = join(root, 'fake-guard.mjs')
+  writeFileSync(guardPath, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
+  writeFileSync(tierPath(), FAKE_TIER)
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), maskModule: maskPath(), guardModule: guardPath, tierModule: tierPath() }))
+  const askRoute = registered.find(route => route.path === '/ask')!
+  const body = asking({ tool_input: { command: 'rm -rf src', want: 1 } })
+  const req = Object.assign(Readable.from([Buffer.from(JSON.stringify(body))]), { method: 'POST', socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3083', [AskKey.HEADER]: keyFor('s1') } })
+  const answer = { status: 0, text: '' }
+  const res = { writeHead: (status: number) => { answer.status = status }, end: (text: string) => { answer.text = text } }
+  await askRoute.handler(req as unknown as IncomingMessage, res as unknown as ServerResponse)
+  expect(answer.status).toBe(200)
+  // The judge graded the action low (tier 3); tier 1 can only come from the sorter the setting names.
+  expect((JSON.parse(answer.text) as { decision: Record<string, unknown> }).decision).toMatchObject({ tier: 1, tier_set_by: 'gate' })
 })
 
 it('refuses an ask whose scratchpad_dir is not an absolute path apart from the project, before any judge is asked', async () => {

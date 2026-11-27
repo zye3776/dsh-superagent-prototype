@@ -55,9 +55,9 @@ it('gives null, and never throws, when the module is not set, not absolute, miss
   for (const [name, path] of Object.entries(cases)) expect(await new FactoryTierModule(path).sort(fields()), name).toBeNull()
 })
 
-it('gives null for a result that is not a tier 1, 2 or 3 with a text rule', async () => {
+it('gives null for a result that is not a tier 1, 2 or 3 with a rule name that is not empty', async () => {
   const results = ['undefined', '"1"', '7', '[1, "r"]', '{}', '{ tier: 0, rule: "r" }', '{ tier: 4, rule: "r" }', '{ tier: "1", rule: "r" }', '{ tier: 1.5, rule: "r" }',
-    '{ tier: 1 }', '{ tier: 1, rule: 7 }', '{ tier: 1, rule: null }', '{ rule: "r" }', 'Promise.resolve({ tier: 1, rule: "r" })']
+    '{ tier: 1 }', '{ tier: 1, rule: 7 }', '{ tier: 1, rule: null }', '{ tier: 1, rule: "" }', '{ rule: "r" }', 'Promise.resolve({ tier: 1, rule: "r" })']
   for (const [index, result] of results.entries()) {
     const path = moduleWith(`shape-${index}.mjs`, `export class GateTierSorter { sort() { return ${result} } }\n`)
     expect(await new FactoryTierModule(path).sort(fields()), result).toBeNull()

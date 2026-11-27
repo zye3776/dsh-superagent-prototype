@@ -17,7 +17,7 @@
  * none back. Instead it sends its session's ask key (`AskKey` in `token.ts`), which only a holder of the token can make for that `session_id`: an ask
  * without the right key for the body's `session_id` is refused with 401 before any judge is asked, so no caller can put questions into another
  * session's judge thread. A worker cannot set its ask's tier either: the route sorts every ask itself, on the raw call, with the factory's own tier
- * sorter (`tier.ts`, the plugin's `tierModule` setting), the working folder the ask names (`cwd`, inside the project) and the session's temp folder
+ * sorter (`tier.ts`, the plugin's `tierModule` setting), the working folder the ask names (`cwd`, an absolute path) and the session's temp folder
  * (`scratchpad_dir`, outside the project), so the ask is judged and recorded at the tier the factory's gate would give the real call. A tier a
  * worker writes into its ask is not read. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
  * approve replaces it.
@@ -92,7 +92,8 @@ export interface AssessRequest {
 /**
  * What a worker posts to `/ask` before it acts: the call it is about to make (`session_id`, `tool_name` and `tool_input`, exactly as its tool call
  * will carry them), `description` (what the action is and why) and, when it has some, `context` (background the judge would not see otherwise).
- * `cwd` is the folder the action will run in: an absolute path that is the project or lies inside it; left out, the project counts as that folder.
+ * `cwd` is the folder the action will run in: an absolute path; left out, the project counts as that folder. It need not lie inside the project:
+ * a git worktree of the project is in another folder, and the factory counts it as the project.
  * `scratchpad_dir` is the worker session's own temp folder: an absolute path apart from the project (not it, not inside it, not around it); left out
  * or `null` when the session has none. The route reads both only to sort the ask into its checking tier.
  */
@@ -329,7 +330,7 @@ export class AssessRoute {
   /**
    * Checks a parsed `/ask` body and returns only its known fields. Refuses with 400 a body that is not an object, one without `project`, `session_id`,
    * `tool_name`, `tool_input` or `description`, and one whose `context` is present but not text. Refuses too a `cwd` that is present but not an
-   * absolute path equal to the project or inside it, and a `scratchpad_dir` that is present but neither `null` nor an absolute path apart from the
+   * absolute path (it may lie outside the project, as a git worktree of it does), and a `scratchpad_dir` that is present but neither `null` nor an absolute path apart from the
    * project: a temp folder that is the project, lies inside it or holds it would let a delete in the project pass as a write to the temp folder.
    * Any other field is dropped, a `tier` or `tier_rule` among them: a worker cannot set its own tier.
    */
@@ -343,7 +344,7 @@ export class AssessRoute {
     if (typeof description !== 'string' || description.trim() === '') throw new AssessRefusal(400, 'The request has no description')
     if ('context' in body && typeof context !== 'string') throw new AssessRefusal(400, 'The request has a malformed context')
     const { cwd, scratchpad_dir: scratchpad } = body as Record<string, unknown>
-    if ('cwd' in body && !(typeof cwd === 'string' && isAbsolute(cwd) && AssessRoute.holds(project, cwd))) throw new AssessRefusal(400, 'The request has a malformed cwd')
+    if ('cwd' in body && !(typeof cwd === 'string' && isAbsolute(cwd))) throw new AssessRefusal(400, 'The request has a malformed cwd')
     if ('scratchpad_dir' in body && scratchpad !== null
       && !(typeof scratchpad === 'string' && isAbsolute(scratchpad) && !AssessRoute.holds(project, scratchpad) && !AssessRoute.holds(scratchpad, project))) {
       throw new AssessRefusal(400, 'The request has a malformed scratchpad_dir')

@@ -259,7 +259,7 @@ export class ReviewPage {
     'html, body { height: 100%; margin: 0; }',
     `html { color: CanvasText; background: ${ReviewPage.BG}; }`,
     // The body's text colour is the token alone. Where the token is not defined the browser drops this line and the body takes `html`'s colour above.
-    `body { display: grid; grid-template-columns: auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dsw-alias-label-primary); background: ${ReviewPage.BG}; }`,
+    `body { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dsw-alias-label-primary); background: ${ReviewPage.BG}; }`,
     'p { margin: 0 0 8px; }',
     `a { color: ${ReviewPage.LINK}; }`,
     `:focus-visible { outline: 2px solid ${ReviewPage.BRAND}; outline-offset: -2px; }`,
@@ -270,18 +270,24 @@ export class ReviewPage {
     'body > .tabs { grid-column: 2; display: flex; gap: 4px; padding: 0 12px; }',
     `.tabs a { display: flex; align-items: center; padding: 0 12px; color: ${ReviewPage.INK2}; text-decoration: none; border-bottom: 2px solid transparent; }`,
     `.tabs a.on { color: ${ReviewPage.INK}; font-weight: 600; border-bottom-color: ${ReviewPage.BRAND}; }`,
-    'body > .crumb, body > .head { grid-column: 3; }',
+    'body > .crumb, body > .head { grid-column: 4; }',
     `.crumb { min-width: 0; padding: 0 16px; line-height: 43px; color: ${ReviewPage.INK2}; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; }`,
     `.crumb > span[title] { color: ${ReviewPage.INK}; font-weight: 600; }`,
     'body > .head { display: flex; align-items: center; gap: 16px; padding-right: 16px; }',
     '.head > .crumb { flex: 1; }',
-    '.talk { display: flex; flex: none; align-items: center; gap: 8px; }',
-    `.hint { font-size: 12px; color: ${ReviewPage.INK3}; }`,
+    '.talk { display: flex; flex: 0 1 auto; align-items: center; gap: 8px; min-width: 0; }',
+    '.talk button { flex: none; }',
+    `.hint { min-width: 0; font-size: 12px; color: ${ReviewPage.INK3}; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; }`,
+    // The left panel folded into the top bar; shown only in a narrow window (see the end of this style).
+    '.fold { display: none; grid-row: 1; grid-column: 3; position: relative; align-self: center; min-width: 0; }',
+    `.fold > summary { max-width: 30vw; padding: 6px 12px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; cursor: pointer; }`,
+    `.fold > .left { position: absolute; top: calc(100% + 4px); left: 0; z-index: 1; width: min(300px, 90vw); max-height: 70vh; overflow: auto; padding: 12px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; background: ${ReviewPage.BG}; }`,
     // Notices: a strip under the top bar, or a box inside a panel.
     `.notice { margin: 8px 0; padding: 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; font-size: 12px; }`,
     `body > .notice { grid-column: 1 / -1; margin: 0; padding: 8px 16px; border: 0; border-bottom: 1px solid ${ReviewPage.LINE}; border-radius: 0; background: ${ReviewPage.WELL}; }`,
-    'body > .notice { grid-row: 2; }',
-    'body > .head + .notice { grid-row: 3; }',
+    // The review talk's notice comes before the proposal's in the page's text, so it is drawn first too.
+    'body > .notice { grid-row: 3; }',
+    'body > .head + .notice { grid-row: 2; }',
     `.notice.refused { border-color: ${ReviewPage.NO}; }`,
     '.notice .small { font-size: 11px; }',
     'body > p { grid-row: 4; grid-column: 1 / -1; margin: 0; padding: 16px; }',
@@ -292,7 +298,7 @@ export class ReviewPage {
     `.cols > * { min-width: 0; min-height: 0; overflow: auto; padding: 12px; border-right: 1px solid ${ReviewPage.LINE}; overflow-wrap: anywhere; }`,
     '.cols > :last-child { border-right: 0; }',
     `h2, h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: ${ReviewPage.INK3}; }`,
-    '.cols h2:not(:first-child) { margin-top: 16px; }',
+    '.cols h2:not(:first-child), .fold h2:not(:first-child) { margin-top: 16px; }',
     `.pill { display: inline-block; padding: 0 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 999px; font-size: 11px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; color: ${ReviewPage.INK2}; }`,
     `.l2, .meta { margin-top: 1px; font-size: 12px; color: ${ReviewPage.INK2}; }`,
     `.who { font-weight: 400; color: ${ReviewPage.INK2}; }`,
@@ -363,6 +369,10 @@ export class ReviewPage {
     '.diff .line { display: block; min-height: 1.45em; border-radius: 3px; text-decoration: none; }',
     `.diff del.line { text-decoration: line-through; text-decoration-color: ${ReviewPage.NO}; background: color-mix(in oklab, ${ReviewPage.NO} 14%, transparent); }`,
     `.diff ins.line { background: color-mix(in oklab, ${ReviewPage.OK} 16%, transparent); }`,
+    // A narrow window: the left panel leaves the screen and its fold shows in the top bar, so the timeline and the step detail keep their room.
+    '@media (max-width: 1100px) { .fold { display: block; } .cols > .left { display: none; } .cols { grid-template-columns: minmax(0, 1fr); } .cols.with-detail { grid-template-columns: minmax(0, 1fr) clamp(240px, 30vw, 380px); } }',
+    // A very narrow window: the top bar takes two lines, the second for where the owner is and the review talk's button.
+    `@media (max-width: 700px) { body { grid-template-rows: auto auto auto auto minmax(0, 1fr); } body > .crumb, body > .head { grid-row: 2; grid-column: 1 / -1; border-bottom: 1px solid ${ReviewPage.LINE}; } body > .head + .notice { grid-row: 3; } body > .notice { grid-row: 4; } body > .cols, body > p { grid-row: 5; } .fold > summary { max-width: 45vw; } .hint { display: none; } }`,
   ].join('\n')
   /**
    * The page's one script: the comment field's saving, the review talk's button, and the question whether a proposal is waiting. Each part does nothing
@@ -618,12 +628,17 @@ ${view.step === undefined || view.detail === undefined ? `<h2>Step detail</h2>
 ${this.commentField(job, view.step, comments)}
 </aside>`
     }
-    const head = talk === '' ? `<div class="crumb">${crumb}</div>` : `<div class="head"><div class="crumb">${crumb}</div>${talk}`
-    return this.document(`${ReviewPage.tabs('jobs', view.waiting ?? [])}
+    const line = ReviewPage.crumbLine(crumb)
+    const head = talk === '' ? line : `<div class="head">${line}${talk}`
+    const left = ReviewPage.left(view)
+    const where = `${name}${view.outside ? ` · ${ReviewPage.OUTSIDE}` : job === undefined ? '' : ` · Job ${job.number}`}`
+    return this.document(`${ReviewPage.tabs('jobs')}
+${ReviewPage.fold(where, 'Projects and jobs', left)}
 ${head}
+${ReviewPage.proposalNotice(view.waiting ?? [])}
 <div class="cols${panel === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Projects and jobs">
-${ReviewPage.left(view)}
+${left}
 </nav>
 <main>
 ${middle}
@@ -687,11 +702,15 @@ ${panel}
       return `<a class="proposal${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.proposalAddress(each.project, each.job_id))}">\
 <span>Proposal · ${ReviewPage.escape(TalkTexts.nameOf(each.project))} job ${each.number}</span><span class="l2">${ReviewPage.escape(ReviewPage.when(each.ts))}</span></a>`
     })
-    return this.document(`${ReviewPage.tabs('guideline', waiting)}
-<div class="crumb">${crumb}</div>
+    const list = `${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}`
+    const where = open !== undefined ? `Proposal · ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}` : picked !== undefined ? `v${picked.version}` : ReviewPage.TAB_GUIDELINE
+    return this.document(`${ReviewPage.tabs('guideline')}
+${list === '' ? '' : ReviewPage.fold(where, 'Guideline versions', list)}
+${ReviewPage.crumbLine(crumb)}
+${ReviewPage.proposalNotice(waiting)}
 <div class="cols${right === '' ? '' : ' with-detail'}">
 <nav class="left" aria-label="Guideline versions">
-${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}
+${list}
 </nav>
 <main${open === undefined ? '' : ' class="proposal"'}>
 ${middle}
@@ -783,17 +802,36 @@ ${ReviewPage.escape(ReviewPage.writeTrend(picked.version))}</button></p>`
     return `${new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}, ${ReviewPage.clock(ts)}`
   }
 
-  /**
-   * The two tabs, the picked one marked, and under them the proposal notice: shown with a link to the newest waiting proposal when one waits, else
-   * there and hidden, so the page's script can show it when one comes.
-   */
-  private static tabs(on: 'jobs' | 'guideline', waiting: readonly GuidelineProposal[]): string {
+  /** The two tabs, the picked one marked. */
+  private static tabs(on: 'jobs' | 'guideline'): string {
     const tab = (which: 'jobs' | 'guideline', href: string, label: string) =>
       `<a class="tab${which === on ? ' on' : ''}" href="${ReviewPage.escape(href)}"${which === on ? ' aria-current="page"' : ''}>${label}</a>`
+    return `<nav class="tabs" aria-label="Tabs">${tab('jobs', ReviewRoute.PATH, ReviewPage.TAB_JOBS)}${tab('guideline', ReviewRoute.guidelineAddress(), ReviewPage.TAB_GUIDELINE)}</nav>`
+  }
+
+  /**
+   * The proposal notice, under the top bar: shown with a link to the newest waiting proposal when one waits, else there and hidden, so the page's
+   * script can show it when one comes. It comes after the top bar in the page's text as well, so the keyboard reaches it in the order it is drawn.
+   */
+  private static proposalNotice(waiting: readonly GuidelineProposal[]): string {
     const newest = waiting[0]
     const href = newest === undefined ? ReviewRoute.guidelineAddress() : ReviewRoute.proposalAddress(newest.project, newest.job_id)
-    return `<nav class="tabs" aria-label="Tabs">${tab('jobs', ReviewRoute.PATH, ReviewPage.TAB_JOBS)}${tab('guideline', ReviewRoute.guidelineAddress(), ReviewPage.TAB_GUIDELINE)}</nav>
-<div id="proposal-notice" class="notice" role="status"${newest === undefined ? ' hidden' : ''}><a id="proposal-link" href="${ReviewPage.escape(href)}">${ReviewPage.PROPOSAL_WAITING}</a></div>`
+    return `<div id="proposal-notice" class="notice" role="status"${newest === undefined ? ' hidden' : ''}><a id="proposal-link" href="${ReviewPage.escape(href)}">${ReviewPage.PROPOSAL_WAITING}</a></div>`
+  }
+
+  /**
+   * The line that says where the owner is. It is cut with "…" when the top bar is too narrow for it, so its whole text is also its tooltip.
+   * `crumb` is markup whose text is already escaped; without its tags it is safe inside the attribute.
+   */
+  private static crumbLine(crumb: string): string { return `<div class="crumb" title="${crumb.replace(/<[^>]*>/g, '')}">${crumb}</div>` }
+
+  /**
+   * The left panel folded into the top bar, for a window too narrow to show it beside the others (the style shows it under 1100px, and hides the
+   * panel there). It is a disclosure, not a form: `where` names what is open now, and a click on it shows `list`, the very links of the left panel,
+   * so picking one does what a click in the panel does. It needs no script.
+   */
+  private static fold(where: string, label: string, list: string): string {
+    return `<details class="fold"><summary>${where}</summary>\n<div class="left" role="navigation" aria-label="${label}">\n${list}\n</div></details>`
   }
 
   /** A version's date and the job whose review led to it, as far as its front matter says them. */

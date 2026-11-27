@@ -433,6 +433,42 @@ it('carries its whole look in the one style its policy allows: three panels on o
   expect(style).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
 })
 
+it('folds the left panel into the top bar in a narrow window: the same links behind one disclosure, with no form and no script', async () => {
+  await serve()
+  put('actions.jsonl', [action(), action({ job_id: 'job-2', step_id: 'step-2', ts: '2026-11-26T09:00:00.000Z' })])
+  const page = dom((await call('GET', ReviewRoute.address(project, 'job-1'), { cookie: await signIn() })).text)
+  const fold = page.querySelector('body > details.fold')!
+  // It names what is open now, and holds every link of the left panel, with the panel's own addresses, texts and marks.
+  const linksOf = (within: Element) => [...within.querySelectorAll('a')].map(link => [link.className, link.getAttribute('href'), link.getAttribute('aria-current'), link.textContent])
+  const panel = linksOf(page.querySelector('.cols > nav.left')!)
+  expect(fold.querySelector('summary')!.textContent).toBe('project · Job 1')
+  expect(linksOf(fold.querySelector('.left')!)).toEqual(panel)
+  expect(panel.filter(([name]) => name!.startsWith('job')).map(([name, href]) => [name, href]))
+    .toEqual([['job fresh', ReviewRoute.address(project, 'job-2')], ['job fresh on', ReviewRoute.address(project, 'job-1')]])
+  expect([fold.hasAttribute('open'), fold.querySelector('.left')!.getAttribute('aria-label'), page.querySelector('form, select, input')]).toEqual([false, 'Projects and jobs', null])
+  // In the page's text it sits where it is drawn: after the tabs and before the line that says where the owner is; the proposal notice comes after both.
+  expect([...page.body.children].filter(each => each.tagName !== 'SCRIPT').map(each => each.id !== '' ? `#${each.id}` : `${each.tagName.toLowerCase()}.${each.className}`))
+    .toEqual(['h1.', 'nav.tabs', 'details.fold', 'div.head', '#talk-notice', '#proposal-notice', 'div.cols with-detail'])
+  // The line that says where the owner is may be cut short in the bar, so its whole text is its tooltip.
+  expect(page.querySelector('.crumb')!.getAttribute('title')).toBe(page.querySelector('.crumb')!.textContent)
+  // The style shows the fold and hides the panel under 1100px only, and the panels left take the whole width.
+  const style = page.querySelector('style')!.textContent
+  expect(style).toContain('.fold { display: none;')
+  expect(style).toContain('@media (max-width: 1100px) { .fold { display: block; } .cols > .left { display: none; } .cols { grid-template-columns: minmax(0, 1fr); } .cols.with-detail { grid-template-columns: minmax(0, 1fr) clamp(240px, 30vw, 380px); } }')
+  // The Guideline tab folds its versions, and a waiting proposal, the same way.
+  const read: GuidelineRead = { folder: '/factory/guideline', versions: [2, 1].map(version => ({ version, date: null, from_job: null, from_version: null, text: 'Text.\n' })), current: null, reason: null }
+  read.current = read.versions[0]!
+  const open: GuidelineProposal = { project, job_id: 'job-1', number: 1, text: 'New.\n', ts: NOW }
+  const versions = dom(new ReviewPage('n').guideline(read, read.versions[1], [open]))
+  expect(versions.querySelector('details.fold summary')!.textContent).toBe('v1')
+  expect(linksOf(versions.querySelector('details.fold .left')!)).toEqual(linksOf(versions.querySelector('.cols > nav.left')!))
+  expect(linksOf(versions.querySelector('details.fold .left')!).map(([name, href]) => [name, href]))
+    .toEqual([['proposal', ReviewRoute.proposalAddress(project, 'job-1')], ['version', ReviewRoute.guidelineAddress(2)], ['version on', ReviewRoute.guidelineAddress(1)]])
+  expect(dom(new ReviewPage('n').guideline(read, undefined, [open], open)).querySelector('details.fold summary')!.textContent).toBe('Proposal · project job 1')
+  // A page with nothing in its left panel has no fold.
+  expect(dom(new ReviewPage('n').guideline({ folder: null, versions: [], current: null, reason: 'x' }, undefined)).querySelector('details')).toBeNull()
+})
+
 it('says there is no job yet when the project holds none, and skips lines it cannot read', async () => {
   await serve([project, join(root, 'missing')])
   const cookie = await signIn()

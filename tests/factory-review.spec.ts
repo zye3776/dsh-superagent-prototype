@@ -383,10 +383,10 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   // Every colour names a DSH token first. The colour after the token is the approved mockup's, shown while DSH's tokens do not reach this page
   // (owner, 2026-11-27: "Use the mockup's colours"). No colour stands without a token in front of it.
   const style = page.querySelector('style')!.textContent
-  for (const [, name] of style.matchAll(/var\((--[a-z0-9-]+)/g)) expect(name).toMatch(/^--dsw-alias-|^--ds-/)
+  for (const [, name] of style.matchAll(/var\((--[a-z0-9-]+)/g)) expect(name).toMatch(/^--dsw-alias-|^--ds-font-family-/)
   expect(style).toContain('var(--dsw-alias-label-primary, ')
-  const outsideTokens = style.replace(/var\(--(?:dsw-alias|ds)-[a-z0-9-]+, (?:[^()]|\([^()]*\))*\)/g, 'TOKEN')
-  expect(outsideTokens).not.toMatch(/#[0-9a-fA-F]{3,8}\b|rgb|hsl|light-dark|(?<![-\w])(?:red|green|blue|black|white|gr[ae]y)(?![-\w])/)
+  const outsideTokens = style.replace(/var\(--dsw-alias-[a-z0-9-]+, (?:[^()]|\([^()]*\))*\)/g, 'TOKEN')
+  expect(outsideTokens).not.toMatch(/#[0-9a-fA-F]{3,8}\b|rgb|hsl|hwb\(|lab\(|lch\(|color\(|light-dark|(?<![-\w])(?:red|green|blue|black|white|gr[ae]y)(?![-\w])/)
   expect(outsideTokens).not.toContain('var(--dsw-alias-')
 })
 

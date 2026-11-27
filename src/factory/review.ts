@@ -283,6 +283,8 @@ export class ReviewPage {
     '.fold { display: none; grid-row: 1; grid-column: 3; position: relative; align-self: center; min-width: 0; }',
     `.fold > summary { max-width: 30vw; padding: 6px 12px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap; cursor: pointer; }`,
     `.fold > .left { position: absolute; top: calc(100% + 4px); left: 0; z-index: 1; width: min(300px, 90vw); max-height: 70vh; overflow: auto; padding: 12px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; background: ${ReviewPage.BG}; }`,
+    // On a phone-width window the open fold spans the screen instead of running past its right edge.
+    '@media (max-width: 520px) { .fold > .left { position: fixed; top: 48px; left: 8px; right: 8px; width: auto; } }',
     // Notices: a strip under the top bar, or a box inside a panel.
     `.notice { margin: 8px 0; padding: 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 8px; font-size: 12px; }`,
     `body > .notice { grid-column: 1 / -1; margin: 0; padding: 8px 16px; border: 0; border-bottom: 1px solid ${ReviewPage.LINE}; border-radius: 0; background: ${ReviewPage.WELL}; }`,

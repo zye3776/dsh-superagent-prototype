@@ -53,7 +53,14 @@
     recordsModule: <absolute path of lib/dist/jobLog.js in the factory's folder, for example /home/me/projects/zees-software-factory/lib/dist/jobLog.js>
     # The orca program that opens a review talk. Optional: left out, DSH looks for orca on PATH, then at /opt/homebrew/bin/orca,
     # once when it starts; with none found, "Start review talk" is refused. When set, only this file is used.
+    # The repository Accept and "Write trend report" save into: an absolute path to a clone of a throwaway repository with its own
+    # remote. Optional: left out, the guideline is read from the factory repository and Accept and "Write trend report" are refused,
+    # so nothing is saved. When set, every save goes there, never into the factory repository, and the guideline every session starts
+    # with, the review page's versions and the trend report's input are read from its remote's main too, so sessions DSH starts see an
+    # accepted version. The factory repository's guideline does not get it until this points at the factory repository, at the move to
+    # main; until then a repository that is the factory, or shares a remote address with it, is refused.
     # review:
     #   orca: /opt/homebrew/bin/orca
+    #   saveRepo: /home/me/projects/guideline-throwaway
     projects:
       - <absolute path of a project, for example /home/me/projects/factory-testbed>

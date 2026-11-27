@@ -762,19 +762,27 @@ it('is wired into the plugin without DSH\'s connection service: the page refuses
   expect(proposed.answer.status).toBe(409)
 })
 
-it('is wired into the plugin for Accept and the guideline: sessions read the remote\'s main after the start fetch, and Accept merges the new version and the old one\'s trend report through the configured glab', async () => {
-  // A throwaway factory: a bare remote and a clone, the clone holding the records module so its guideline reader names the clone's folder.
+it('is wired into the plugin for Accept and the guideline: with review.saveRepo set, sessions read the save repository\'s main after the start fetch, and Accept merges the new version and the old one\'s trend report there through the configured glab, leaving the factory untouched', async () => {
   const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
   const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
-  const bare = join(root, 'remote.git'), factory = join(root, 'factory'), other = join(root, 'other')
-  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', bare)
-  git(root, 'clone', '--quiet', bare, factory)
-  // The plugin's git reads the owner's global config: the clone's own settings decide identity and signing here.
-  for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', '/dev/null']]) git(factory, 'config', name!, value!)
+  // A throwaway factory: a bare remote and a clone, the clone holding the records module so its guideline reader names the clone's folder.
+  const factoryBare = join(root, 'factory-remote.git'), factory = join(root, 'factory')
+  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', factoryBare)
+  git(root, 'clone', '--quiet', factoryBare, factory)
   mkdirSync(join(factory, 'guideline'))
-  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\n')
-  git(factory, 'add', '.'); git(factory, 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
-  // Another session merged v2 on the remote; the clone has not fetched it, and its checkout keeps v1.
+  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nFactory only.\n')
+  git(factory, 'add', '.'); git(factory, '-c', 'user.name=Factory', '-c', 'user.email=f@example.invalid', 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
+  const factoryMain = git(factoryBare, 'rev-parse', 'main')
+  // The save repository (review.saveRepo): another bare remote and its clone, `target`.
+  const bare = join(root, 'remote.git'), target = join(root, 'target'), other = join(root, 'other')
+  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', bare)
+  git(root, 'clone', '--quiet', bare, target)
+  // The plugin's git reads the owner's global config: the clone's own settings decide identity and signing here.
+  for (const [name, value] of [['user.name', 'Test Owner'], ['user.email', 'owner@example.invalid'], ['commit.gpgsign', 'false'], ['core.hooksPath', '/dev/null']]) git(target, 'config', name!, value!)
+  mkdirSync(join(target, 'guideline'))
+  writeFileSync(join(target, 'guideline', 'v1.md'), '# Guideline\nKeep it small.\n')
+  git(target, 'add', '.'); git(target, 'commit', '--quiet', '-m', 'v1'); git(target, 'push', '--quiet', 'origin', 'main')
+  // Another session merged v2 on the save repository's remote; the clone has not fetched it, and its checkout keeps v1.
   git(root, 'clone', '--quiet', bare, other)
   writeFileSync(join(other, 'guideline', 'v2.md'), '# Guideline\nKeep to the minimum feature.\n')
   git(other, 'add', '.'); git(other, '-c', 'user.name=Other', '-c', 'user.email=o@example.invalid', 'commit', '--quiet', '-m', 'v2'); git(other, 'push', '--quiet', 'origin', 'main')
@@ -800,9 +808,9 @@ it('is wired into the plugin for Accept and the guideline: sessions read the rem
   Object.assign(ctx, { on: (name: string, listener: (payload: { agent: unknown }) => Promise<unknown>) => { listeners[name] = listener; return () => {} } })
   const root0 = TalkFolder.ROOT
   Object.assign(TalkFolder, { ROOT: talkRoot() })
-  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
-  // The start fetch runs in the background: wait for the clone's copy of main to reach v2.
-  for (let tries = 0; git(factory, 'rev-parse', 'refs/remotes/origin/main') !== git(bare, 'rev-parse', 'main'); tries++) {
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab, saveRepo: target } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  // The start fetch runs in the background, in the save repository: wait for the clone's copy of main to reach v2.
+  for (let tries = 0; git(target, 'rev-parse', 'refs/remotes/origin/main') !== git(bare, 'rev-parse', 'main'); tries++) {
     if (tries > 200) throw new Error('the start fetch never landed')
     await new Promise(resolve => { setTimeout(resolve, 25) })
   }
@@ -836,8 +844,74 @@ it('is wired into the plugin for Accept and the guideline: sessions read the rem
   expect(report).toMatch(/^---\nversion: 2\ndate: \d{4}-\d{2}-\d{2}\njobs: 1\ncompared_with: 1\nwritten: accepted\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n\nFewer wide approvals under v2\.\n/)
   expect([threads.agents.size, [...threads.agents.values()][0]!.asked[0]]).toMatchObject([1, expect.stringContaining('## Jobs under v2 (1)')])
   expect(readFileSync(glabLog, 'utf8')).toContain('mr merge 9 --yes --auto-merge=false --sha')
-  expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
+  expect(readdirSync(join(target, 'guideline'))).toEqual(['v1.md'])
   expect(await sectionOf('main-2')).toContain('version 3')
+  // The factory repository: its remote's main, branches and guideline are as they were, and no session read its guideline.
+  expect([git(factoryBare, 'rev-parse', 'main'), git(factoryBare, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/')]).toEqual([factoryMain, 'main'])
+  expect(await sectionOf('main-3')).not.toContain('Factory only.')
+  expect([git(factory, 'worktree', 'list').split('\n').length, git(factory, 'rev-parse', 'refs/remotes/origin/main'), git(factory, 'status', '--porcelain')])
+    .toEqual([1, factoryMain, expect.not.stringContaining('guideline')])
+})
+
+it('is wired into the plugin with review.saveRepo unset: the guideline is read from the factory, and "Write trend report" and Accept refuse before any thread, git or glab', async () => {
+  const emptyConfig = join(root, 'gitconfig'); writeFileSync(emptyConfig, '')
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } }).trim()
+  const bare = join(root, 'remote.git'), factory = join(root, 'factory')
+  git(root, 'init', '--bare', '--quiet', '--initial-branch=main', bare)
+  git(root, 'clone', '--quiet', bare, factory)
+  mkdirSync(join(factory, 'guideline'))
+  writeFileSync(join(factory, 'guideline', 'v1.md'), '# Guideline\nFactory only.\n')
+  git(factory, 'add', '.'); git(factory, '-c', 'user.name=Factory', '-c', 'user.email=f@example.invalid', 'commit', '--quiet', '-m', 'v1'); git(factory, 'push', '--quiet', 'origin', 'main')
+  const before = git(bare, 'rev-parse', 'main')
+  const records = recordsModule(factory)
+  put('actions.jsonl', [action({ guideline_version: 'v1' })])
+  const guardModule = join(root, 'guard.mjs')
+  writeFileSync(guardModule, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
+  const threads = fakeDsh(() => 'never asked')
+  writeFileSync(join(factory, 'proposeServer.js'), '// stand-in for the built propose server\n')
+  put('reviews.jsonl', [review()])
+  const glab = join(root, 'fake-glab'), glabLog = join(root, 'fake-glab.log')
+  writeFileSync(glab, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${glabLog}'\nexit 1\n`)
+  const orca = join(root, 'fake-orca')
+  writeFileSync(orca, `#!/bin/sh\n[ "$2" = list ] && printf '%s' '{"result":{"repos":[]}}'\nexit 0\n`)
+  chmodSync(glab, 0o755); chmodSync(orca, 0o755)
+  const registered: Route[] = []
+  const { ctx } = pluginContext(registered, dsh)
+  Object.assign(ctx, threads.ctx)
+  const listeners: Record<string, (payload: { agent: unknown }) => Promise<unknown>> = {}
+  Object.assign(ctx, { on: (name: string, listener: (payload: { agent: unknown }) => Promise<unknown>) => { listeners[name] = listener; return () => {} } })
+  const root0 = TalkFolder.ROOT
+  Object.assign(TalkFolder, { ROOT: talkRoot() })
+  try { plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), recordsModule: records, guardModule, review: { orca, glab } })) } finally { Object.assign(TalkFolder, { ROOT: root0 }) }
+  // Sessions start with the factory's guideline, as before.
+  const session = new Context()
+  try {
+    await session.plugin(SystemPrompt)
+    await listeners['agent/created']!({ agent: { id: 'main-1', ctx: session } })
+    expect((await session.systemPrompt.assemble()).sections.find(section => section.name === plugin.GuidelineSection.NAME)?.text).toContain('Factory only.')
+  } finally { await session.fiber.dispose() }
+  const handler = (path: string) => registered.find(route => route.path === path)!.handler
+  const refused = { error: 'Not saved: no save repository is set (review.saveRepo)' }
+  const asked = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ version: 1 }))
+  await handler('/review/trends')(asked.req, asked.res)
+  expect([asked.answer.status, JSON.parse(asked.answer.text)]).toEqual([503, refused])
+  // Accept, after a talk and a proposal, refuses the same way, and the proposal stays waiting.
+  const talk = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1' }))
+  await handler('/review/talk')(talk.req, talk.res)
+  expect(talk.answer.status).toBe(200)
+  const proposed = direct('127.0.0.1', 'POST', { [SharedTokenFile.HEADER]: TOKEN, 'content-type': 'application/json' }, JSON.stringify({ job_id: 'job-1', text: '# Guideline\nTwo.\n' }))
+  await handler('/review/proposal')(proposed.req, proposed.res)
+  expect(proposed.answer.status).toBe(200)
+  const waiting = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await handler('/review/proposal')(waiting.req, waiting.res)
+  const { ts } = (JSON.parse(waiting.answer.text) as { waiting: { ts: string }[] }).waiting[0]!
+  const accepted = direct('127.0.0.1', 'POST', { origin: 'http://127.0.0.1:3083', cookie: DSH_COOKIE }, JSON.stringify({ project, job_id: 'job-1', ts, answer: 'accept', base: 1 }))
+  await handler('/review/answer')(accepted.req, accepted.res)
+  expect([accepted.answer.status, JSON.parse(accepted.answer.text)]).toEqual([503, refused])
+  const still = direct('127.0.0.1', 'GET', { cookie: DSH_COOKIE })
+  await handler('/review/proposal')(still.req, still.res)
+  expect((JSON.parse(still.answer.text) as { waiting: unknown[] }).waiting).toHaveLength(1)
+  expect([threads.agents.size, existsSync(glabLog), git(bare, 'rev-parse', 'main'), git(factory, 'worktree', 'list').split('\n').length]).toEqual([0, false, before, 1])
 })
 
 it('is wired into the plugin for the review talk: a start writes .mcp.json with the propose server beside the configured records module and the configured token file', async () => {

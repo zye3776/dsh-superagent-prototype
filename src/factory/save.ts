@@ -17,8 +17,13 @@
  *   8. remove the worktree.
  * When a step fails the save stops there and says which step failed; nothing done before is undone, so a merge request that was opened stays open.
  * The worktree is removed in every case. git and glab run only through the runner they are given; tests give one that reaches no real remote.
+ *
+ * Until Epic 3 moves to main, the repository saved to is not the factory's: it is the save repository the `review.saveRepo` setting names, a clone
+ * of a throwaway repository with its own remote (owner, 2026-11-27: "Throwaway repo for now"). Every step above runs there, and the version number
+ * and the "main moved on" check come from that repository's `main`. While the setting is set the guideline is read from there too, so an accepted
+ * version reaches the next session; the factory's own guideline is not read and not changed. Unset, nothing is saved.
  */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, accessSync, constants, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, posix, resolve } from 'node:path'
 import { FactoryRecordsModule, RecordsRefusal, type GuidelineRead, type GuidelineSource, type GuidelineVersion, type JobsSource, type RecordsMasker, type TrendReport } from './records.ts'
@@ -78,10 +83,13 @@ export class FactoryRemote {
   readonly remote: string
   readonly branch: string
   readonly runner: OrcaRunner
+  /** How messages name the repository: "the factory repository", or "the save repository" for the `review.saveRepo` one. */
+  readonly name: string
   private cached: { commit: string; read: GuidelineRead } | undefined
   private repository: true | undefined
-  constructor(options: { repo: string; runner: OrcaRunner; remote?: string; branch?: string }) {
+  constructor(options: { repo: string; runner: OrcaRunner; remote?: string; branch?: string; name?: string }) {
     this.repo = resolve(options.repo)
+    this.name = options.name ?? 'the factory repository'
     this.runner = options.runner
     this.remote = options.remote ?? 'origin'
     this.branch = options.branch ?? 'main'
@@ -130,7 +138,7 @@ export class FactoryRemote {
   async read(at?: string): Promise<GuidelineRead> {
     const folder = join(this.repo, GuidelineFile.FOLDER)
     const commit = at ?? await this.head()
-    if (commit === undefined) return { folder, versions: [], current: null, reason: `The guideline could not be read: the factory repository has no ${this.remote}/${this.branch} yet` }
+    if (commit === undefined) return { folder, versions: [], current: null, reason: `The guideline could not be read: ${this.name} has no ${this.remote}/${this.branch} yet` }
     if (this.cached?.commit === commit) return this.cached.read
     const listed = await this.git(['ls-tree', '-z', commit, '--', `${GuidelineFile.FOLDER}/`])
     if (!listed.ok) return { folder, versions: [], current: null, reason: `The guideline could not be read from ${this.remote}/${this.branch}` }
@@ -166,17 +174,59 @@ export class FactoryRemote {
  * The factory's own guideline reader is still asked first, only to find the repository (its `folder` is `<repository>/guideline`); with no repository
  * found, its answer and reason are kept. A factory folder that is not a git repository at all is no checkout of the factory repository and has no
  * remote: its own `guideline/` folder is read, as the factory's reader reads it (design default).
+ *
+ * The save repository (`saveRepo`, the `review.saveRepo` setting; owner, 2026-11-27: "Throwaway repo for now") is where Accept and "Write trend
+ * report" save. One setting decides both sides: while it is set, the guideline is also read from that repository's remote `main`, never from the
+ * factory, so the sessions, the review page, the trend report's input and the start-up fetch all see what was saved. While it is unset, the guideline
+ * is read from the factory as before and nothing can be saved.
  */
 export class RemoteGuidelineRecords extends FactoryRecordsModule {
+  static readonly NOT_A_REPOSITORY = 'the save repository (review.saveRepo) is not a git repository'
+  static readonly IS_FACTORY = 'the save repository (review.saveRepo) is the factory repository or shares a remote with it; until Epic 3 moves to main, saves go only to a throwaway repository'
   private readonly runner: OrcaRunner
   private readonly remoteName: string | undefined
   private readonly branch: string | undefined
   private readonly remotes = new Map<string, FactoryRemote>()
-  constructor(path: string | undefined, options: { runner: OrcaRunner; remote?: string; branch?: string }) {
+  private readonly target: FactoryRemote | undefined
+  constructor(path: string | undefined, options: { runner: OrcaRunner; remote?: string; branch?: string; saveRepo?: string | undefined }) {
     super(path)
     this.runner = options.runner
     this.remoteName = options.remote
     this.branch = options.branch
+    this.target = options.saveRepo === undefined ? undefined : this.remoteOf(options.saveRepo, 'the save repository')
+  }
+  /** The save repository's remote, or `undefined` while no save repository is set; then nothing is saved. */
+  saveRemote(): FactoryRemote | undefined { return this.target }
+  /**
+   * The save repository's remote for a save, checked: rejects with `RecordsRefusal(503)` while none is set, and while it is the factory repository
+   * or shares a remote address with it (a worktree of the factory, a clone with the factory as a remote), so no save reaches the factory until
+   * Epic 3 moves to main. This check goes when the setting is meant to point at the factory.
+   */
+  async saveTarget(): Promise<FactoryRemote> {
+    const target = this.target
+    if (target === undefined) throw new RecordsRefusal(503, GuidelineSaver.NO_SAVE_REPO)
+    const local = (await super.guidelineReader()).read()
+    // No factory repository found: there is nothing a save could reach.
+    if (local.folder === null) return target
+    const factory = await this.factoryRemote()
+    if (RemoteGuidelineRecords.realOf(target.repo) === RemoteGuidelineRecords.realOf(factory.repo)) throw new RecordsRefusal(503, RemoteGuidelineRecords.IS_FACTORY)
+    if (await factory.isRepository()) {
+      const ours = new Set(await RemoteGuidelineRecords.addressesOf(factory))
+      if ((await RemoteGuidelineRecords.addressesOf(target)).some(address => ours.has(address))) throw new RecordsRefusal(503, RemoteGuidelineRecords.IS_FACTORY)
+    }
+    return target
+  }
+  /** Every fetch and push address of a repository's remotes, as `git remote -v` gives them; none when git cannot say. */
+  private static async addressesOf(remote: FactoryRemote): Promise<string[]> {
+    const listed = await remote.git(['remote', '-v'])
+    if (!listed.ok) return []
+    return listed.stdout.split('\n').flatMap(line => { const found = /^\S+\t(.+) \((?:fetch|push)\)$/.exec(line.trim()); return found === null ? [] : [found[1]!.replace(/\/+$/, '')] })
+  }
+  private static realOf(path: string): string { try { return realpathSync(path) } catch { return resolve(path) } }
+  /** Where the guideline is read from: the save repository while one is set, else the factory repository. Rejects as `factoryRemote` does. */
+  async guidelineRemote(): Promise<FactoryRemote> { return this.target ?? await this.factoryRemote() }
+  private remoteOf(repo: string, name?: string): FactoryRemote {
+    return new FactoryRemote({ repo, runner: this.runner, ...(name === undefined ? {} : { name }), ...(this.remoteName === undefined ? {} : { remote: this.remoteName }), ...(this.branch === undefined ? {} : { branch: this.branch }) })
   }
   /** The factory repository's remote. Rejects with `RecordsRefusal(503)` when the repository was not found. */
   async factoryRemote(): Promise<FactoryRemote> {
@@ -185,12 +235,18 @@ export class RemoteGuidelineRecords extends FactoryRecordsModule {
     const repo = dirname(resolve(local.folder))
     let remote = this.remotes.get(repo)
     if (remote === undefined) {
-      remote = new FactoryRemote({ repo, runner: this.runner, ...(this.remoteName === undefined ? {} : { remote: this.remoteName }), ...(this.branch === undefined ? {} : { branch: this.branch }) })
+      remote = this.remoteOf(repo)
       this.remotes.set(repo, remote)
     }
     return remote
   }
   override async guidelineReader(): Promise<GuidelineSource> {
+    if (this.target !== undefined) {
+      const target = this.target
+      const read: GuidelineRead = await target.isRepository() ? await target.read()
+        : { folder: join(target.repo, GuidelineFile.FOLDER), versions: [], current: null, reason: `The guideline could not be read: ${RemoteGuidelineRecords.NOT_A_REPOSITORY}`, reports: [] }
+      return { read: () => read }
+    }
     const local = (await super.guidelineReader()).read()
     if (local.folder === null) return { read: () => local }
     const remote = await this.factoryRemote()
@@ -257,7 +313,7 @@ export class FactoryRepoSave {
     const fetched = await remote.fetch()
     if (!fetched.ok) return FactoryRepoSave.failed('fetch', fetched.error)
     const commitOf = await remote.head()
-    if (commitOf === undefined) return FactoryRepoSave.failed('read', `the factory repository has no ${remote.remote}/${remote.branch}`)
+    if (commitOf === undefined) return FactoryRepoSave.failed('read', `${remote.name} has no ${remote.remote}/${remote.branch}`)
     let change: RepoChange
     try { change = prepare(await remote.read(commitOf)) } catch (error) {
       return FactoryRepoSave.failed('write', error instanceof RecordsRefusal ? error.message : 'the files could not be made')
@@ -359,7 +415,7 @@ export class TrendReports {
    */
   async file(version: number, read: GuidelineRead, written: 'accepted' | 'asked', now: Date): Promise<SaveFile> {
     const of = read.versions.find(each => each.version === version)
-    if (of === undefined) throw new RecordsRefusal(503, `v${version} is not on the factory's main`)
+    if (of === undefined) throw new RecordsRefusal(503, `v${version} is not on the save repository's main`)
     // The version before it: the highest number below it.
     const before = read.versions.filter(each => each.version < version).sort((left, right) => right.version - left.version)[0] ?? null
     let jobs
@@ -382,11 +438,13 @@ export class TrendReports {
 export class GuidelineSaver {
   static readonly NOT_SAVED = 'Not saved: '
   static readonly NO_REPORTS = 'writing a trend report is not set up here'
-  private readonly records: Pick<RemoteGuidelineRecords, 'factoryRemote' | 'maskerFor'>
+  /** Until Epic 3 moves to main, saves go only to a throwaway repository the owner names; with none named, nothing is saved (AD-18). */
+  static readonly NO_SAVE_REPO = 'no save repository is set (review.saveRepo)'
+  private readonly records: Pick<RemoteGuidelineRecords, 'saveRemote' | 'saveTarget' | 'maskerFor'>
   private readonly repo: FactoryRepoSave
   private readonly now: () => Date
   private readonly reports: TrendReports | undefined
-  constructor(options: { records: Pick<RemoteGuidelineRecords, 'factoryRemote' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date; reports?: TrendReports }) {
+  constructor(options: { records: Pick<RemoteGuidelineRecords, 'saveRemote' | 'saveTarget' | 'maskerFor'>; repo: FactoryRepoSave; now?: () => Date; reports?: TrendReports }) {
     this.records = options.records
     this.repo = options.repo
     this.now = options.now ?? (() => new Date())
@@ -402,6 +460,8 @@ export class GuidelineSaver {
    * before it, that version's trend report is written first and saved in the same commit; when it cannot be written, nothing is saved. It never throws.
    */
   async accept(proposal: GuidelineProposal, base: number | null): Promise<GuidelineSaved> {
+    // First of all, so with no save repository nothing runs: no mask, no fetch, no worktree, no git, no glab, no thread.
+    if (this.records.saveRemote() === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_REPO)
     if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
     this.running = true
     try { return await this.save(proposal, base) } catch { return GuidelineSaver.not('the save failed') } finally { this.running = false }
@@ -412,6 +472,7 @@ export class GuidelineSaver {
    * fork merges, replacing a report written before. It never throws.
    */
   async report(version: number): Promise<GuidelineSaved> {
+    if (this.records.saveRemote() === undefined) return GuidelineSaver.not(GuidelineSaver.NO_SAVE_REPO)
     if (this.busy) return GuidelineSaver.not(FactoryRepoSave.BUSY)
     if (this.reports === undefined) return GuidelineSaver.not(GuidelineSaver.NO_REPORTS)
     this.running = true
@@ -422,17 +483,16 @@ export class GuidelineSaver {
     const not = GuidelineSaver.not
     let mask: (text: string) => string
     let remote: FactoryRemote
-    try {
-      mask = GuidelineSaver.maskOf(await this.records.maskerFor(proposal.project))
-      remote = await this.records.factoryRemote()
-    } catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
+    try { mask = GuidelineSaver.maskOf(await this.records.maskerFor(proposal.project)) }
+    catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
+    // A save that could not start (glab missing, another save running) stops here, before any git call and before the thread is asked.
+    const refused = this.repo.refusal()
+    if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
+    try { remote = await this.saveRemote() } catch (error) { return not(GuidelineSaver.reasonOf(error, mask)) }
     const now = this.now()
     // The report of the version being replaced is written before the save, from the remote's main as it is now; the save checks again after its fetch.
     let report: SaveFile | undefined
     if (base !== null && this.reports !== undefined) {
-      // A save that could not start (glab missing, another save running) stops here too, before the thread is asked.
-      const refused = this.repo.refusal()
-      if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
       // A fetch that fails stops here, before any thread is asked: the save's own fetch would fail the same way.
       const fetched = await remote.fetch()
       if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
@@ -471,13 +531,12 @@ export class GuidelineSaver {
     const not = GuidelineSaver.not
     let mask: (text: string) => string
     let remote: FactoryRemote
-    try {
-      mask = await reports.mask()
-      remote = await this.records.factoryRemote()
-    } catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
-    const now = this.now()
+    try { mask = await reports.mask() }
+    catch (error) { return not(error instanceof RecordsRefusal ? error.message : 'the factory\'s records module could not be had') }
     const refused = this.repo.refusal()
     if (refused !== undefined) return GuidelineSaver.failedOf(refused, mask)
+    try { remote = await this.saveRemote() } catch (error) { return not(GuidelineSaver.reasonOf(error, mask)) }
+    const now = this.now()
     const fetched = await remote.fetch()
     if (!fetched.ok) return GuidelineSaver.failedOf(FactoryRepoSave.failed('fetch', fetched.error), mask)
     const read = await remote.read()
@@ -504,6 +563,12 @@ export class GuidelineSaver {
     if (moved !== undefined) return not(GuidelineSaver.notCurrentText(version, moved))
     return GuidelineSaver.failedOf(outcome, mask)
   }
+
+  /**
+   * The save repository's remote, which every save step uses. Rejects with `RecordsRefusal(503)` when it is unset or is the factory's. A folder
+   * that is not a git repository fails at the fetch step, as git says (git never looks above it).
+   */
+  private saveRemote(): Promise<FactoryRemote> { return this.records.saveTarget() }
 
   private static not(why: string, mr?: string): GuidelineSaved { return { saved: false, reason: `${GuidelineSaver.NOT_SAVED}${why}`, mr } }
   private static movedText(now: number | null): string {

@@ -6,8 +6,10 @@
  * service lets the owner's browser in with DSH's own sign-in, and while DSH has no connection service the page refuses every browser request.
  * Every model thread it runs, the main session and each judge thread, starts with the owner's current decision guideline in its system prompt, and
  * `job_start` names the version (`guideline.ts`). The guideline is read from the factory repository's remote `main`, never from a checkout, and the
- * page's Accept saves a new version there through a merge request the fork merges at once (`save.ts`), with the trend report of the version it
- * replaces in the same commit; the page's "Write trend report" saves the current version's report the same way (`trends.ts`).
+ * page's Accept saves a new version through a merge request the fork merges at once (`save.ts`), with the trend report of the version it
+ * replaces in the same commit; the page's "Write trend report" saves the current version's report the same way (`trends.ts`). Until Epic 3 moves to
+ * main, saves go only to the throwaway repository `review.saveRepo` names, and while it is set the guideline is read from there instead of the
+ * factory repository; unset, nothing is saved.
  * It runs on its own, without the main plugin.
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -52,7 +54,9 @@ export const Config = s.object({
       .description('The orca program that opens a review talk in Orca. Absolute path, optional; when set, only this file is used. Without it DSH looks for orca on PATH, then at /opt/homebrew/bin/orca, once when it starts. With none found, "Start review talk" is refused.'),
     glab: s.string().pattern(/^\//)
       .description('The glab program that opens and merges the merge request of an accepted guideline version. Absolute path, optional; when set, only this file is used. Without it DSH looks for glab on PATH, then at /opt/homebrew/bin/glab, once when it starts. With none found, Accept is refused and nothing is saved.'),
-  }).default({}).description('The review page\'s review talk and its Accept.'),
+    saveRepo: s.string().pattern(/^\//)
+      .description('The repository that Accept and "Write trend report" save into: a git repository folder, a clone of a throwaway repository with its own remote. Absolute path, optional. Every save goes there, never into the factory repository, and while it is set the decision guideline is read from its remote\'s main too: every session\'s starting guideline, the review page\'s versions and the trend report\'s input. Sessions DSH starts while it is set read that repository\'s guideline, so they see an accepted version; the factory repository\'s guideline, which the super agent reads without this setting, does not get it until this setting points at the factory repository, at the move to main. Until then a save repository that is the factory repository, or shares a remote address with it, is refused. Without it, the guideline is read from the factory repository and Accept and "Write trend report" are refused; nothing is saved.'),
+  }).default({}).description('The review page\'s review talk, its Accept and where Accept saves.'),
 })
 export type FactoryConfig = ReturnType<typeof Config>
 export function apply(ctx: Context, config: FactoryConfig): void {
@@ -64,12 +68,13 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   if (folder === undefined) warn('No job_start line was written: the folder DSH was started in is gone')
   // The guideline comes from the factory repository's remote main, so a version merged there reaches the next session (AD-18).
   const runner = new ExecFileRunner()
-  const records = new RemoteGuidelineRecords(config.recordsModule, { runner })
+  // With `review.saveRepo` set, the guideline is read from that repository, where Accept saves, so a saved version reaches the next session.
+  const records = new RemoteGuidelineRecords(config.recordsModule, { runner, saveRepo: config.review?.saveRepo })
   // Once, in the background: the first sessions read the last fetched main until it lands. A failure only means an older copy is read.
-  void records.factoryRemote().then(async remote => {
+  void records.guidelineRemote().then(async remote => {
     if (!await remote.isRepository()) return
     const fetched = await remote.fetch()
-    if (!fetched.ok) warn('The factory repository\'s main could not be fetched; the guideline is read from the last fetched copy')
+    if (!fetched.ok) warn(`The main of ${remote.name} could not be fetched; the guideline is read from the last fetched copy`)
   }, () => { /* no factory repository: the guideline section says so */ })
   // Before any session exists, so every agent DSH creates gets the guideline, judges included.
   const guideline = new GuidelineSection(records, warn)

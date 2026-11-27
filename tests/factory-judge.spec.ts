@@ -413,7 +413,7 @@ describe('helpers and documentation lookups', () => {
     expect(brief).toContain('engine "claude" reads the project with Read, Grep and Glob')
     // The owner's rule: a claim resting on more than 3 unread files is checked with helpers, never at tier 3.
     expect(brief).toContain('rests on more than 3 project files you have not read, you must check those files with ask_helper (engine "claude") instead of reading them yourself')
-    expect(brief).toContain('This does not apply at tier 3, where helpers are refused.')
+    expect(brief).toContain('This holds whatever risk you grade; it is waived only when the gate itself sorted the request into tier 3, where helpers are refused.')
     expect(brief).toContain('engine "codex" reads no file: it answers only from the text you give it.')
     expect(brief).toContain('docs_lookup looks up a tool\'s or library\'s public documentation, only within the first 10 seconds of a request. Send only its name and one general question')
     expect(brief).not.toMatch(/subagent|wait_agent/)

@@ -189,6 +189,8 @@ export class ReviewPage {
   static readonly COMMENT_SAVED = 'review-comment-saved'
   static readonly PROPOSAL_WAITING = 'A guideline change is waiting for your answer'
   static readonly NOTHING_SAVED = 'Nothing is saved until you accept.'
+  /** The pill on a proposal that waits for the owner's answer, in the Guideline tab's list. */
+  static readonly WAITING = 'waiting'
   static readonly REJECT = 'Reject'
   static readonly SAVING_VERSION = 'Saving: a merge request into the factory\'s save branch is opened and merged…'
   static readonly NOT_ANSWERED = 'Not answered: the review page did not answer'
@@ -223,28 +225,28 @@ export class ReviewPage {
     message_in: 'Message received', message_out: 'Message sent', session_start: 'Session started', session_steer: 'Session steered',
   }
   /**
-   * A DSH colour token, followed by what the browser shows where the token is not defined. This page is a document of its own: DSH's client, whose
-   * script carries the tokens' values, does not run in it, so today the second value is the one seen. It is always a colour of the browser's own
-   * (`Canvas`, `CanvasText`, `LinkText`) or a mix of two of them, never a colour this page picks, and it follows light and dark by itself.
+   * A DSH colour token, followed by the colour shown where the token is not defined. This page is a document of its own: DSH's client, whose script
+   * carries the tokens' values, does not run in it, so today the second colour is the one seen. It is the approved mockups' colour, `light` in a
+   * light theme and `dark` in a dark one (the browser picks by the system's setting: `light-dark()` under `color-scheme: light dark`).
+   * No colour is written without a token in front of it.
    */
-  private static token(name: string, fallback: string): string { return `var(--dsw-alias-${name}, ${fallback})` }
-  /** The browser's text colour thinned into its page colour: `percent` of text, the rest page. */
-  private static thin(percent: number): string { return `color-mix(in oklab, CanvasText ${percent}%, Canvas)` }
-  private static readonly INK = ReviewPage.token('label-primary', 'CanvasText')
-  private static readonly INK2 = ReviewPage.token('label-secondary', ReviewPage.thin(68))
-  private static readonly INK3 = ReviewPage.token('label-tertiary', ReviewPage.thin(54))
-  private static readonly LINE = ReviewPage.token('border-l3', ReviewPage.thin(12))
-  private static readonly LINE2 = ReviewPage.token('border-l2', ReviewPage.thin(24))
-  private static readonly BG = ReviewPage.token('bg-layer-1', 'Canvas')
-  private static readonly BG2 = ReviewPage.token('bg-layer-2', ReviewPage.thin(4))
-  private static readonly WELL = ReviewPage.token('bg-module-platform', ReviewPage.thin(6))
-  private static readonly HOVER = ReviewPage.token('interactive-bg-hover', ReviewPage.thin(8))
-  private static readonly BRAND = ReviewPage.token('brand-primary', 'CanvasText')
-  private static readonly ON_BRAND = ReviewPage.token('label-primary-foreground', 'Canvas')
-  private static readonly OK = ReviewPage.token('state-success-primary', 'CanvasText')
-  private static readonly NO = ReviewPage.token('state-error-primary', 'CanvasText')
-  private static readonly WARN = ReviewPage.token('state-warn-primary', 'CanvasText')
-  private static readonly LINK = ReviewPage.token('link', 'LinkText')
+  private static token(name: string, light: string, dark: string): string { return `var(--dsw-alias-${name}, light-dark(${light}, ${dark}))` }
+  private static readonly INK = ReviewPage.token('label-primary', '#1b1c1f', '#eceef2')
+  private static readonly INK2 = ReviewPage.token('label-secondary', '#55585f', '#b3b7bf')
+  private static readonly INK3 = ReviewPage.token('label-tertiary', '#7c8088', '#8b9099')
+  private static readonly LINE = ReviewPage.token('border-l3', '#e3e5e9', '#2e3138')
+  private static readonly LINE2 = ReviewPage.token('border-l2', '#cfd2d8', '#3d414a')
+  private static readonly BG = ReviewPage.token('bg-layer-1', '#ffffff', '#17181c')
+  private static readonly BG2 = ReviewPage.token('bg-layer-2', '#f6f7f9', '#1e2025')
+  private static readonly WELL = ReviewPage.token('bg-module-platform', '#f1f2f5', '#24262c')
+  private static readonly HOVER = ReviewPage.token('interactive-bg-hover', '#eceef2', '#2a2d34')
+  private static readonly BRAND = ReviewPage.token('brand-primary', '#3b5bdb', '#7c93f5')
+  private static readonly ON_BRAND = ReviewPage.token('label-primary-foreground', '#ffffff', '#101114')
+  private static readonly OK = ReviewPage.token('state-success-primary', '#2b8a3e', '#69db7c')
+  private static readonly NO = ReviewPage.token('state-error-primary', '#c92a2a', '#ff8787')
+  private static readonly WARN = ReviewPage.token('state-warn-primary', '#b7791f', '#ffd43b')
+  /** The mockups name no link colour, so a link falls back to the brand colour. */
+  private static readonly LINK = ReviewPage.token('link', '#3b5bdb', '#7c93f5')
   private static readonly MONO = 'var(--ds-font-family-code, ui-monospace, Menlo, monospace)'
   /**
    * The page's look: one screen with no page scroll. A 44px top bar (title, tabs, where the owner is, the review talk's button), the notices under it,
@@ -257,9 +259,8 @@ export class ReviewPage {
     '* { box-sizing: border-box; }',
     '[hidden] { display: none !important; }',
     'html, body { height: 100%; margin: 0; }',
-    `html { color: CanvasText; background: ${ReviewPage.BG}; }`,
-    // The body's text colour is the token alone. Where the token is not defined the browser drops this line and the body takes `html`'s colour above.
-    `body { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dsw-alias-label-primary); background: ${ReviewPage.BG}; }`,
+    `html { background: ${ReviewPage.BG}; }`,
+    `body { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: ${ReviewPage.INK}; background: ${ReviewPage.BG}; }`,
     'p { margin: 0 0 8px; }',
     `a { color: ${ReviewPage.LINK}; }`,
     `:focus-visible { outline: 2px solid ${ReviewPage.BRAND}; outline-offset: -2px; }`,
@@ -299,13 +300,18 @@ export class ReviewPage {
     '.cols > :last-child { border-right: 0; }',
     `h2, h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: ${ReviewPage.INK3}; }`,
     '.cols h2:not(:first-child), .fold h2:not(:first-child) { margin-top: 16px; }',
-    `.pill { display: inline-block; padding: 0 8px; border: 1px solid ${ReviewPage.LINE2}; border-radius: 999px; font-size: 11px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; color: ${ReviewPage.INK2}; }`,
+    `.pill { display: inline-block; flex: none; padding: 0 8px; text-wrap: nowrap; border: 1px solid ${ReviewPage.LINE2}; border-radius: 999px; font-size: 11px; font-weight: 400; line-height: 1.45; letter-spacing: 0; text-transform: none; color: ${ReviewPage.INK2}; }`,
     `.l2, .meta { margin-top: 1px; font-size: 12px; color: ${ReviewPage.INK2}; }`,
     `.who { font-weight: 400; color: ${ReviewPage.INK2}; }`,
     `code { padding: 0 4px; border-radius: 4px; font-family: ${ReviewPage.MONO}; font-size: 12px; background: ${ReviewPage.WELL}; overflow-wrap: anywhere; }`,
     `time { font-family: ${ReviewPage.MONO}; font-size: 11px; color: ${ReviewPage.INK3}; }`,
     'pre { margin: 0; font: inherit; text-wrap-mode: wrap; overflow-wrap: anywhere; }',
-    'pre.guideline-text { max-width: 68ch; }',
+    // A guideline's text as headed prose: its `#` lines as headings, everything else as written.
+    '.guideline-text { max-width: 68ch; }',
+    `.guideline-text h3 { margin: 14px 0 4px; font-size: 13px; letter-spacing: 0; text-transform: none; color: ${ReviewPage.INK}; }`,
+    '.guideline-text h3:first-child { margin-top: 0; }',
+    '.guideline-text p { margin: 0 0 10px; white-space: pre-wrap; }',
+    `.pill.wait { border-color: ${ReviewPage.WARN}; color: ${ReviewPage.WARN}; }`,
     // Left panel: one row per project, job, version or proposal.
     '.left a { display: block; margin-bottom: 4px; padding: 8px; border: 1px solid transparent; border-radius: 8px; color: inherit; text-decoration: none; }',
     `.left a:hover { background: ${ReviewPage.HOVER}; }`,
@@ -318,7 +324,7 @@ export class ReviewPage {
     // The dot before the number of a job with no comment yet.
     '.left a.job.fresh > span:first-child { padding-left: 13px; }',
     `.left a.job.fresh > span:first-child::before { content: ""; position: absolute; left: 0; top: 50%; width: 7px; height: 7px; margin-top: -4px; border-radius: 50%; background: ${ReviewPage.BRAND}; }`,
-    `.left a.proposal { border-left: 3px solid ${ReviewPage.WARN}; }`,
+    '.left a.proposal > span:first-child { display: flex; align-items: center; justify-content: space-between; gap: 8px; }',
     // Middle panel: the timeline as rows, the time in a column of its own.
     'ol, ul.comments { list-style: none; margin: 0; padding: 0; }',
     'li { position: relative; margin-bottom: 2px; border: 1px solid transparent; border-radius: 8px; }',
@@ -354,7 +360,7 @@ export class ReviewPage {
     `button.primary { border-color: ${ReviewPage.BRAND}; font-weight: 600; color: ${ReviewPage.ON_BRAND}; background: ${ReviewPage.BRAND}; }`,
     'button:disabled { opacity: .45; cursor: not-allowed; }',
     '.answer { display: flex; align-items: center; gap: 8px; margin: 0; }',
-    `.answer span { color: ${ReviewPage.INK2}; }`,
+    `.answer span { flex: 1; color: ${ReviewPage.INK2}; }`,
     // A proposal before → after: the middle and right panels as one area, its two halves equal and each scrolling.
     'main.proposal { display: flex; flex-direction: column; padding: 0; overflow: hidden; }',
     'main.proposal > * { flex: none; }',
@@ -367,6 +373,7 @@ export class ReviewPage {
     `.halves section { min-height: 0; overflow: auto; padding: 12px; border-right: 1px solid ${ReviewPage.LINE}; }`,
     '.halves section:last-child { border-right: 0; }',
     '.diff .line { display: block; min-height: 1.45em; border-radius: 3px; text-decoration: none; }',
+    '.diff .line.h { font-weight: 600; }',
     `.diff del.line { text-decoration: line-through; text-decoration-color: ${ReviewPage.NO}; background: color-mix(in oklab, ${ReviewPage.NO} 14%, transparent); }`,
     `.diff ins.line { background: color-mix(in oklab, ${ReviewPage.OK} 16%, transparent); }`,
     // A narrow window: the left panel leaves the screen and its fold shows in the top bar, so the timeline and the step detail keep their room.
@@ -661,6 +668,41 @@ ${panel}
     return `${button}\n<div id="talk-notice" class="notice" role="status"><span>${ReviewPage.escape(ReviewPage.talkStarted(talk))}</span> <a href="#" id="fresh-talk" class="small">${ReviewPage.FRESH_TALK}</a></div>`
   }
 
+  /** A line of a guideline that is a heading as it is written: one to six `#`, a space, then the title. */
+  private static readonly HEADING_LINE = /^#{1,6} +(.*\S)\s*$/
+
+  /**
+   * A guideline's text as headed prose: each heading line becomes a heading with its `#` marks taken off, and everything between two headings is one
+   * block shown as written, its line breaks and blank lines kept. All of it is text made safe first: nothing in a guideline is read as markup.
+   */
+  private static prose(text: string): string {
+    const parts: string[] = []
+    let block: string[] = []
+    const close = () => {
+      const kept = block.join('\n').replace(/^\n+|\n+$/g, '')
+      if (kept !== '') parts.push(`<p>${ReviewPage.escape(kept)}</p>`)
+      block = []
+    }
+    for (const line of text.split('\n')) {
+      const title = ReviewPage.HEADING_LINE.exec(line)?.[1]
+      if (title === undefined) { block.push(line); continue }
+      close()
+      parts.push(`<h3>${ReviewPage.escape(title)}</h3>`)
+    }
+    close()
+    return `<div class="guideline-text">${parts.join('')}</div>`
+  }
+
+  /**
+   * What a timeline row is headed by. A permission answer is headed by the answer itself, "Approved" or "Denied", in its colour: the job log's line
+   * ends with the decision (`FactoryJob` writes "Permission request <id>: approve"). Any other line, or one whose decision cannot be read, is headed by its kind.
+   */
+  private static rowHeading(line: JobLogLine): string {
+    const decision = line.kind === 'permission_answer' ? /: (approve|deny|ask_owner)$/.exec(line.summary)?.[1] as keyof typeof ReviewPage.DECISIONS | undefined : undefined
+    if (decision === undefined) return `<strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>`
+    return `<strong${decision === 'approve' ? ' class="ok"' : decision === 'deny' ? ' class="no"' : ''}>${ReviewPage.DECISIONS[decision]}</strong>`
+  }
+
   /** The review talk notice for a talk that was started before: its date, and its name to find its tab by in Orca. */
   static talkStarted(talk: TalkState): string {
     const day = new Date(talk.started).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
@@ -690,17 +732,17 @@ ${panel}
     } else if (picked === undefined) {
       middle = `<p>${ReviewPage.escape(ReviewPage.NO_GUIDELINE)}</p>`
     } else {
-      crumb += ` › v${picked.version}`
+      crumb += ` › v${picked.version}${read.current === null ? '' : ` · current: <span class="pill">v${read.current.version}</span>`}`
       left = read.versions.map(each => ReviewPage.versionRow(each, read, picked)).join('\n')
       middle = `<h2>Guideline v${picked.version}${picked.version === read.current?.version ? ' · current' : ''}</h2>
 <p class="meta">${ReviewPage.escape(ReviewPage.sourceOf(picked))}</p>
-<pre class="guideline-text">${ReviewPage.escape(picked.text)}</pre>`
+${ReviewPage.prose(picked.text)}`
       right = ReviewPage.reportPanel(read, picked)
     }
     const proposals = waiting.map(each => {
       const on = open !== undefined && each.project === open.project && each.job_id === open.job_id
       return `<a class="proposal${on ? ' on' : ''}"${on ? ' aria-current="page"' : ''} href="${ReviewPage.escape(ReviewRoute.proposalAddress(each.project, each.job_id))}">\
-<span>Proposal · ${ReviewPage.escape(TalkTexts.nameOf(each.project))} job ${each.number}</span><span class="l2">${ReviewPage.escape(ReviewPage.when(each.ts))}</span></a>`
+<span>Proposal · ${ReviewPage.escape(TalkTexts.nameOf(each.project))} job ${each.number} <span class="pill wait">${ReviewPage.WAITING}</span></span><span class="l2">${ReviewPage.escape(ReviewPage.when(each.ts))}</span></a>`
     })
     const list = `${proposals.length === 0 ? '' : `${proposals.join('\n')}\n`}${left}`
     const where = open !== undefined ? `Proposal · ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}` : picked !== undefined ? `v${picked.version}` : ReviewPage.TAB_GUIDELINE
@@ -777,7 +819,7 @@ ${ReviewPage.escape(ReviewPage.writeTrend(picked.version))}</button></p>`
     const { before, after } = new TextDiff(current?.text ?? '', open.text).sides()
     const lines = (side: readonly DiffLine[]) => side.map(line => {
       const tag = line.mark === 'removed' ? 'del' : line.mark === 'added' ? 'ins' : 'span'
-      return `<${tag} class="line">${ReviewPage.escape(line.text)}</${tag}>`
+      return `<${tag} class="line${ReviewPage.HEADING_LINE.test(line.text) ? ' h' : ''}">${ReviewPage.escape(line.text)}</${tag}>`
     }).join('')
     const next = (current?.version ?? 0) + 1
     // With a version before it, Accept first has that version's trend report written, which can take minutes: the saving notice says so.
@@ -786,8 +828,8 @@ ${ReviewPage.escape(ReviewPage.writeTrend(picked.version))}</button></p>`
     return `<h2>Proposed change · from the review talk on ${ReviewPage.escape(TalkTexts.nameOf(open.project))} job ${open.number}</h2>
 <p class="meta">Proposed ${ReviewPage.escape(ReviewPage.when(open.ts))}</p>
 <div id="answer-notice" class="notice" role="status" hidden></div>
-<p class="answer"><button type="button" id="accept-proposal" class="primary" ${data}>${ReviewPage.accept(next)}</button> \
-<button type="button" id="reject-proposal" class="plain">${ReviewPage.REJECT}</button> <span>${ReviewPage.NOTHING_SAVED}</span></p>
+<p class="answer"><span>${ReviewPage.NOTHING_SAVED}</span> <button type="button" id="accept-proposal" class="primary" ${data}>${ReviewPage.accept(next)}</button> \
+<button type="button" id="reject-proposal" class="plain">${ReviewPage.REJECT}</button></p>
 <div class="halves">
 <section aria-label="Current version"><h3>${current === null ? ReviewPage.escape(ReviewPage.NO_GUIDELINE) : `Guideline v${current.version} · current`}</h3><pre class="diff">${lines(before)}</pre></section>
 <section aria-label="Proposed version"><h3>Proposed v${next}</h3><pre class="diff">${lines(after)}</pre></section>
@@ -930,7 +972,7 @@ ${jobs.join('\n')}`
     const cost = [line.tokens === undefined ? '' : `${line.tokens.toLocaleString('en-US')} tokens`, line.ms === undefined ? '' : `${(line.ms / 1000).toFixed(1)} s`].filter(part => part !== '')
     // The step's own comment shows under it; the whole job's under the row that stops the job.
     const comment = line.kind === 'job_stop' ? comments.of() : comments.of(line.step_id)
-    return ReviewPage.item([], '', link, `${ReviewPage.time(line.ts)} <strong>${ReviewPage.escape(ReviewPage.HEADINGS[line.kind] ?? line.kind)}</strong>${who}${pill}<div>${
+    return ReviewPage.item([], '', link, `${ReviewPage.time(line.ts)} ${ReviewPage.rowHeading(line)}${who}${pill}<div>${
       ReviewPage.escape(line.summary)}</div>${cost.length === 0 ? '' : `<div class="meta">${cost.join(' · ')}</div>`}${comment === undefined ? '' : ReviewPage.echo(comment)}`)
   }
 

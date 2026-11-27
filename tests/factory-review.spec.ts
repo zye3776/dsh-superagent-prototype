@@ -380,11 +380,14 @@ it('lets the page load nothing but its own style and script, and names only DSH\
   expect([page.querySelector('script[src]'), page.querySelector('link'), page.querySelector('img'), page.querySelector('[style]')]).toEqual([null, null, null, null])
   // A new nonce for each answer.
   expect(String((await call('GET', '/review', {})).headers['content-security-policy'])).not.toContain(nonce)
-  // Every colour comes from a DSH token: no colour value of the page's own.
+  // Every colour names a DSH token first. The colour after the token is the approved mockup's, shown while DSH's tokens do not reach this page
+  // (owner, 2026-11-27: "Use the mockup's colours"). No colour stands without a token in front of it.
   const style = page.querySelector('style')!.textContent
-  expect(style).not.toMatch(/#[0-9a-fA-F]{3,8}\b|rgb|hsl|\b(?:red|green|blue|black|white|gr[ae]y)\b/)
-  for (const [, name] of style.matchAll(/var\((--[a-z0-9-]+)/g)) expect(name).toMatch(/^--dsw-alias-|^--ds-font-family-code$/)
-  expect(style).toContain('var(--dsw-alias-label-primary)')
+  for (const [, name] of style.matchAll(/var\((--[a-z0-9-]+)/g)) expect(name).toMatch(/^--dsw-alias-|^--ds-/)
+  expect(style).toContain('var(--dsw-alias-label-primary, ')
+  const outsideTokens = style.replace(/var\(--(?:dsw-alias|ds)-[a-z0-9-]+, (?:[^()]|\([^()]*\))*\)/g, 'TOKEN')
+  expect(outsideTokens).not.toMatch(/#[0-9a-fA-F]{3,8}\b|rgb|hsl|light-dark|(?<![-\w])(?:red|green|blue|black|white|gr[ae]y)(?![-\w])/)
+  expect(outsideTokens).not.toContain('var(--dsw-alias-')
 })
 
 it('carries its whole look in the one style its policy allows: three panels on one screen, and a colour to fall back on behind every DSH token', async () => {
@@ -420,17 +423,16 @@ it('carries its whole look in the one style its policy allows: three panels on o
   expect([proposal.querySelectorAll('main.proposal > .halves > section').length, proposal.querySelector('.halves del.line')!.textContent, proposal.querySelector('.halves ins.line')!.textContent])
     .toEqual([2, 'Old line.', 'New line.'])
   expect(dom(new ReviewPage('n').guideline(read, read.versions[0])).querySelector('main')!.className).toBe('')
-  // DSH's client does not run in this page, so no token is defined in it. Every token is followed by the colour to show without it. The one
-  // exception is the body's text colour, which the browser drops when the token is missing: the body then takes the colour set on `html`.
+  // DSH's client does not run in this page, so no token is defined in it. Every token is followed by the colour to show without it: the mockup's,
+  // one for a light theme and one for a dark one, which the browser picks between by the system's setting.
   const uses = [...style.matchAll(/var\(--dsw-alias-[a-z0-9-]+(\)|, )/g)].map(([, end]) => end)
-  expect([uses.length > 20, uses.filter(end => end === ')').length]).toEqual([true, 1])
-  expect(style).toContain('html { color: CanvasText;')
-  expect(style).toMatch(/\nbody \{[^}]* color: var\(--dsw-alias-label-primary\);/)
-  // The colours behind the tokens are the browser's own, which follow light and dark by themselves; the page still picks none.
+  expect([uses.length > 20, uses.filter(end => end === ')').length]).toEqual([true, 0])
   expect(style).not.toMatch(/min-width: [1-9]/)
   expect(style).toContain(':root { color-scheme: light dark; }')
-  for (const [, fallback] of style.matchAll(/var\(--dsw-alias-[a-z0-9-]+, ((?:[^()]|\([^()]*\))+)\)/g)) expect(fallback).toMatch(/^(?:Canvas|CanvasText|LinkText|color-mix\(in oklab, CanvasText \d+%, Canvas\))$/)
-  expect(style).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+  for (const [, fallback] of style.matchAll(/var\(--dsw-alias-[a-z0-9-]+, ((?:[^()]|\([^()]*\))+)\)/g)) expect(fallback).toMatch(/^light-dark\(#[0-9a-f]{6}, #[0-9a-f]{6}\)$/)
+  // The mockups' colours: text, page, the blue of the primary button, the green and red of Approved and Denied, the amber of a waiting proposal.
+  for (const colour of ['label-primary, light-dark(#1b1c1f, #eceef2)', 'bg-layer-1, light-dark(#ffffff, #17181c)', 'brand-primary, light-dark(#3b5bdb, #7c93f5)',
+    'state-success-primary, light-dark(#2b8a3e, #69db7c)', 'state-error-primary, light-dark(#c92a2a, #ff8787)', 'state-warn-primary, light-dark(#b7791f, #ffd43b)']) expect(style).toContain(`var(--dsw-alias-${colour})`)
 })
 
 it('folds the left panel into the top bar in a narrow window: the same links behind one disclosure, with no form and no script', async () => {
@@ -467,6 +469,34 @@ it('folds the left panel into the top bar in a narrow window: the same links beh
   expect(dom(new ReviewPage('n').guideline(read, undefined, [open], open)).querySelector('details.fold summary')!.textContent).toBe('Proposal · project job 1')
   // A page with nothing in its left panel has no fold.
   expect(dom(new ReviewPage('n').guideline({ folder: null, versions: [], current: null, reason: 'x' }, undefined)).querySelector('details')).toBeNull()
+})
+
+it('words the page as the mockups do where the records allow: a permission answer headed by the answer, a guideline as headed prose, a waiting pill, the current version in the crumb', () => {
+  // A permission answer's row is headed by the answer, in its colour; the job log's line ends with the decision. Other rows keep their kind's heading.
+  const lines = ['approve', 'deny', 'ask_owner'].map((decision, at) => action({ step_id: `step-${at + 2}`, ts: `2026-11-26T08:1${at}:00.000Z`, kind: 'permission_answer', summary: `Permission request req-${at}: ${decision}`, ref: `decision-${at}` }))
+  const unread = action({ step_id: 'step-9', ts: '2026-11-26T08:20:00.000Z', kind: 'permission_answer', summary: 'Approved: run the tests.' })
+  const steps = [action(), ...lines, unread].map(line => ({ automatic: false as const, ts: line.ts, line }))
+  const job: RecordedJob = { project, job_id: 'job-1', number: 1, started: steps[0]!.ts, stopped: null, last: unread.ts, reviews: [], steps }
+  const entry: ProjectJobs = { project, jobs: [job], outside: [] }
+  const rows = [...dom(new ReviewPage('n').view({ projects: [entry], project: entry, job, outside: false })).querySelectorAll('ol li')]
+  expect(rows.map(row => [row.querySelector('strong')!.textContent, row.querySelector('strong')!.className]))
+    .toEqual([['Job started', ''], ['Approved', 'ok'], ['Denied', 'no'], ['Handed to the owner', ''], ['Permission answered', '']])
+  // A guideline's `#` lines are headings and the rest is shown as written, all of it as text: nothing in it is read as markup.
+  const text = '# Scope\n\nApprove <b>small</b> changes.\n- one\n- two\n\n## Cost #1\nPrefer the cheaper way.\n#not a heading\n'
+  const read: GuidelineRead = { folder: '/factory/guideline', versions: [2, 1].map(version => ({ version, date: null, from_job: null, from_version: null, text })), current: null, reason: null }
+  read.current = read.versions[0]!
+  const open: GuidelineProposal = { project, job_id: 'job-1', number: 1, text: '# Scope\nNew.\n', ts: NOW }
+  const page = dom(new ReviewPage('n').guideline(read, read.versions[1], [open]))
+  expect([...page.querySelector('.guideline-text')!.children].map(part => [part.tagName, part.textContent]))
+    .toEqual([['H3', 'Scope'], ['P', 'Approve <b>small</b> changes.\n- one\n- two'], ['H3', 'Cost #1'], ['P', 'Prefer the cheaper way.\n#not a heading']])
+  expect(page.querySelector('.guideline-text b')).toBeNull()
+  // The crumb names the current version beside the one that is open; a proposal in the list carries the pill "waiting".
+  expect([page.querySelector('.crumb')!.textContent, page.querySelector('.crumb .pill')!.textContent]).toEqual(['Guideline › v1 · current: v2', 'v2'])
+  expect([...page.querySelectorAll('nav a.proposal .pill')].map(pill => [pill.className, pill.textContent])).toEqual([['pill wait', ReviewPage.WAITING]])
+  // In the proposal view the sentence comes first, then the two answers; a heading line of either side is marked as one, its text as written.
+  const view = dom(new ReviewPage('n').guideline(read, undefined, [open], open))
+  expect([...view.querySelector('.answer')!.children].map(part => part.id || part.textContent)).toEqual([ReviewPage.NOTHING_SAVED, 'accept-proposal', 'reject-proposal'])
+  expect([...view.querySelectorAll('.halves section:last-child .line')].map(line => [line.className, line.textContent])).toEqual([['line h', '# Scope'], ['line', 'New.']])
 })
 
 it('says there is no job yet when the project holds none, and skips lines it cannot read', async () => {

@@ -165,7 +165,7 @@ it('leaves no job_stop when the process is killed, and the reader still returns 
 function assessRoute(running: FactoryJob): AssessRoute {
   const mask = join(root, 'plain-mask.mjs')
   writeFileSync(mask, 'export const DecisionMask = { forProject: () => ({ mask: line => line }) }\n')
-  return new AssessRoute([project], undefined, new StubJudge(), undefined, new DecisionWriter(new FactoryMaskModule(mask)), running)
+  return new AssessRoute([project], undefined, new StubJudge(), undefined, new DecisionWriter(new FactoryMaskModule(mask)), undefined, running)
 }
 const request = (id: string) => ({ request_id: id, session_id: 'worker-1', project, tool_name: 'Bash', tool_input: { command: 'ls' } })
 

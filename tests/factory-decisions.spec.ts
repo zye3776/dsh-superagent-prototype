@@ -8,7 +8,7 @@ import { AssessRefusal, DecisionsFile, DecisionWriter, FactoryMaskModule, type D
 let root = '', project = ''
 const file = (of: string = project) => join(of, DecisionsFile.FOLDER, DecisionsFile.FILE)
 const lines = (of: string = project) => readFileSync(file(of), 'utf8').split('\n').filter(line => line !== '')
-const line = (fields: Partial<DecisionLine> = {}): DecisionLine => ({ decision_id: 'd-1', request_id: 'req-1', kind: 'permission', decision: 'deny', choice: null, risk: 'high',
+const line = (fields: Partial<DecisionLine> = {}): DecisionLine => ({ decision_id: 'd-1', request_id: 'req-1', kind: 'permission', decision: 'deny', choice: null, risk: 'high', tier: 1, tier_set_by: 'judge',
   reason: 'The command prints planted-secret-value.', alternative: 'Ask for a narrower command.', cites: 'Ticket 3.', reads: [{ path: '.env', used: false }], tokens: 12,
   seconds: 0.5, ts: '2026-11-26T08:09:10.123Z', project, ...fields })
 /** Writes a stand-in for the factory's built mask file and returns its path. Each one gets a name of its own, because Node loads a path once. */
@@ -107,4 +107,46 @@ it('still refuses a project without its .factory folder, after masking', async (
   rmSync(join(project, DecisionsFile.FOLDER), { recursive: true })
   expect(await refusal(new DecisionWriter(new FactoryMaskModule(maskModule(REPLACING))))).toEqual([409, 'The project has no .factory folder yet'])
   expect(existsSync(join(project, DecisionsFile.FOLDER))).toBe(false)
+})
+
+/** The status and message of the refusal a call ends in. */
+const refusedWith = async (attempt: Promise<unknown>): Promise<[number, string]> => {
+  try { await attempt } catch (error) { if (error instanceof AssessRefusal) return [error.status, error.message]; throw error }
+  throw new Error('The call was not refused')
+}
+
+it('gives the factory\'s key of a request and masks a request\'s fields, both through the mask module', async () => {
+  const path = maskModule(`export const DecisionMask = {
+    requestKey(session, tool, input) { return this === DecisionMask ? 'key:' + JSON.stringify([session, tool, input]) : 'wrong this' },
+    forProject: project => ({ mask: line => line, maskRequest: fields => ({ ...fields, reason: fields.reason.replace('planted-secret-value', '[redacted-secret]') }) }),
+  }\n`)
+  const masks = new FactoryMaskModule(path)
+  const writer = new DecisionWriter(masks)
+  expect(await writer.requestKey('s1', 'Bash', { command: 'ls' })).toBe('key:["s1","Bash",{"command":"ls"}]')
+  const fields = { reason: 'It prints planted-secret-value.', tool_input: { command: 'ls' } }
+  expect(await writer.maskRequest(project, fields)).toEqual({ reason: 'It prints [redacted-secret].', tool_input: { command: 'ls' } })
+  // The fields passed in are not changed.
+  expect(fields.reason).toBe('It prints planted-secret-value.')
+})
+
+it('refuses to key or mask a request with 503 when the mask module cannot, and never repeats the module\'s own error', async () => {
+  const old = maskModule('export const DecisionMask = { forProject: () => ({ mask: line => line }) }\n')
+  const throwing = maskModule(`export const DecisionMask = { requestKey: () => { throw new Error('planted-secret-value') },
+    forProject: () => ({ mask: line => line, maskRequest: () => { throw new Error('planted-secret-value') } }) }\n`)
+  const empty = maskModule('export const DecisionMask = { requestKey: () => \'\', forProject: () => ({ mask: line => line, maskRequest: () => null }) }\n')
+  const key = (path?: string) => refusedWith(new DecisionWriter(new FactoryMaskModule(path)).requestKey('s1', 'Bash', {}))
+  const mask = (path?: string) => refusedWith(new DecisionWriter(new FactoryMaskModule(path)).maskRequest(project, { reason: 'x' }))
+  expect((await key())[0]).toBe(503)
+  expect((await key('relative/mask.mjs'))[0]).toBe(503)
+  expect((await key(join(root, 'missing.mjs')))[0]).toBe(503)
+  expect(await key(old)).toEqual([503, 'The configured maskModule does not export DecisionMask.requestKey, so no request is judged'])
+  // A request that cannot be keyed is the caller's fault, not this side's.
+  expect(await key(throwing)).toEqual([400, 'The request cannot be given a key'])
+  expect((await key(empty))[0]).toBe(503)
+  expect((await mask())[0]).toBe(503)
+  expect(await mask(old)).toEqual([503, 'The configured maskModule cannot mask a request, so it is not judged'])
+  expect(await mask(throwing)).toEqual([503, 'The request could not be masked, so it is not judged'])
+  expect((await mask(empty))[0]).toBe(503)
+  // A mask source without a key function of its own (a test's stand-in) cannot key either.
+  expect((await refusedWith(new DecisionWriter({ maskerFor: async () => ({ mask: line => line }) }).requestKey('s1', 'Bash', {})))[0]).toBe(503)
 })

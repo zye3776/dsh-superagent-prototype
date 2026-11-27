@@ -1,9 +1,9 @@
 /**
  * The shared token of the `/assess` route: one secret that the factory and this route both read from the same file on this
  * machine. The factory sends it with each request and the route sends it back with each decision, so each side knows the
- * other is the one set up here. This file mirrors the factory's `lib/sharedToken`; the two repositories share no code.
+ * other is the one set up here. This file mirrors the factory's `lib/sharedToken` and `lib/askKey`; the two repositories share no code.
  */
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -57,5 +57,23 @@ export class SharedTokenFile {
   static same(a: string, b: string): boolean {
     const hash = (text: string) => createHash('sha256').update(text, 'utf8').digest()
     return timingSafeEqual(hash(a), hash(b))
+  }
+}
+
+/**
+ * The ask key of one worker session: the credential a worker sends with its `/ask`, so a caller cannot ask in another session's name.
+ * It is the lowercase hex HMAC-SHA256 of `zees-ask-v1:<session_id>`, keyed with the shared token (trimmed). The factory's session-start hook
+ * computes the same key for each session and puts it in that session's environment; this route computes it again from the ask's `session_id`
+ * and the token file. Nothing stores it. This mirrors the factory's `lib/askKey`: both sides pin the same test vector.
+ */
+export class AskKey {
+  /** What comes before the session id in the signed text; the version lets a later key scheme tell its keys apart. */
+  static readonly PREFIX = 'zees-ask-v1:'
+  /** The HTTP header of an `/ask` request that carries the key. */
+  static readonly HEADER = 'x-zees-ask-key'
+
+  /** The key of `sessionId` under the shared `token`, as 64 lowercase hex characters. */
+  static compute(token: string, sessionId: string): string {
+    return createHmac('sha256', token.trim()).update(AskKey.PREFIX + sessionId, 'utf8').digest('hex')
   }
 }

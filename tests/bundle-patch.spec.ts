@@ -92,15 +92,20 @@ it('defines the factory\'s judge preset, off unless a profile turns it on: a she
   expect(named('@deepseek-ai/dsh-bash-sandbox').length).toBe(1)
   const names = plugins.map(item => item.name)
   for (const name of ['@deepseek-ai/dsh-tool-jobs', '@deepseek-ai/dsh-tool-skill', '@deepseek-ai/dsh-skill-filesystem', '@deepseek-ai/dsh-compaction-basic',
-    '@deepseek-ai/dsh-compaction-tool-result-pruner', '@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-web', '@deepseek-ai/dsh-tool-todo',
+    '@deepseek-ai/dsh-compaction-tool-result-pruner', '@deepseek-ai/dsh-tool-web', '@deepseek-ai/dsh-tool-todo',
     '@deepseek-ai/dsh-tool-ask-user', '@deepseek-ai/dsh-persona',
     // The project's AGENTS.md and CLAUDE.md, which the judged worker can write, do not become the judge's instructions.
     '@deepseek-ai/dsh-agent-instructions']) expect(names, name).not.toContain(name)
+  // Story 2.25: no delegation plugin. The judge's helpers are Claude Code and Codex processes its own ask_helper tool starts, so a judge cannot start a DSH agent.
+  for (const name of ['@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-subagent-control']) expect(names, name).not.toContain(name)
+  expect(judge.plugins.map(item => item.id)).not.toContain('delegation')
 })
 
 it('turns the judge preset and the factory route on in the factory\'s example profile, and names the guard file, the mask file and the job log file', () => {
   const example = readFileSync(join(import.meta.dirname, '..', 'examples', 'factory-profile.cordis.patch.yml'), 'utf8')
   expect(example).toMatch(/^- id: dsh-superagent-judge-preset\n  disabled: false$/m)
+  // Story 2.25: story 2.22's helper preset is gone.
+  expect(example).not.toContain('dsh-superagent-judge-helper-preset')
   expect(example).toMatch(/^- id: dsh-superagent-factory\n  disabled: false$/m)
   // The review page's link is its own package's row, on, since the main plugin's row (which would carry it) is off here.
   expect(example).toMatch(/^- id: dsh-superagent-review-link\n  disabled: false$/m)

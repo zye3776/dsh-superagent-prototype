@@ -203,6 +203,9 @@
     # agent-instructions plugin: the project's AGENTS.md and CLAUDE.md, which the judged worker can write, must not become the
     # judge's own instructions; the judge reads them as project files. A preset row cannot set the sandbox, so the plugin sets DSH's `read-only` permission preset on each judge Session, allows only the
     # tools read, grep, glob and bash, and checks every call with the factory's guard.
+    # The plugin registers the judge's own `docs_lookup` (story 2.22) and `ask_helper` (story 2.25) tools on each judge Session, so
+    # no MCP client and no delegation plugin is loaded here: `ask_helper` starts short Claude Code and Codex processes on weaker
+    # models from the plugin's own code (src/factory/helpers.ts), never through the judge's shell.
     - id: dsh-superagent-judge-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true

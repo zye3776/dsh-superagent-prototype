@@ -5,19 +5,33 @@
  * The route asks its `Judge` for the decision. In the plugin that is `ModelJudge` (`verdict.ts`), which asks the judge Session of the request's worker session;
  * when that judge cannot be opened or gives no usable answer in time, the route answers 503 and writes nothing. `StubJudge` gives the same fixed, safe
  * answer to every request and asks no model: the factory's contract check uses it. This file loads no judge code itself, so Node can run it straight from source.
+ * Each request may carry the checking tier the factory's gate gave it (`tier`, `tier_rule`); every decision records its final `tier` and `tier_set_by`
+ * (`TierChoice` in `decisions.ts`), the stub's too.
  * Only the factory is answered: a caller must be on this machine and send the shared token (`token.ts`), and the route sends
  * the token back with each decision, so the factory can tell this route's reply from another service's.
+ *
+ * Two more routes sit beside it, for "ask first": a worker tells the judge what it is about to do, and why, before it does it.
+ * `POST /ask` takes the worker's action (`session_id`, `tool_name`, `tool_input`), its `description` and an optional `context`. The route masks them with
+ * the factory's mask, has the judge of that worker session decide, and writes the decision as `/assess` does. An `approve` is then held for a short
+ * time (`approvals.ts`) under the factory's own `request_key` of that exact call. A worker holds no shared token, so `/ask` asks for none and sends
+ * none back. Instead it sends its session's ask key (`AskKey` in `token.ts`), which only a holder of the token can make for that `session_id`: an ask
+ * without the right key for the body's `session_id` is refused with 401 before any judge is asked, so no caller can put questions into another
+ * session's judge thread. A decision that is not an approve leaves an approval held earlier for the same call as it is: only that session's own newer
+ * approve replaces it.
+ * `POST /claim` is for the factory's hook (shared token, as `/assess`): when the same call reaches the hook, it posts the call's key and gets the held
+ * approval's `decision_id`, once, with no model call. With nothing to claim the hook posts to `/assess` as before.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, resolve } from 'node:path'
-import { AssessRefusal, DecisionWriter, type Decision } from './decisions.ts'
+import { PendingApprovals, type ApprovalClaim } from './approvals.ts'
+import { AssessRefusal, DecisionWriter, TierChoice, type Decision, type DecisionLine, type Tier } from './decisions.ts'
 import type { JobAnswer } from './job.ts'
-import { SharedTokenFile } from './token.ts'
+import { AskKey, SharedTokenFile } from './token.ts'
 
-export { AssessRefusal, DecisionsFile, type Decision, type DecisionLine, type DecisionRead } from './decisions.ts'
+export { AssessRefusal, DecisionsFile, TierChoice, type Decision, type DecisionLine, type DecisionRead, type Tier } from './decisions.ts'
 
 /** One path of a shared temp folder (such as `/tmp`) that a request names, with what the factory's hook found out about it. */
 export interface TempPathFact {
@@ -60,9 +74,22 @@ export class TempFactsShape {
 /**
  * What the factory posts: its masked request record. Only these fields are read here; `project` is the raw absolute path, and `session_id` names the
  * worker session that asks, which gets a judge Session of its own. `temp` holds the request's temp-folder facts for the judge: left out by a caller
- * that sends none, `null` when the hook could not work them out.
+ * that sends none, `null` when the hook could not work them out. `context` is background a worker gave with an ask: its own claim, never evidence.
+ * `tier` is the checking tier the factory's gate sorted the request into by plain code (1 project direction, 2 third-party tools, 3 low risk), and
+ * `tier_rule` the name of its rule: both `null` when the gate left the request unsorted, and left out by a caller that sends none. An `/ask` never
+ * carries them: a worker cannot set its own tier.
  */
-export interface AssessRequest { request_id: string; project: string; session_id: string; temp?: TempFacts | null; [field: string]: unknown }
+export interface AssessRequest {
+  request_id: string; project: string; session_id: string; temp?: TempFacts | null; context?: string; tier?: Tier | null; tier_rule?: string | null
+  [field: string]: unknown
+}
+/**
+ * What a worker posts to `/ask` before it acts: the call it is about to make (`session_id`, `tool_name` and `tool_input`, exactly as its tool call
+ * will carry them), `description` (what the action is and why) and, when it has some, `context` (background the judge would not see otherwise).
+ */
+export interface AskRequest { project: string; session_id: string; tool_name: string; tool_input: unknown; description: string; context?: string }
+/** What the factory's hook posts to `/claim`: its own `request_id`, and what identifies the request an approval may be held for. */
+export interface ClaimRequest extends ApprovalClaim { request_id: string }
 
 /** A decision without `seconds`, which the route measures. */
 export type Verdict = Omit<Decision, 'seconds'>
@@ -80,7 +107,7 @@ export class StubJudge implements Judge {
   /** The decision for one request, without `seconds`, which the route measures. */
   decide(request: AssessRequest): Verdict {
     return { decision_id: randomUUID(), request_id: request.request_id, kind: 'permission', decision: 'ask_owner', choice: null, risk: 'high',
-      reason: StubJudge.REASON, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0 }
+      ...TierChoice.of(TierChoice.gateTierOf(request), 'high'), reason: StubJudge.REASON, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0 }
   }
 }
 
@@ -109,12 +136,15 @@ export interface AnswerLog { answered(answer: JobAnswer): Promise<void> }
  */
 export class AssessRoute {
   static readonly PATH = '/assess'
+  static readonly ASK_PATH = '/ask'
+  static readonly CLAIM_PATH = '/claim'
   static readonly MAX_BODY_BYTES = 128 * 1024
   /** The addresses a caller on this machine connects from: IPv4, IPv6, and IPv4 as an IPv6 socket reports it. */
   static readonly LOOPBACK_ADDRESSES: ReadonlySet<string> = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
   private readonly projects: ReadonlySet<string>
   constructor(projects: readonly string[], private readonly tokens: TokenSource = new SharedTokenFile(), private readonly judge: Judge = new StubJudge(),
-    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter(), private readonly log?: AnswerLog) {
+    private readonly now: () => Date = () => new Date(), private readonly writer: DecisionWriter = new DecisionWriter(),
+    private readonly approvals: PendingApprovals = new PendingApprovals(undefined, () => now().getTime()), private readonly log?: AnswerLog) {
     const relative = projects.filter(project => !isAbsolute(project))
     if (relative.length) throw new Error(`dsh-superagent-factory projects must be absolute paths: ${relative.join(', ')}`)
     // Normalised, so an entry written with a trailing slash or `..` still matches the absolute path a caller sends.
@@ -123,21 +153,63 @@ export class AssessRoute {
   /** How many projects the route may write into. */
   get projectCount(): number { return this.projects.size }
 
-  /** Adds the route to the web server and returns the function that removes it. */
+  /** Adds the three routes (`/assess`, `/ask`, `/claim`) to the web server and returns the function that removes them. */
   register(ctx: Context): () => void {
     if (ctx.webServer.host !== '127.0.0.1') throw new Error('The factory /assess route requires a loopback Web server')
-    // Anonymous to DSH, because its login accepts only a browser cookie, which a hook does not have. The route checks the shared token itself.
-    const route: AnonymousRoute = { kind: 'exact', path: AssessRoute.PATH, auth: 'anonymous', handler: (req, res) => this.handle(req, res, ctx.webServer.port) }
-    return ctx.webServer.register(route)
+    const port = () => ctx.webServer.port
+    // Anonymous to DSH, because its login accepts only a browser cookie, which a hook does not have. `/assess` and `/claim` check the shared token themselves.
+    const routes: AnonymousRoute[] = [
+      { kind: 'exact', path: AssessRoute.PATH, auth: 'anonymous', handler: (req, res) => this.handle(req, res, port()) },
+      { kind: 'exact', path: AssessRoute.ASK_PATH, auth: 'anonymous', handler: (req, res) => this.handleAsk(req, res, port()) },
+      { kind: 'exact', path: AssessRoute.CLAIM_PATH, auth: 'anonymous', handler: (req, res) => this.handleClaim(req, res, port()) },
+    ]
+    const removers = routes.map(route => ctx.webServer.register(route))
+    return () => { for (const remove of removers) remove() }
   }
 
-  /** Answers one HTTP request: 200 with the decision line and the shared token in its header, or the status of the refusal with `{ error }`. */
-  async handle(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
+  /** Answers one `/assess` request: 200 with the decision line and the shared token in its header, or the status of the refusal with `{ error }`. */
+  handle(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
+    return this.answer(req, res, port, true, async body => this.assess(AssessRoute.requestOf(body)))
+  }
+
+  /**
+   * Answers one `/ask` request: 200 with `{ decision, pending_until }`, or the status of the refusal with `{ error }`.
+   * The caller is a worker, which has no shared token: none is asked for and none is sent back. It must send the ask key of the body's
+   * `session_id` instead, checked once the body is read (the key depends on it) and before any judge is asked.
+   */
+  handleAsk(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
+    return this.answer(req, res, port, false, async body => {
+      const ask = AssessRoute.askOf(body)
+      this.checkAskKey(req, ask.session_id)
+      return this.ask(ask)
+    })
+  }
+
+  /**
+   * Refuses an ask that does not carry the ask key of `session`: 503 while this side has no usable token file (it cannot compute any key),
+   * 401 when the key is missing or wrong, including the key of another session. The key is compared in constant time and never echoed.
+   */
+  private checkAskKey(req: IncomingMessage, session: string): void {
+    const token = this.tokens.read()
+    if (token === undefined) throw new AssessRefusal(503, 'The route has no usable token file, so it answers nobody')
+    const sent = req.headers[AskKey.HEADER]
+    if (typeof sent !== 'string' || sent === '' || !SharedTokenFile.same(sent, AskKey.compute(token, session))) {
+      throw new AssessRefusal(401, 'The ask key is missing or wrong for this session')
+    }
+  }
+
+  /** Answers one `/claim` request: 200 with the claim reply and the shared token in its header, or the status of the refusal with `{ error }`. */
+  handleClaim(req: IncomingMessage, res: ServerResponse, port: number): Promise<void> {
+    return this.answer(req, res, port, true, async body => this.claim(AssessRoute.claimOf(body)))
+  }
+
+  /** Admits the caller, reads the body and sends what `reply` makes of it. With `withToken`, the caller must send the shared token and gets it back. */
+  private async answer(req: IncomingMessage, res: ServerResponse, port: number, withToken: boolean, reply: (body: unknown) => Promise<string>): Promise<void> {
     let bodyRead = false
     try {
-      const token = this.admit(req, port)
+      const token = this.admit(req, port, withToken)
       bodyRead = true
-      AssessRoute.send(res, 200, await this.assess(AssessRoute.requestOf(await AssessRoute.readBody(req))), { [SharedTokenFile.HEADER]: token })
+      AssessRoute.send(res, 200, await reply(await AssessRoute.readBody(req)), token === undefined ? {} : { [SharedTokenFile.HEADER]: token })
     } catch (error) {
       // A caller refused before its body was read may still be sending it: the upload is read and thrown away, so the caller receives the answer and not a broken connection.
       if (!bodyRead) req.resume()
@@ -149,8 +221,10 @@ export class AssessRoute {
   /**
    * Checks who is calling, before any of the body is read, and returns the shared token to send back.
    * The order is fixed: where the request claims to go and come from, where it really comes from, the method, this side's own token file, then the caller's token.
+   * Without `withToken` (`/ask`) the last two steps are left out, the token file is not read here, and nothing is returned: `/ask` reads the
+   * token file after the body, to check the ask key of the body's `session_id`.
    */
-  private admit(req: IncomingMessage, port: number): string {
+  private admit(req: IncomingMessage, port: number, withToken: boolean): string | undefined {
     const host = req.headers.host
     if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) throw new AssessRefusal(403, 'Loopback request required')
     // A browser adds Origin to every cross-site POST; the factory's client never sends one, so a web page cannot forge a decision.
@@ -158,6 +232,7 @@ export class AssessRoute {
     // The Host header is the caller's word; the address of the connection is not.
     if (!AssessRoute.LOOPBACK_ADDRESSES.has(req.socket.remoteAddress ?? '')) throw new AssessRefusal(403, 'Loopback request required')
     if (req.method !== 'POST') throw new AssessRefusal(405, 'Only POST is allowed')
+    if (!withToken) return undefined
     const token = this.tokens.read()
     if (token === undefined) throw new AssessRefusal(503, 'The route has no usable token file, so it answers nobody')
     const sent = req.headers[SharedTokenFile.HEADER]
@@ -183,8 +258,77 @@ export class AssessRoute {
   }
 
   /**
+   * Judges an action a worker asks about before it runs it, and holds an `approve` for the hook to claim. Returns the reply text:
+   * `{ decision, pending_until }`, where `decision` is the decision line as written and `pending_until` the moment the held approval expires
+   * (ISO-8601, UTC), or `null` when the judge did not approve: then nothing new is held, and an approve held earlier for the same call stays
+   * claimable until it expires (a weak ask cannot cancel it; a newer approve of the same call replaces it).
+   * The key is computed first, on the raw values, with the factory's own key function: the hook computes the same key for the real call. Then the
+   * fields are masked with the factory's mask, as the hook masks a request, so the judge sees no secret and not who the owner is. Without the key
+   * function or the mask the ask is refused with 503 before any judge is asked. The judged request has the shape of an `/assess` request, with a new
+   * `request_id`, the worker's `description` as `reason`, and `context` when given. It carries no `temp`: a worker cannot state those facts itself,
+   * and the hook claims no approval for a request the temp-folder rule is about.
+   */
+  async ask(ask: AskRequest): Promise<string> {
+    if (!this.projects.has(ask.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
+    const key = await this.writer.requestKey(ask.session_id, ask.tool_name, ask.tool_input)
+    const masked = await this.writer.maskRequest(ask.project, { session_id: ask.session_id, tool_name: ask.tool_name, tool_input: ask.tool_input,
+      reason: ask.description, ...(ask.context === undefined ? {} : { context: ask.context }) })
+    const { session_id: session, context } = masked
+    // The masked session id names the judge Session, as it does for `/assess`, where the hook's masked record brings it.
+    if (typeof session !== 'string' || session === '') throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
+    if (ask.context !== undefined && typeof context !== 'string') throw new AssessRefusal(503, 'The request could not be masked, so it is not judged')
+    const line = await this.assess({ request_id: randomUUID(), request_key: key, project: ask.project, session_id: session, tool_name: masked.tool_name,
+      tool_input: masked.tool_input, reason: masked.reason, ...(typeof context === 'string' ? { context } : {}) })
+    const decision = JSON.parse(line) as DecisionLine
+    const until = decision.decision === 'approve'
+      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }).toISOString()
+      : null
+    // The line is put in as written, so the reply holds exactly what the decisions file holds.
+    return `{"decision":${line},"pending_until":${JSON.stringify(until)}}`
+  }
+
+  /**
+   * Hands out the approval held for exactly this request, once, and returns the reply text: `{ claimed: true, request_id, decision_id, project }`,
+   * or the same with `claimed: false` and `decision_id: null` when none is held for it (never approved, another request, session or project,
+   * expired, or claimed before). No judge is asked and nothing is written: the decision line was written when the worker asked.
+   */
+  claim(claim: ClaimRequest): string {
+    if (!this.projects.has(claim.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
+    const id = this.approvals.claim(claim) ?? null
+    return JSON.stringify({ claimed: id !== null, request_id: claim.request_id, decision_id: id, project: claim.project })
+  }
+
+  /**
+   * Checks a parsed `/ask` body and returns only its known fields. Refuses with 400 a body that is not an object, one without `project`, `session_id`,
+   * `tool_name`, `tool_input` or `description`, and one whose `context` is present but not text.
+   */
+  static askOf(body: unknown): AskRequest {
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
+    const { project, session_id: session, tool_name: tool, tool_input: input, description, context } = body as Record<string, unknown>
+    if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
+    if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
+    if (typeof tool !== 'string' || tool === '') throw new AssessRefusal(400, 'The request has no tool_name')
+    if (input === undefined) throw new AssessRefusal(400, 'The request has no tool_input')
+    if (typeof description !== 'string' || description.trim() === '') throw new AssessRefusal(400, 'The request has no description')
+    if ('context' in body && typeof context !== 'string') throw new AssessRefusal(400, 'The request has a malformed context')
+    return { project, session_id: session, tool_name: tool, tool_input: input, description, ...(typeof context === 'string' ? { context } : {}) }
+  }
+
+  /** Checks a parsed `/claim` body and returns only its known fields. Refuses with 400 a body that is not an object or lacks one of the four texts. */
+  static claimOf(body: unknown): ClaimRequest {
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
+    const { request_id: id, request_key: key, session_id: session, project } = body as Record<string, unknown>
+    if (typeof id !== 'string' || id === '') throw new AssessRefusal(400, 'The request has no request_id')
+    if (typeof key !== 'string' || key === '') throw new AssessRefusal(400, 'The request has no request_key')
+    if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
+    if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
+    return { request_id: id, request_key: key, session_id: session, project }
+  }
+
+  /**
    * Checks a parsed body and returns it as the request, unchanged. Refuses with 400 a body that is not an object, one without `request_id`, `project` or
-   * `session_id`, and one whose `temp` is present but neither `null` nor the agreed facts. Public, so the factory's contract check can run the same check.
+   * `session_id`, one whose `temp` is present but neither `null` nor the agreed facts, one whose `context` is present but not text, and one whose `tier` is
+   * present but neither `null` nor the whole number 1, 2 or 3, or whose `tier_rule` is present but neither `null` nor text. Public, so the factory's contract check can run the same check.
    */
   static requestOf(body: unknown): AssessRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
@@ -193,6 +337,9 @@ export class AssessRoute {
     if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
     if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
     if ('temp' in body && !TempFactsShape.holds((body as Record<string, unknown>).temp)) throw new AssessRefusal(400, 'The request has a malformed temp')
+    if ('context' in body && typeof (body as Record<string, unknown>).context !== 'string') throw new AssessRefusal(400, 'The request has a malformed context')
+    const { tier, tier_rule: rule } = body as Record<string, unknown>
+    if (!TierChoice.holds(tier) || (rule !== undefined && rule !== null && typeof rule !== 'string')) throw new AssessRefusal(400, 'The request has a malformed tier')
     return body as AssessRequest
   }
 

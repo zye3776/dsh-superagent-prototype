@@ -6,11 +6,12 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts } from '../src/factory/assess.ts'
+import { PendingApprovals } from '../src/factory/approvals.ts'
+import { AssessRoute, DecisionsFile, StubJudge, TempFactsShape, type AssessRequest, type Judge, type TempFacts, type Verdict } from '../src/factory/assess.ts'
 import { DecisionWriter, FactoryMaskModule } from '../src/factory/decisions.ts'
 import { FactoryGuardModule, JudgeSessions } from '../src/factory/judge.ts'
 import * as plugin from '../src/factory/index.ts'
-import { SharedTokenFile } from '../src/factory/token.ts'
+import { AskKey, SharedTokenFile } from '../src/factory/token.ts'
 import { ModelJudge } from '../src/factory/verdict.ts'
 import { fakeDsh, fakeGuard } from './fixtures/judge.ts'
 
@@ -32,10 +33,24 @@ function writeToken(content: string = TOKEN, mode = 0o600): void {
   // Set after writing: the mode given to writeFileSync is cut down by the umask.
   chmodSync(tokenPath(), mode)
 }
-/** A stand-in for the factory's built mask file, with the same export. It marks `reason`, so a test can tell that the line went through it. */
+/**
+ * A stand-in for the factory's built mask file, with the same export. It marks `reason`, so a test can tell that the line went through it, and it wraps a
+ * request's `tool_input`, so a test can tell the masked input the judge sees from the raw input the key is made of.
+ */
 const maskPath = () => join(root, 'fake-mask.mjs')
 const MASKED = ' [masked]'
-const FAKE_MASK = `export const DecisionMask = { forProject: () => ({ mask: line => ({ ...line, reason: line.reason + ${JSON.stringify(MASKED)} }) }) }\n`
+const MASKED_REQUEST = ' [masked request]'
+/** The fake key of a request: readable, so a test can tell that it was made from the raw values. */
+const keyOf = (session: string, tool: string, input: unknown) => `key:${JSON.stringify([session, tool, input])}`
+const FAKE_MASK = `export const DecisionMask = {
+  requestKey: (session, tool, input) => 'key:' + JSON.stringify([session, tool, input]),
+  forProject: () => ({
+    mask: line => ({ ...line, reason: line.reason + ${JSON.stringify(MASKED)} }),
+    maskRequest: fields => ({ ...fields, tool_input: { masked: fields.tool_input }, reason: fields.reason + ${JSON.stringify(MASKED_REQUEST)}, ...('context' in fields ? { context: fields.context + ${JSON.stringify(MASKED_REQUEST)} } : {}) }),
+  }),
+}\n`
+/** The mask file of a factory from before "ask first": it masks a decision, and nothing else. */
+const OLD_MASK = `export const DecisionMask = { forProject: () => ({ mask: line => line }) }\n`
 /** The route's writer, loading the mask module at `path`. */
 const writer = (path: string | undefined = maskPath()) => new DecisionWriter(new FactoryMaskModule(path))
 const file = () => join(project, DecisionsFile.FOLDER, DecisionsFile.FILE)
@@ -52,23 +67,25 @@ const judgeReply = () => JSON.stringify({ decision: 'approve', risk: 'low', undo
  * Serves the route of a fake DSH web server over real HTTP, reading the token file and the fake mask of the test, and returns the route as it was registered.
  * The stub decides unless a test gives another judge.
  */
-async function serve(projects: string[] = [project], mask: DecisionWriter = writer(), judge: Judge = new StubJudge()): Promise<Route> {
-  let route: Route | undefined
-  server = createServer((req, res) => { void route!.handler(req, res) })
+let routes = new Map<string, Route>()
+async function serve(projects: string[] = [project], mask: DecisionWriter = writer(), judge: Judge = new StubJudge(), approvals?: PendingApprovals): Promise<Route> {
+  routes = new Map<string, Route>()
+  // Each request goes to the route registered for its path, as DSH's web server sends it.
+  server = createServer((req, res) => { void routes.get(req.url ?? '')!.handler(req, res) })
   await new Promise<void>(resolve => { server!.listen(0, '127.0.0.1', resolve) })
   port = (server.address() as AddressInfo).port
-  const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { route = registered; return () => {} } } }
-  new AssessRoute(projects, new SharedTokenFile(tokenPath()), judge, () => new Date(NOW), mask).register(ctx as never)
-  return route!
+  const ctx = { webServer: { host: '127.0.0.1', port, register: (registered: Route) => { routes.set(registered.path, registered); return () => {} } } }
+  new AssessRoute(projects, new SharedTokenFile(tokenPath()), judge, () => new Date(NOW), mask, approvals).register(ctx as never)
+  return routes.get('/assess')!
 }
-/** Sends one request with the valid token, unless `headers` gives another one or `undefined` for none. */
-function call(method: string, body?: unknown, headers: Record<string, string | undefined> = {}): Promise<Answer> {
+/** Sends one request to `path` with the valid token, unless `headers` gives another one or `undefined` for none. */
+function call(method: string, body?: unknown, headers: Record<string, string | undefined> = {}, path = '/assess'): Promise<Answer> {
   const sent = body === undefined ? undefined : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
   return new Promise((resolve, reject) => {
     // Without a length, Node sends the body in chunks, so the route cannot refuse it by its length up front.
     const length = sent && !('transfer-encoding' in headers) ? { 'content-length': String(sent.length) } : {}
     const all = Object.fromEntries(Object.entries({ [SharedTokenFile.HEADER]: TOKEN, ...length, ...headers }).filter(([, value]) => value !== undefined))
-    const req = request({ host: '127.0.0.1', port, path: '/assess', method, headers: all as Record<string, string> }, res => {
+    const req = request({ host: '127.0.0.1', port, path, method, headers: all as Record<string, string> }, res => {
       const chunks: Buffer[] = []
       res.on('data', (chunk: Buffer) => { chunks.push(chunk) })
       res.on('end', () => {
@@ -95,9 +112,14 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-it('registers one exact, anonymous route and refuses a web server that is not on loopback', async () => {
+it('registers three exact, anonymous routes, removes them together, and refuses a web server that is not on loopback', async () => {
   const route = await serve()
   expect({ kind: route.kind, path: route.path, auth: route.auth }).toEqual({ kind: 'exact', path: '/assess', auth: 'anonymous' })
+  expect([...routes.values()].map(({ kind, path, auth }) => ({ kind, path, auth }))).toEqual(['/assess', '/ask', '/claim'].map(path => ({ kind: 'exact', path, auth: 'anonymous' })))
+  const removed: string[] = []
+  const counting = { webServer: { host: '127.0.0.1', port: 3083, register: (registered: Route) => () => { removed.push(registered.path) } } }
+  new AssessRoute([project]).register(counting as never)()
+  expect(removed).toEqual(['/assess', '/ask', '/claim'])
   const ctx = { webServer: { host: '192.168.1.5', port: 3083, register: () => () => {} } }
   expect(() => new AssessRoute([project]).register(ctx as never)).toThrow('loopback')
   expect(() => new AssessRoute(['relative/project'])).toThrow('absolute')
@@ -109,7 +131,7 @@ it('answers a valid request with the stub decision, masked, and appends the same
   const answer = await call('POST', sample())
   expect(answer.status).toBe(200)
   expect(answer.body).toEqual({ decision_id: expect.stringMatching(/^[0-9a-f-]{36}$/), request_id: 'req-1', kind: 'permission', decision: 'ask_owner',
-    choice: null, risk: 'high', reason: `${StubJudge.REASON}${MASKED}`, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0, seconds: expect.any(Number),
+    choice: null, risk: 'high', tier: 1, tier_set_by: 'judge', reason: `${StubJudge.REASON}${MASKED}`, alternative: '', cites: StubJudge.CITES, reads: [], tokens: 0, seconds: expect.any(Number),
     ts: NOW, project })
   // The factory's decision shape refuses an empty `cites`.
   expect(StubJudge.CITES).not.toBe('')
@@ -248,12 +270,14 @@ it('refuses any method but POST, a Host header that is not loopback and a browse
 
 it('is a plugin that needs the web server and DSH\'s Session services, and mounts the route for the configured projects', () => {
   expect([plugin.name, plugin.inject]).toEqual(['dsh-superagent-factory', ['webServer', 'agents', 'sessionController', 'workspaceRegistry', 'permissionPresets', 'systemPrompt']])
-  expect(plugin.Config({ guardModule: '/factory/lib/dist/judgeGuard.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, guardModule: '/factory/lib/dist/judgeGuard.js', review: {} })
+  expect(plugin.Config({ guardModule: '/factory/lib/dist/judgeGuard.js' })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, guardModule: '/factory/lib/dist/judgeGuard.js', approvalSeconds: 120, review: {} })
   expect(() => plugin.Config({ guardModule: 'relative/judgeGuard.js' })).toThrow()
-  expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath(), review: {} })
-  expect(plugin.Config({ maskModule: maskPath() })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, maskModule: maskPath(), review: {} })
+  expect(plugin.Config({ projects: [project], tokenFile: tokenPath() })).toEqual({ projects: [project], tokenFile: tokenPath(), approvalSeconds: 120, review: {} })
+  expect(plugin.Config({ maskModule: maskPath() })).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, maskModule: maskPath(), approvalSeconds: 120, review: {} })
   expect(() => plugin.Config({ maskModule: 'relative/decisionMask.js' })).toThrow()
-  expect(plugin.Config({})).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, review: {} })
+  expect(plugin.Config({})).toEqual({ projects: [], tokenFile: SharedTokenFile.DEFAULT_PATH, approvalSeconds: 120, review: {} })
+  expect(plugin.Config({ approvalSeconds: 600 }).approvalSeconds).toBe(600)
+  for (const seconds of [0, 601, 1.5]) expect(() => plugin.Config({ approvalSeconds: seconds }), String(seconds)).toThrow()
   expect(plugin.Config({ review: { orca: '/opt/homebrew/bin/orca' } }).review).toEqual({ orca: '/opt/homebrew/bin/orca' })
   expect(() => plugin.Config({ review: { orca: 'orca' } })).toThrow()
   expect(SharedTokenFile.DEFAULT_PATH).toBe(join(homedir(), '.config', 'zees-factory', 'superagent-token'))
@@ -262,10 +286,12 @@ it('is a plugin that needs the web server and DSH\'s Session services, and mount
   const registered: Route[] = []
   const dispose = vi.fn()
   const ctx = { webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return dispose } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: vi.fn(), inject: () => () => {} }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: vi.fn(), inject: () => () => {}, tools: { guard: vi.fn(() => () => {}) } }
   plugin.apply(ctx as never, plugin.Config({ projects: [project] }))
-  // The review page's six addresses come after it (tests/factory-review.spec.ts).
-  expect(registered.map(route => route.path)).toEqual(['/assess', '/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer', '/review/trends'])
+  // The review page's six addresses come after the assess, ask and claim routes (tests/factory-review.spec.ts).
+  expect(registered.map(route => route.path)).toEqual(['/assess', '/ask', '/claim', '/review', '/review/comment', '/review/talk', '/review/proposal', '/review/answer', '/review/trends'])
+  // Story 2.25: the judge's helpers are processes its own tool starts, not DSH agents, so the plugin puts no global guard on DSH's tools.
+  expect(ctx.tools.guard).not.toHaveBeenCalled()
 })
 
 it('is a plugin that reads the shared token from the configured token file, masks with the configured mask module, guards its judges with the configured guard module and answers with the judge\'s decision', async () => {
@@ -276,7 +302,7 @@ it('is a plugin that reads the shared token from the configured token file, mask
   const registered: Route[] = []
   const dsh = fakeDsh(judgeReply)
   const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
-    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: vi.fn(), inject: () => () => {} }
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: vi.fn(), inject: () => () => {}, tools: { guard: vi.fn(() => () => {}) } }
   // Without a guard module the plugin's route opens no judge Session and writes nothing.
   plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: configured, maskModule: maskPath() }))
   const unguarded = direct('127.0.0.1', { [SharedTokenFile.HEADER]: OTHER_TOKEN })
@@ -458,4 +484,280 @@ it('answers 503 and writes nothing when no guard module is configured', async ()
   const answer = await call('POST', sample())
   expect([answer.status, answer.body]).toEqual([503, { error: 'No guardModule is configured, so no judge session is opened and no decision is written' }])
   expect([existsSync(file()), dsh.agents.size]).toEqual([false, 0])
+})
+
+/** A judge that gives every request the same answer and keeps what it was asked. */
+function fixedJudge(decision: Verdict['decision'] = 'approve'): Judge & { seen: AssessRequest[] } {
+  const seen: AssessRequest[] = []
+  return { seen, decide: (asked: AssessRequest): Verdict => {
+    seen.push(asked)
+    return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission', decision, choice: null, risk: 'low', tier: 3, tier_set_by: 'judge', reason: JUDGED,
+      alternative: decision === 'deny' ? 'Do it another way.' : '', cites: 'Ticket 19', reads: [], tokens: 7 }
+  } }
+}
+/** What a worker posts to `/ask`: the call it is about to make, and why. */
+const asking = (fields: Record<string, unknown> = {}) => ({ project, session_id: 's1', tool_name: 'Bash', tool_input: { command: 'pnpm test', description: 'Run the tests' },
+  description: 'Run the tests of ticket 19', ...fields })
+/** What the hook posts to `/claim` for the call `asking()` describes. */
+const claiming = (fields: Record<string, unknown> = {}) => ({ request_id: 'hook-req-1', request_key: keyOf('s1', 'Bash', asking().tool_input), session_id: 's1', project, ...fields })
+/** The ask key a worker session holds: the key of `session` under the test token. */
+const keyFor = (session: unknown, token: string = TOKEN) => AskKey.compute(token, String(session))
+/**
+ * Sends a worker's ask: no shared token, and by default the right ask key for the body's `session_id`. `headers` adds to these or replaces them;
+ * `undefined` leaves a header out.
+ */
+const ask = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = {}) => {
+  const body = asking(fields)
+  return call('POST', body, { [SharedTokenFile.HEADER]: undefined, [AskKey.HEADER]: keyFor(body.session_id), ...headers }, '/ask')
+}
+const claim = (fields: Record<string, unknown> = {}, headers: Record<string, string | undefined> = {}) => call('POST', claiming(fields), headers, '/claim')
+
+it('judges an ask without a token, masked and keyed with the factory\'s functions, and holds the approve for one claim', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  const asked = await ask({ context: 'The plan lists this test run.' })
+  expect(asked.status).toBe(200)
+  // A worker holds no token: none was sent, and none comes back.
+  expect(asked.headers[SharedTokenFile.HEADER]).toBeUndefined()
+  expect(asked.text).not.toContain(TOKEN)
+  expect(Object.keys(asked.body)).toEqual(['decision', 'pending_until'])
+  expect(asked.body.pending_until).toBe(new Date(Date.parse(NOW) + 120_000).toISOString())
+  // The decision is the line as written, and it is the only line.
+  expect(lines()).toEqual([JSON.stringify(asked.body.decision)])
+  const decision = asked.body.decision as Record<string, unknown>
+  expect([decision.decision, decision.decision_id, decision.reason, decision.project]).toEqual(['approve', 'd-1', JUDGED + MASKED, project])
+
+  // What the judge saw: an /assess-shaped request with a new id, the key of the raw call, and the masked description and context.
+  expect(judge.seen).toHaveLength(1)
+  const seen = judge.seen[0]!
+  expect(Object.keys(seen)).toEqual(['request_id', 'request_key', 'project', 'session_id', 'tool_name', 'tool_input', 'reason', 'context'])
+  expect(seen.request_id).toMatch(/^[0-9a-f-]{36}$/)
+  expect(decision.request_id).toBe(seen.request_id)
+  expect(seen).toMatchObject({ request_key: keyOf('s1', 'Bash', asking().tool_input), project, session_id: 's1', tool_name: 'Bash',
+    // The judge sees the masked input; the key is made of the raw one.
+    tool_input: { masked: asking().tool_input },
+    reason: `Run the tests of ticket 19${MASKED_REQUEST}`, context: `The plan lists this test run.${MASKED_REQUEST}` })
+
+  // The hook claims it: the ask's decision id, the token back, no judge asked, nothing written.
+  const first = await claim()
+  expect([first.status, first.body]).toEqual([200, { claimed: true, request_id: 'hook-req-1', decision_id: 'd-1', project }])
+  expect(first.headers[SharedTokenFile.HEADER]).toBe(TOKEN)
+  expect(first.text).not.toContain(TOKEN)
+  // One use: the same claim again finds nothing.
+  const second = await claim({ request_id: 'hook-req-2' })
+  expect([second.status, second.body]).toEqual([200, { claimed: false, request_id: 'hook-req-2', decision_id: null, project }])
+  expect(second.headers[SharedTokenFile.HEADER]).toBe(TOKEN)
+  expect(judge.seen).toHaveLength(1)
+  expect(lines()).toHaveLength(1)
+})
+
+it('holds nothing for an ask the judge denies or hands to the owner, and an ask without context has none', async () => {
+  for (const decision of ['deny', 'ask_owner'] as const) {
+    const judge = fixedJudge(decision)
+    await serve([project], writer(), judge)
+    const asked = await ask()
+    expect([asked.status, asked.body.pending_until, (asked.body.decision as Record<string, unknown>).decision], decision).toEqual([200, null, decision])
+    expect('context' in judge.seen[0]!, decision).toBe(false)
+    expect((await claim()).body, decision).toMatchObject({ claimed: false, decision_id: null })
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+  }
+  expect(lines()).toHaveLength(2)
+})
+
+it('keeps a held approve claimable when a newer ask of the same call is denied or handed to the owner', async () => {
+  for (const later of ['deny', 'ask_owner'] as const) {
+    const answers: string[] = ['approve', later]
+    const seen: Record<string, unknown>[] = []
+    const judge = { decide: (asked: AssessRequest) => {
+      seen.push(asked)
+      const decision = answers[seen.length - 1] as 'approve' | 'deny' | 'ask_owner'
+      return { decision_id: `d-${seen.length}`, request_id: asked.request_id, kind: 'permission' as const, decision, choice: null, risk: 'low' as const, tier: 3 as const, tier_set_by: 'judge' as const,
+        reason: JUDGED, alternative: decision === 'deny' ? 'Do it another way.' : '', cites: 'Ticket 19', reads: [], tokens: 7 }
+    } }
+    await serve([project], writer(), judge)
+    expect((await ask()).body.pending_until, later).not.toBeNull()
+    expect((await ask({ context: 'The plan changed.' })).body.pending_until, later).toBeNull()
+    // A weak ask cannot cancel the approval: the call that was approved can still run on it.
+    expect((await claim()).body, later).toEqual({ claimed: true, request_id: 'hook-req-1', decision_id: 'd-1', project })
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+  }
+})
+
+it('holds an approve for the configured approvalSeconds when it runs as the plugin', async () => {
+  const registered: Route[] = []
+  const dsh = fakeDsh(judgeReply)
+  const ctx = { ...dsh.ctx, webServer: { host: '127.0.0.1', port: 3083, register: (route: Route) => { registered.push(route); return () => {} } },
+    effect: (effect: () => () => void) => effect(), logger: { info: vi.fn(), warn: vi.fn() }, on: vi.fn(), inject: () => () => {}, tools: { guard: vi.fn(() => () => {}) } }
+  const guardPath = join(root, 'fake-guard.mjs')
+  writeFileSync(guardPath, 'export const JudgeToolGuard = { forHome: () => ({ check: () => undefined }) }\n')
+  plugin.apply(ctx as never, plugin.Config({ projects: [project], tokenFile: tokenPath(), maskModule: maskPath(), guardModule: guardPath, approvalSeconds: 30 }))
+  const askRoute = registered.find(route => route.path === '/ask')!
+  const req = Object.assign(Readable.from([Buffer.from(JSON.stringify(asking()))]), { method: 'POST', socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3083', [AskKey.HEADER]: keyFor('s1') } })
+  const answer = { status: 0, text: '' }
+  const res = { writeHead: (status: number) => { answer.status = status }, end: (text: string) => { answer.text = text } }
+  const before = Date.now()
+  await askRoute.handler(req as unknown as IncomingMessage, res as unknown as ServerResponse)
+  const after = Date.now()
+  expect(answer.status).toBe(200)
+  const until = Date.parse((JSON.parse(answer.text) as { pending_until: string }).pending_until)
+  expect(until).toBeGreaterThanOrEqual(before + 30_000)
+  expect(until).toBeLessThanOrEqual(after + 30_000)
+})
+
+it('gives a held approval only to the same key, session and project, and only until it expires', async () => {
+  const other = join(root, 'other-project')
+  mkdirSync(join(other, DecisionsFile.FOLDER), { recursive: true })
+  let now = 1_000_000
+  await serve([project, other], writer(), fixedJudge(), new PendingApprovals(30, () => now))
+  expect((await ask()).body.pending_until).toBe(new Date(now + 30_000).toISOString())
+  // Another command has another key; another session or project does not match the one that asked.
+  for (const fields of [{ request_key: keyOf('s1', 'Bash', { command: 'pnpm build' }) }, { session_id: 's2' }, { project: other }]) {
+    expect((await claim(fields)).body, JSON.stringify(fields)).toEqual({ claimed: false, request_id: 'hook-req-1', decision_id: null, project: fields.project ?? project })
+  }
+  // None of those used it up.
+  now += 29_999
+  expect((await claim()).body).toMatchObject({ claimed: true, decision_id: 'd-1' })
+  // A new ask of the same call is held again, and is gone once its time is over.
+  expect((await ask()).status).toBe(200)
+  now += 30_000
+  expect((await claim()).body).toMatchObject({ claimed: false, decision_id: null })
+  now -= 1
+  expect((await claim()).body).toMatchObject({ claimed: false, decision_id: null })
+})
+
+it('refuses a claim without the shared token, with a wrong one, or while the route has no token file, and a claim that is malformed or for an unlisted project', async () => {
+  await serve([project], writer(), fixedJudge())
+  await ask()
+  expect([(await claim({}, { [SharedTokenFile.HEADER]: undefined })).status, (await claim({}, { [SharedTokenFile.HEADER]: OTHER_TOKEN })).status]).toEqual([401, 401])
+  rmSync(tokenPath())
+  expect((await claim()).status).toBe(503)
+  writeToken()
+  for (const field of ['request_id', 'request_key', 'session_id', 'project']) {
+    expect([(await claim({ [field]: 7 })).status, (await claim({ [field]: '' })).status], field).toEqual([400, 400])
+  }
+  expect((await call('POST', ['not an object'], {}, '/claim')).status).toBe(400)
+  expect((await claim({ project: join(root, 'unlisted') })).status).toBe(403)
+  expect((await call('GET', undefined, {}, '/claim')).status).toBe(405)
+  // None of the refused claims used the approval up.
+  expect((await claim()).body).toMatchObject({ claimed: true })
+})
+
+it('admits an ask like an assess request but for the token, and refuses a malformed one with 400 before any judge is asked', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  expect((await ask({}, { [SharedTokenFile.HEADER]: undefined, origin: 'http://evil.example' })).status).toBe(403)
+  expect((await ask({}, { [SharedTokenFile.HEADER]: undefined, host: 'evil.example' })).status).toBe(403)
+  expect((await call('GET', undefined, {}, '/ask')).status).toBe(405)
+  expect((await ask({ project: join(root, 'unlisted') })).status).toBe(403)
+  for (const fields of [{ project: 7 }, { session_id: '' }, { tool_name: 7 }, { tool_input: undefined }, { description: '  ' }, { description: 7 }, { context: 7 }, { context: null }]) {
+    expect((await ask(fields)).status, JSON.stringify(fields)).toBe(400)
+  }
+  expect((await call('POST', '{not json', { [SharedTokenFile.HEADER]: undefined }, '/ask')).status).toBe(400)
+  expect(judge.seen).toEqual([])
+  expect(existsSync(file())).toBe(false)
+  // Without its token file the route cannot check any ask key, so it answers no ask, and asks no judge.
+  rmSync(tokenPath())
+  expect((await ask()).status).toBe(503)
+  expect(judge.seen).toEqual([])
+  writeToken()
+  // Fields the route does not know never reach the judge: a worker cannot state its own temp facts.
+  expect((await ask({ temp: null, extra: 'x' })).status).toBe(200)
+  expect(Object.keys(judge.seen[0]!)).toEqual(['request_id', 'request_key', 'project', 'session_id', 'tool_name', 'tool_input', 'reason'])
+})
+
+it('answers an ask with 503 and asks no judge when the mask module is missing or is from a factory that cannot key or mask a request', async () => {
+  const old = join(root, 'old-mask.mjs'), noKey = join(root, 'no-key.mjs'), broken = join(root, 'broken.mjs')
+  writeFileSync(old, OLD_MASK)
+  writeFileSync(noKey, 'export const DecisionMask = { forProject: () => ({ mask: line => line, maskRequest: fields => fields }) }\n')
+  writeFileSync(broken, 'export const DecisionMask = { requestKey: () => \'k\', forProject: () => ({ mask: line => line, maskRequest: () => { throw new Error(\'secret text\') } }) }\n')
+  for (const path of [undefined, join(root, 'missing.mjs'), old, noKey, broken]) {
+    const judge = fixedJudge()
+    await serve([project], new DecisionWriter(new FactoryMaskModule(path)), judge)
+    const asked = await ask()
+    expect([asked.status, judge.seen.length], String(path)).toEqual([503, 0])
+    expect(asked.text, String(path)).not.toContain('secret text')
+    await new Promise<void>(resolve => { server!.close(() => { resolve() }) })
+  }
+  expect(existsSync(file())).toBe(false)
+})
+
+it('refuses a tier that is not null or a whole 1, 2 or 3, or a tier rule that is not text, with 400, and writes nothing', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  for (const fields of [{ tier: 7 }, { tier: '1' }, { tier: 0 }, { tier: 1.5 }, { tier: true }, { tier: [1] }, { tier: 2, tier_rule: 3 }, { tier_rule: ['x'] }]) {
+    const answer = await call('POST', sample(fields))
+    expect([answer.status, answer.body], JSON.stringify(fields)).toEqual([400, { error: 'The request has a malformed tier' }])
+  }
+  expect(judge.seen).toEqual([])
+  expect(existsSync(file())).toBe(false)
+  for (const fields of [{ tier: 1, tier_rule: 'project-direction-file' }, { tier: null, tier_rule: null }, {}]) expect((await call('POST', sample(fields))).status).toBe(200)
+  expect(judge.seen.map(request => [request.tier, request.tier_rule])).toEqual([[1, 'project-direction-file'], [null, null], [undefined, undefined]])
+})
+
+it('records the gate\'s tier on the stub\'s decision: its high grade keeps a gate tier 1 and raises any other', async () => {
+  await serve([project], writer())
+  const recorded = async (fields: Record<string, unknown>) => (await call('POST', sample(fields))).body as Record<string, unknown>
+  expect(await recorded({ request_id: 'r1', tier: 1, tier_rule: 'project-direction-file' })).toMatchObject({ tier: 1, tier_set_by: 'gate' })
+  expect(await recorded({ request_id: 'r2', tier: 3, tier_rule: 'read-only' })).toMatchObject({ tier: 1, tier_set_by: 'judge' })
+  expect(await recorded({ request_id: 'r3' })).toMatchObject({ tier: 1, tier_set_by: 'judge' })
+})
+
+it('takes no tier from a worker\'s ask: the judged request carries none', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  expect((await ask({ tier: 3, tier_rule: 'read-only' })).status).toBe(200)
+  expect('tier' in judge.seen[0]!).toBe(false)
+  expect('tier_rule' in judge.seen[0]!).toBe(false)
+})
+
+it('refuses an assess request whose context is not text, and hands a text context to the judge', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  for (const context of [7, null, ['x']]) expect((await call('POST', sample({ context }))).status, JSON.stringify(context)).toBe(400)
+  expect(judge.seen).toEqual([])
+  expect((await call('POST', sample({ context: 'Background.' }))).status).toBe(200)
+  expect(judge.seen[0]!.context).toBe('Background.')
+})
+
+it('refuses an ask with no ask key, a wrong one or another session\'s with 401, before any judge, and leaves held approvals as they are', async () => {
+  const judge = fixedJudge()
+  await serve([project], writer(), judge)
+  // Session s2 asks with its own key and holds an approval.
+  expect((await ask({ session_id: 's2' })).body.pending_until).not.toBeNull()
+  expect(judge.seen).toHaveLength(1)
+  const refused = [
+    await ask({}, { [AskKey.HEADER]: undefined }),
+    await ask({}, { [AskKey.HEADER]: '' }),
+    await ask({}, { [AskKey.HEADER]: '0'.repeat(64) }),
+    await ask({}, { [AskKey.HEADER]: keyFor('s1', OTHER_TOKEN) }),
+    // Another session's key (s2's) does not let a caller ask in s1's name.
+    await ask({}, { [AskKey.HEADER]: keyFor('s2') }),
+    // The shared token itself is not an ask key.
+    await ask({}, { [AskKey.HEADER]: TOKEN }),
+  ]
+  for (const [index, answer] of refused.entries()) {
+    expect(answer.status, String(index)).toBe(401)
+    expect(Object.keys(answer.body), String(index)).toEqual(['error'])
+    expect(answer.text, String(index)).not.toContain(keyFor('s1'))
+    expect(answer.headers[SharedTokenFile.HEADER], String(index)).toBeUndefined()
+  }
+  // No refused ask reached the judge or the decisions file, and s2's approval is still there for its own claim.
+  expect(judge.seen).toHaveLength(1)
+  expect(lines()).toHaveLength(1)
+  const s2Key = keyOf('s2', 'Bash', asking().tool_input)
+  expect((await claim({ session_id: 's2', request_key: s2Key })).body).toMatchObject({ claimed: true, decision_id: 'd-1' })
+  // With the right key the ask is judged.
+  expect((await ask()).status).toBe(200)
+  expect(judge.seen).toHaveLength(2)
+})
+
+it('computes the ask key as the factory does: the pinned test vector', () => {
+  // The same vector is pinned in the factory's lib/askKey test; both sides must agree on it.
+  expect(AskKey.PREFIX).toBe('zees-ask-v1:')
+  expect(AskKey.HEADER).toBe('x-zees-ask-key')
+  expect(AskKey.compute(TOKEN, 'session-0001')).toBe('1db6e63a803f7acf619ed4b46312c11fe1a1fab443b3b52720411b6c422393f6')
+  // The token is trimmed first, so a line break after it changes nothing.
+  expect(AskKey.compute(`${TOKEN}\n`, 'session-0001')).toBe(AskKey.compute(TOKEN, 'session-0001'))
+  expect(AskKey.compute(TOKEN, 'session-0002')).not.toBe(AskKey.compute(TOKEN, 'session-0001'))
 })

@@ -44,7 +44,7 @@ const branchesOf = () => git(bare, 'for-each-ref', '--format=%(refname:short)', 
  * Its `mr create` prints a merge request's address; its `mr merge` moves the merge request's target branch to its source branch, as GitLab would.
  */
 class TestRunner implements OrcaRunner {
-  readonly calls: { program: string; args: string[]; cwd: string | undefined }[] = []
+  readonly calls: { program: string; args: string[]; cwd: string | undefined; env: RunOptions['env'] }[] = []
   fail: { create?: string; merge?: string } = {}
   /** What `mr create` prints. */
   created = 'Creating merge request for zees-factory into main in factory\n\n!7 guideline\n https://gitlab.example/factory/-/merge_requests/7\n'
@@ -52,7 +52,7 @@ class TestRunner implements OrcaRunner {
   private branch = ''
   private target = ''
   async run(program: string, args: readonly string[], timeoutMs: number, options: RunOptions = {}): Promise<OrcaRun> {
-    this.calls.push({ program, args: [...args], cwd: options.cwd })
+    this.calls.push({ program, args: [...args], cwd: options.cwd, env: options.env })
     if (program === 'git') return this.real.run(program, args, timeoutMs, { ...options, env: { ...options.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' } })
     if (program !== GLAB) return { ok: false, error: `the test runs no ${program}` }
     if (args[0] === 'mr' && args[1] === 'create') {
@@ -64,8 +64,9 @@ class TestRunner implements OrcaRunner {
     if (args[0] === 'mr' && args[1] === 'merge') {
       if (this.fail.merge !== undefined) return { ok: false, error: this.fail.merge }
       const sha = args[args.indexOf('--sha') + 1]!
-      // The bare repository of the worktree glab runs in, as GitLab would merge in that project, into the merge request's target branch.
-      const remote = git(options.cwd!, 'remote', 'get-url', 'origin')
+      // The project glab is told with --repo, as GitLab would merge in that project, into the merge request's target branch.
+      const remote = args[args.indexOf('--repo') + 1]!
+      if (!args.includes('--repo')) return { ok: false, error: 'no --repo given' }
       if (git(remote, 'rev-parse', `refs/heads/${this.branch}`) !== sha) return { ok: false, error: 'the branch is not at that commit' }
       git(remote, 'update-ref', `refs/heads/${this.target}`, sha)
       return { ok: true, stdout: 'Merged!' }
@@ -117,6 +118,28 @@ afterEach(async () => {
 })
 
 describe('Accept saves the next version through a merge request', () => {
+  it('tells glab the project it pushed to, so a second remote or a glab host variable cannot send the merge request elsewhere', async () => {
+    const other = join(root, 'other.git')
+    git(root, 'init', '-q', '--bare', other)
+    git(factory, 'remote', 'add', 'aaa-other', other)
+    const saved = process.env.GITLAB_HOST
+    process.env.GITLAB_HOST = 'gitlab.elsewhere.example'
+    try {
+      expect(await saverOf().accept(proposal('Two.\n'), 1)).toMatchObject({ saved: true, version: 2 })
+    } finally { if (saved === undefined) delete process.env.GITLAB_HOST; else process.env.GITLAB_HOST = saved }
+    const glab = runner.calls.filter(call => call.program === GLAB)
+    expect(glab.map(call => call.args[call.args.indexOf('--repo') + 1])).toEqual([bare, bare])
+    expect(glab.map(call => ({ GITLAB_HOST: call.env?.GITLAB_HOST, GL_HOST: call.env?.GL_HOST, GITLAB_REPO: call.env?.GITLAB_REPO }))).toEqual([{}, {}].map(() => ({ GITLAB_HOST: undefined, GL_HOST: undefined, GITLAB_REPO: undefined })))
+    expect(glab.every(call => call.env !== undefined && 'GITLAB_HOST' in call.env)).toBe(true)
+    expect(git(other, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/')).toBe('')
+  })
+
+  it('takes a user name and password out of the address it gives glab', () => {
+    expect(FactoryRemote.withoutCredentials('https://owner:secret@gitlab.example/group/factory.git')).toBe('https://gitlab.example/group/factory.git')
+    expect(FactoryRemote.withoutCredentials('git@gitlab.example:group/factory.git')).toBe('git@gitlab.example:group/factory.git')
+    expect(FactoryRemote.withoutCredentials('/srv/factory.git')).toBe('/srv/factory.git')
+  })
+
   it('creates v2 on the save branch from one pushed commit, merged at once, with v1 unchanged and no worktree left', async () => {
     const before = tipOf()
     const v1 = fileOnTip('guideline/v1.md')
@@ -131,10 +154,10 @@ describe('Accept saves the next version through a merge request', () => {
     // The merge request: from a new branch into main, deleting no branch; merged at once and only at the pushed commit.
     const branch = 'zees-factory/guideline-v2-20261127T101530Z'
     expect(runner.glabCalls).toEqual([
-      ['mr', 'create', '--source-branch', branch, '--target-branch', SAVE, '--title', 'guideline v2, from the review of factory-testbed job 3',
+      ['mr', 'create', '--repo', bare, '--source-branch', branch, '--target-branch', SAVE, '--title', 'guideline v2, from the review of factory-testbed job 3',
         '--description', 'Guideline v2, replacing v1, from the review talk on factory-testbed job 3. Accepted by the owner on the review page and merged by the fork.',
         '--remove-source-branch=false', '--yes'],
-      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', tipOf()],
+      ['mr', 'merge', '7', '--repo', bare, '--yes', '--auto-merge=false', '--sha', tipOf()],
     ])
     expect(branchesOf()).toEqual(['main', branch, SAVE])
     // The factory clone, its checkout and its branches are untouched; the save's worktree and its folder are gone. The remote's main never moved.
@@ -364,9 +387,9 @@ describe('trend reports: in the Accept\'s commit, and from the button by the sam
     expect(v2).toMatch(/^---\nversion: 2\ndate: 2026-11-27\njobs: 1\ncompared_with: 1\nwritten: asked\n---\n# Trend report for guideline v2\n\nCompared with v1\.\n/)
     const branch = 'zees-factory/trends-v2-20261127T101530Z'
     expect(runner.glabCalls.slice(2)).toEqual([
-      ['mr', 'create', '--source-branch', branch, '--target-branch', SAVE, '--title', 'trend report for guideline v2',
+      ['mr', 'create', '--repo', bare, '--source-branch', branch, '--target-branch', SAVE, '--title', 'trend report for guideline v2',
         '--description', 'The trend report for guideline v2. Asked for by the owner on the review page and merged by the fork.', '--remove-source-branch=false', '--yes'],
-      ['mr', 'merge', '7', '--yes', '--auto-merge=false', '--sha', tipOf()],
+      ['mr', 'merge', '7', '--repo', bare, '--yes', '--auto-merge=false', '--sha', tipOf()],
     ])
     // Nothing in the factory clone's checkout, and no worktree left.
     expect([readdirSync(join(factory, 'guideline')), readdirSync(saves), git(factory, 'branch', '--show-current')]).toEqual([['v1.md'], [], 'main'])

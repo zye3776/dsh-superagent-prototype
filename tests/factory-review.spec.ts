@@ -848,7 +848,7 @@ it('is wired into the plugin for Accept and the guideline: with review.saveBranc
   const glabLines = readFileSync(glabLog, 'utf8')
   expect(glabLines).toContain(`--target-branch ${TRIAL} `)
   expect(glabLines).not.toContain('--target-branch main')
-  expect(glabLines).toContain('mr merge 9 --yes --auto-merge=false --sha')
+  expect(glabLines).toContain(`mr merge 9 --repo ${bare} --yes --auto-merge=false --sha`)
   expect(readdirSync(join(factory, 'guideline'))).toEqual(['v1.md'])
   expect(await sectionOf('main-2')).toContain('version 3')
   // main: its commit and its guideline are as they were.

@@ -110,6 +110,35 @@ export class FactoryRemote {
     return { ...env, GIT_TERMINAL_PROMPT: '0', GIT_CEILING_DIRECTORIES: dirname(resolve(cwd)) }
   }
 
+  /** glab's host and project variables: any of them would make glab pick a host or project other than the remote the save pushed to (glab config --help: "A host from an environment variable, such as `GITLAB_HOST`, always wins"). Its token variables are kept. */
+  static readonly GLAB_TARGET_VARIABLES = ['GITLAB_HOST', 'GITLAB_URI', 'GL_HOST', 'GITLAB_API_HOST', 'GITLAB_REPO', 'GL_REPO'] as const
+
+  /** The variables glab runs with: those of `envFor`, and none of glab's own host or project variables. */
+  static glabEnvFor(cwd: string): Record<string, string | undefined> {
+    return { ...FactoryRemote.envFor(cwd), ...Object.fromEntries(FactoryRemote.GLAB_TARGET_VARIABLES.map(name => [name, undefined])) }
+  }
+
+  /**
+   * The project glab is told to act on: the address the save pushes to (`git remote get-url --push`), with any user name or password taken out,
+   * so it never shows in a process list. glab takes a full URL or Git URL for `--repo` (glab mr create --help: "The full URL or Git URL is also accepted").
+   */
+  async glabRepo(cwd: string = this.repo): Promise<OrcaRun & { repo?: string }> {
+    const got = await this.git(['remote', 'get-url', '--push', '--', this.remote], FactoryRemote.LOCAL_MS, cwd)
+    if (!got.ok) return got
+    return { ...got, repo: FactoryRemote.withoutCredentials(got.stdout.trim()) }
+  }
+
+  /** `url` without a user name or password; a Git URL such as `git@host:group/project.git` is kept as it is. */
+  static withoutCredentials(url: string): string {
+    try {
+      const parsed = new URL(url)
+      if (parsed.username === '' && parsed.password === '') return url
+      parsed.username = ''
+      parsed.password = ''
+      return parsed.toString()
+    } catch { return url }
+  }
+
   /** Whether the factory's folder is a git repository of its own. A yes is kept; a no is asked again next time, so one failed call does not stick. */
   async isRepository(): Promise<boolean> {
     if (this.repository !== undefined) return this.repository
@@ -351,12 +380,15 @@ export class FactoryRepoSave {
       const commit = head.stdout.trim()
       const pushed = await remote.git(['push', '--', remote.remote, `${commit}:refs/heads/${change.branch}`], FactoryRemote.NETWORK_MS, worktree)
       if (!pushed.ok) return FactoryRepoSave.failed('push', pushed.error)
-      const glabEnv = FactoryRemote.envFor(worktree)
-      const opened = await remote.runner.run(glab, ['mr', 'create', '--source-branch', change.branch, '--target-branch', remote.branch, '--title', change.title,
+      const glabEnv = FactoryRemote.glabEnvFor(worktree)
+      // glab is told the project the commit was pushed to, so no second remote or glab host variable can send the merge request elsewhere.
+      const target = await remote.glabRepo(worktree)
+      if (!target.ok || target.repo === undefined || target.repo === '') return FactoryRepoSave.failed('merge request', target.ok ? 'the remote\'s address could not be read' : target.error)
+      const opened = await remote.runner.run(glab, ['mr', 'create', '--repo', target.repo, '--source-branch', change.branch, '--target-branch', remote.branch, '--title', change.title,
         '--description', change.description, '--remove-source-branch=false', '--yes'], FactoryRemote.NETWORK_MS, { cwd: worktree, env: glabEnv })
       if (!opened.ok) return FactoryRepoSave.failed('merge request', opened.error)
       const { mr, id } = FactoryRepoSave.requestOf(opened.stdout)
-      const merged = await remote.runner.run(glab, ['mr', 'merge', id ?? change.branch, '--yes', '--auto-merge=false', '--sha', commit], FactoryRemote.NETWORK_MS,
+      const merged = await remote.runner.run(glab, ['mr', 'merge', id ?? change.branch, '--repo', target.repo, '--yes', '--auto-merge=false', '--sha', commit], FactoryRemote.NETWORK_MS,
         { cwd: worktree, env: glabEnv })
       if (!merged.ok) return FactoryRepoSave.failed('merge', merged.error, mr)
       // So the next read sees the merged version; when it fails, the next fetch brings it.

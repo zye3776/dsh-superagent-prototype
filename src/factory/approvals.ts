@@ -8,13 +8,22 @@
  * When the real call is decided through `/assess` after all (the hook's claim came before the ask was answered), that decision settles the request:
  * `settle` drops the approval held for it and remembers the key for a while, so an ask that started before the decision holds nothing when its
  * approve comes back late. Without this, the same call sent again would be allowed on the older approval.
+ * An approval is also bound to where the ask was sorted: its working folder (`cwd`) and the checking tier the factory's tier sorter gave it (`tier`,
+ * `null` for unsorted). The claim brings the real call's folder and gate tier, and an approval is handed out only when both are the same. Without
+ * this a worker could ask from another folder (its temp folder, say), get a shallower tier for the ask, and have the approval cover the real call
+ * in the project, which the gate sorts stricter. A claim that brings neither is for a request this binding cannot check, so it claims nothing.
  * This file imports nothing, so the factory's contract test can run it with Node straight from source.
  */
 
 /** What identifies the request an approval is for: the factory's key, and the session and project that asked. */
 export interface ApprovalClaim { request_key: string; session_id: string; project: string }
-/** An approval to hold: the request it is for, and the id of the judge's decision that approved it. */
-export interface HeldApproval extends ApprovalClaim { decision_id: string }
+/**
+ * Where a call was sorted: the working folder, as an absolute path with `.` and `..` worked out, and the gate's checking tier (1, 2 or 3), `null`
+ * when the sorter left it unsorted. A claim that leaves them out (`undefined`) matches no approval.
+ */
+export interface SortedAt { cwd?: string; tier?: number | null }
+/** An approval to hold: the request it is for, where its ask was sorted, and the id of the judge's decision that approved it. */
+export interface HeldApproval extends ApprovalClaim { decision_id: string; cwd: string; tier: number | null }
 
 /**
  * Keeps approved asks, one for each request key, each for `seconds` seconds.
@@ -101,20 +110,22 @@ export class PendingApprovals {
     }
     const expires = now + this.seconds * 1000
     this.held.set(approval.request_key, { request_key: approval.request_key, session_id: approval.session_id, project: approval.project,
-      decision_id: approval.decision_id, expires })
+      decision_id: approval.decision_id, cwd: approval.cwd, tier: approval.tier, expires })
     return new Date(expires)
   }
 
   /**
    * Hands out the approval held for exactly this request, once: returns its `decision_id` and forgets it, or returns `undefined` when there is none.
-   * It matches only the same key, the same session and the same project, and only before the approval expires. An expired approval is dropped; one held
-   * for another session or project stays, because the claim was not for it.
+   * It matches only the same key, the same session and the same project, the same working folder and the same gate tier, and only before the
+   * approval expires. An expired approval is dropped; one held for another session, project, folder or tier stays, because the claim was not for
+   * it (the real call then goes to `/assess`, whose decision settles the request and drops it).
    */
-  claim(claim: ApprovalClaim): string | undefined {
+  claim(claim: ApprovalClaim & SortedAt): string | undefined {
     const entry = this.held.get(claim.request_key)
     if (!entry) return undefined
     if (entry.expires <= this.now()) { this.held.delete(claim.request_key); return undefined }
     if (entry.session_id !== claim.session_id || entry.project !== claim.project) return undefined
+    if (claim.cwd === undefined || claim.cwd !== entry.cwd || claim.tier === undefined || claim.tier !== entry.tier) return undefined
     this.held.delete(claim.request_key)
     return entry.decision_id
   }

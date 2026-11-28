@@ -499,7 +499,9 @@ function fixedJudge(decision: Verdict['decision'] = 'approve'): Judge & { seen: 
 const asking = (fields: Record<string, unknown> = {}) => ({ project, session_id: 's1', tool_name: 'Bash', tool_input: { command: 'pnpm test', description: 'Run the tests' },
   description: 'Run the tests of ticket 19', ...fields })
 /** What the hook posts to `/claim` for the call `asking()` describes. */
-const claiming = (fields: Record<string, unknown> = {}) => ({ request_id: 'hook-req-1', request_key: keyOf('s1', 'Bash', asking().tool_input), session_id: 's1', project, ...fields })
+const claiming = (fields: Record<string, unknown> = {}) => ({ request_id: 'hook-req-1', request_key: keyOf('s1', 'Bash', asking().tool_input), session_id: 's1', project,
+  // The real call's folder and gate tier: the asks here name no cwd (so the project) and the route has no tier module (so unsorted).
+  cwd: project, tier: null, ...fields })
 /** The ask key a worker session holds: the key of `session` under the test token. */
 const keyFor = (session: unknown, token: string = TOKEN) => AskKey.compute(token, String(session))
 /**
@@ -1066,4 +1068,28 @@ it('refuses an ask whose scratchpad_dir is not an absolute path apart from the p
   // A folder beside the project, one whose name only starts like the project's, and `null` are taken.
   for (const dir of [join(root, 'session-temp'), `${project}-temp`, null]) expect((await ask({ scratchpad_dir: dir })).status, String(dir)).toBe(200)
   expect(judge.seen).toHaveLength(3)
+})
+
+it('holds a sorted ask\'s approve for the folder and gate tier it was sorted at: the real call elsewhere or at another tier claims nothing', async () => {
+  await serveSorted()
+  const temp = join(root, 'session-temp')
+  const input = { command: 'rm -rf src', want: 3 }
+  // The worker asks from its temp folder, where the sorter gives a delete tier 3.
+  const asked = await ask({ tool_input: input, cwd: temp, scratchpad_dir: temp })
+  expect(tierOf(asked)).toEqual([3, 'gate'])
+  const key = keyOf('s1', 'Bash', input)
+  // The real call in the project, which the gate sorts tier 1, or with no folder or tier at all: nothing is claimed, and the approval stays.
+  for (const other of [{ cwd: project, tier: 1 }, { cwd: project, tier: 3 }, { cwd: temp, tier: 1 }, { cwd: temp, tier: null }, { cwd: undefined, tier: undefined }]) {
+    expect(await claimed({ request_key: key, ...other }), JSON.stringify(other)).toBe(false)
+  }
+  // The same folder (written another way) at the same tier claims it, once.
+  expect(await claimed({ request_key: key, cwd: join(temp, 'x', '..'), tier: 3 })).toBe(true)
+  expect(await claimed({ request_key: key, cwd: temp, tier: 3 })).toBe(false)
+})
+
+it('refuses a claim whose cwd is not an absolute path or whose tier is not 1, 2, 3 or null', async () => {
+  await serve()
+  for (const fields of [{ cwd: 'src' }, { cwd: 7 }, { tier: 0 }, { tier: '3' }, { tier: 1.5 }]) {
+    expect((await claim(fields)).status, JSON.stringify(fields)).toBe(400)
+  }
 })

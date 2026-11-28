@@ -39,7 +39,7 @@ export function apply(ctx: Context, config: FactoryConfig): void {
   const judges = new JudgeSessions(ctx, new FactoryGuardModule(config.guardModule))
   const route = new AssessRoute(config.projects ?? [], new SharedTokenFile(config.tokenFile ?? SharedTokenFile.DEFAULT_PATH), new ModelJudge(judges), undefined,
     new DecisionWriter(new FactoryMaskModule(config.maskModule)), new PendingApprovals(config.approvalSeconds ?? PendingApprovals.DEFAULT_SECONDS),
-    new FactoryTierModule(config.tierModule))
+    new FactoryTierModule(config.tierModule, text => ctx.logger.warn(text)))
   ctx.effect(() => route.register(ctx), 'factory: assess, ask and claim routes')
   ctx.logger.info('dsh-superagent-factory serves POST %s, %s and %s for %d project(s)', AssessRoute.PATH, AssessRoute.ASK_PATH, AssessRoute.CLAIM_PATH, route.projectCount)
 }

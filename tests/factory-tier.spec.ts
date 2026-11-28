@@ -90,3 +90,23 @@ it.skipIf(realTier === '' || !existsSync(realTier))('sorts with the factory\'s r
   expect(await tiers.sort({ tool_name: 'Bash', tool_input: { command: 'rm -rf src' }, cwd: project, scratchpad_dir: join(root, 'temp') })).toMatchObject({ tier: 1 })
   expect(await tiers.sort({ tool_name: 'Edit', tool_input: { file_path: join(project, 'src', 'a.ts'), old_string: 'a', new_string: 'b' }, cwd: project, scratchpad_dir: null })).toBeNull()
 })
+
+it('tells the log once when a tier setting gives no sorter or the sorter throws, and never when there is no setting', async () => {
+  const told: string[] = []
+  const missing = new FactoryTierModule(join(root, 'absent.mjs'), text => told.push(text))
+  expect([await missing.sort(fields()), await missing.sort(fields())]).toEqual([null, null])
+  expect(told).toHaveLength(1)
+  expect(told[0]).toMatch(/^dsh-superagent-factory: .+, so asks are judged without a gate tier \(logged once\)$/)
+  // A file without the export gives no sorter.
+  const empty = new FactoryTierModule(moduleWith('e.mjs', 'export const x = 1\n'), text => told.push(text))
+  await empty.sort(fields())
+  expect(told.splice(1)).toEqual(['dsh-superagent-factory: the tierModule setting gives no tier sorter, so asks are judged without a gate tier (logged once)'])
+  const throwing = new FactoryTierModule(moduleWith('t.mjs', 'export class GateTierSorter { sort() { throw new Error("secret /work/app") } }\n'), text => told.push(text))
+  await throwing.sort(fields()); await throwing.sort(fields())
+  expect(told).toHaveLength(2)
+  expect(told[1]).toContain('the tier sorter failed')
+  expect(told[1]).not.toContain('secret')
+  const none = new FactoryTierModule(undefined, text => told.push(text))
+  expect(await none.sort(fields())).toBeNull()
+  expect(told).toHaveLength(2)
+})

@@ -102,7 +102,7 @@ export interface AskRequest {
   cwd?: string; scratchpad_dir?: string | null
 }
 /** What the factory's hook posts to `/claim`: its own `request_id`, and what identifies the request an approval may be held for. */
-export interface ClaimRequest extends ApprovalClaim { request_id: string }
+export interface ClaimRequest extends ApprovalClaim { request_id: string; cwd?: string; tier?: Tier | null }
 
 /** A decision without `seconds`, which the route measures. */
 export type Verdict = Omit<Decision, 'seconds'>
@@ -297,7 +297,8 @@ export class AssessRoute {
   async ask(ask: AskRequest): Promise<string> {
     if (!this.projects.has(ask.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
     const key = await this.writer.requestKey(ask.session_id, ask.tool_name, ask.tool_input)
-    const gate = await this.tiers.sort({ tool_name: ask.tool_name, tool_input: ask.tool_input, cwd: ask.cwd ?? ask.project, scratchpad_dir: ask.scratchpad_dir ?? null })
+    const cwd = resolve(ask.cwd ?? ask.project)
+    const gate = await this.tiers.sort({ tool_name: ask.tool_name, tool_input: ask.tool_input, cwd, scratchpad_dir: ask.scratchpad_dir ?? null })
     const masked = await this.writer.maskRequest(ask.project, { session_id: ask.session_id, tool_name: ask.tool_name, tool_input: ask.tool_input,
       reason: ask.description, ...(ask.context === undefined ? {} : { context: ask.context }) })
     const { session_id: session, context } = masked
@@ -310,7 +311,8 @@ export class AssessRoute {
       ...(gate === null ? {} : { tier: gate.tier, tier_rule: gate.tier_rule }) })
     const decision = JSON.parse(line) as DecisionLine
     const until = decision.decision === 'approve'
-      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id }, since)?.toISOString() ?? null
+      ? this.approvals.hold({ request_key: key, session_id: session, project: ask.project, decision_id: decision.decision_id, cwd,
+        tier: gate?.tier ?? null }, since)?.toISOString() ?? null
       : null
     // The line is put in as written, so the reply holds exactly what the decisions file holds.
     return `{"decision":${line},"pending_until":${JSON.stringify(until)}}`
@@ -323,7 +325,7 @@ export class AssessRoute {
    */
   claim(claim: ClaimRequest): string {
     if (!this.projects.has(claim.project)) throw new AssessRefusal(403, 'The project is not listed in the factory configuration')
-    const id = this.approvals.claim(claim) ?? null
+    const id = this.approvals.claim({ ...claim, ...(claim.cwd === undefined ? {} : { cwd: resolve(claim.cwd) }) }) ?? null
     return JSON.stringify({ claimed: id !== null, request_id: claim.request_id, decision_id: id, project: claim.project })
   }
 
@@ -360,7 +362,11 @@ export class AssessRoute {
     return steps === '' || (steps !== '..' && !steps.startsWith('../') && !isAbsolute(steps))
   }
 
-  /** Checks a parsed `/claim` body and returns only its known fields. Refuses with 400 a body that is not an object or lacks one of the four texts. */
+  /**
+   * Checks a parsed `/claim` body and returns only its known fields. Refuses with 400 a body that is not an object or lacks one of the four texts,
+   * one whose `cwd` is present but not an absolute path, and one whose `tier` is present but neither `null` nor the whole number 1, 2 or 3.
+   * `cwd` and `tier` are the real call's working folder and gate tier: a claim without them is answered, but claims nothing (`PendingApprovals.claim`).
+   */
   static claimOf(body: unknown): ClaimRequest {
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new AssessRefusal(400, 'The request body is not a JSON object')
     const { request_id: id, request_key: key, session_id: session, project } = body as Record<string, unknown>
@@ -368,7 +374,11 @@ export class AssessRoute {
     if (typeof key !== 'string' || key === '') throw new AssessRefusal(400, 'The request has no request_key')
     if (typeof session !== 'string' || session === '') throw new AssessRefusal(400, 'The request has no session_id')
     if (typeof project !== 'string' || project === '') throw new AssessRefusal(400, 'The request has no project')
-    return { request_id: id, request_key: key, session_id: session, project }
+    const { cwd, tier } = body as Record<string, unknown>
+    if ('cwd' in body && !(typeof cwd === 'string' && isAbsolute(cwd))) throw new AssessRefusal(400, 'The request has a malformed cwd')
+    if ('tier' in body && !(tier === null || TierChoice.holds(tier))) throw new AssessRefusal(400, 'The request has a malformed tier')
+    return { request_id: id, request_key: key, session_id: session, project, ...(typeof cwd === 'string' ? { cwd } : {}),
+      ...('tier' in body ? { tier: tier as Tier | null } : {}) }
   }
 
   /**

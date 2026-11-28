@@ -31,25 +31,38 @@ interface TierModuleExports { GateTierSorter?: unknown }
  * tier, as every ask was before this setting.
  * Only a missing file is tried again on the next ask. Node keeps a file once it has loaded it or once it threw while loading, so a tier file that
  * was fixed or rebuilt takes effect only after DSH restarts.
+ * The first time a tier setting is given but gives no sorter, or the sorter throws, `warn` is told once, so asks that silently lose their gate
+ * tier show in the log.
  */
 export class FactoryTierModule implements TierSource {
   private static readonly TIERS: readonly unknown[] = [1, 2, 3]
   private sorter?: GateSorter
-  constructor(readonly path?: string) {}
+  private warned = false
+  constructor(readonly path?: string, private readonly warn: (text: string) => void = () => {}) {}
 
   async sort(fields: TierSortFields): Promise<GateTierOfAsk | null> {
     try {
       const sorter = await this.load()
-      if (sorter === null) return null
+      if (sorter === null) {
+        if (this.path !== undefined && this.path !== '') this.warnOnce('the tierModule setting gives no tier sorter')
+        return null
+      }
       const result = sorter.sort({ toolName: fields.tool_name, toolInput: fields.tool_input, cwd: fields.cwd, scratchpadDir: fields.scratchpad_dir })
       if (result === null || typeof result !== 'object') return null
       const { tier, rule } = result as { tier?: unknown; rule?: unknown }
       if (!FactoryTierModule.TIERS.includes(tier) || typeof rule !== 'string' || rule === '') return null
       return { tier: tier as Tier, tier_rule: rule }
     } catch {
-      // Any failure of the module or its sorter leaves the ask unsorted.
+      // Any failure of the module or its sorter leaves the ask unsorted. The error's text is not logged: it could quote the request.
+      this.warnOnce('the tier sorter failed')
       return null
     }
+  }
+
+  private warnOnce(what: string): void {
+    if (this.warned) return
+    this.warned = true
+    try { this.warn(`dsh-superagent-factory: ${what}, so asks are judged without a gate tier (logged once)`) } catch { /* a log failure changes nothing */ }
   }
 
   /** The sorter, built on first use; `null` when the setting or the file cannot give one. It may throw: `sort` catches it. */

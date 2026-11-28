@@ -2,8 +2,24 @@
 import { expect, it } from 'vitest'
 import { PendingApprovals } from '../src/factory/approvals.ts'
 
-const approval = (fields: Record<string, string> = {}) => ({ request_key: 'k1', session_id: 's1', project: '/p', decision_id: 'd1', ...fields })
-const claim = (fields: Record<string, string> = {}) => ({ request_key: 'k1', session_id: 's1', project: '/p', ...fields })
+const approval = (fields: Record<string, string> = {}) =>
+  ({ request_key: 'k1', session_id: 's1', project: '/p', decision_id: 'd1', cwd: '/p', tier: 3 as number | null, ...fields })
+const claim = (fields: Record<string, string> = {}) => ({ request_key: 'k1', session_id: 's1', project: '/p', cwd: '/p', tier: 3 as number | null, ...fields })
+
+it('hands an approval out only to a claim from the same folder at the same gate tier, and keeps it for the right one', () => {
+  const approvals = new PendingApprovals()
+  approvals.hold(approval())
+  // Asked from the temp folder at tier 3, the real call in the project sorted tier 1: no match.
+  const others: Partial<{ cwd: string | undefined; tier: number | null | undefined }>[] = [
+    { cwd: '/tmp/scratch' }, { tier: 1 }, { tier: 2 }, { tier: null }, { cwd: undefined }, { tier: undefined }]
+  for (const other of others) expect(approvals.claim({ ...claim(), ...other }), JSON.stringify(other)).toBeUndefined()
+  expect(approvals.size).toBe(1)
+  expect(approvals.claim(claim())).toBe('d1')
+  // An unsorted ask is claimed only by an unsorted real call.
+  approvals.hold({ ...approval(), tier: null })
+  expect(approvals.claim(claim())).toBeUndefined()
+  expect(approvals.claim({ ...claim(), tier: null })).toBe('d1')
+})
 
 it('hands a held approval out once, to exactly the request it is for', () => {
   const approvals = new PendingApprovals()
